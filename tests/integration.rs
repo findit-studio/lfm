@@ -202,10 +202,11 @@ fn t08_repetition_penalty_reduces_repeats() {
   // window is too short for that to be statistically stable.
   let mut run = |opts: RequestOptions| match engine.generate(&user_msg("Describe."), &images, &opts)
   {
-    Ok(text) => text
-      .is_empty()
-      .then(|| panic!("empty output"))
-      .unwrap_or(()),
+    Ok(text) => {
+      if text.is_empty() {
+        panic!("empty output")
+      }
+    }
     Err(lfm::Error::MaxTokensExceeded {
       schema_complete, ..
     }) => {

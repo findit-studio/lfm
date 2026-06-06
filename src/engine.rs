@@ -273,6 +273,75 @@ impl Engine {
     )
   }
 
+  /// Construct an MLX (`mlxrs`) Metal-backed engine from an **exact**
+  /// `model.safetensors` file path (Apple Silicon only).
+  ///
+  /// The explicit-format counterpart to [`from_mlx_dir`](Self::from_mlx_dir): use
+  /// it when you already know the checkpoint is an MLX safetensors file and where
+  /// it lives. The `config.json` and the `tokenizer.json` are read from the
+  /// weight file's **parent directory** (`weights.parent()`). There is no ONNX
+  /// fallback — this constructor always builds the MLX backend.
+  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  #[cfg_attr(docsrs, doc(cfg(all(target_os = "macos", target_arch = "aarch64"))))]
+  pub fn from_mlx_safetensors<P: AsRef<Path>>(weights: P, opts: Options) -> Result<Self> {
+    let weights = weights.as_ref();
+    opts.image_budget().validate()?;
+    let backend = crate::runtime::mlx_backend::MlxBackend::from_safetensors(weights)?;
+    Self::assemble(
+      BackendImpl::Mlx(Box::new(backend)),
+      &crate::runtime::mlx_backend::weights_parent(weights).join("tokenizer.json"),
+      &opts,
+    )
+  }
+
+  /// Construct an MLX (`mlxrs`) Metal-backed engine from an **exact** `*.npz`
+  /// file path (Apple Silicon only). The `config.json` and the `tokenizer.json`
+  /// are read from the weight file's **parent directory** (`weights.parent()`).
+  ///
+  /// Explicit-format MLX constructor (see
+  /// [`from_mlx_safetensors`](Self::from_mlx_safetensors)); always builds the MLX
+  /// backend, no ONNX fallback.
+  #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "npz"))]
+  #[cfg_attr(
+    docsrs,
+    doc(cfg(all(target_os = "macos", target_arch = "aarch64", feature = "npz")))
+  )]
+  pub fn from_mlx_npz<P: AsRef<Path>>(weights: P, opts: Options) -> Result<Self> {
+    let weights = weights.as_ref();
+    opts.image_budget().validate()?;
+    let backend = crate::runtime::mlx_backend::MlxBackend::from_npz(weights)?;
+    Self::assemble(
+      BackendImpl::Mlx(Box::new(backend)),
+      &crate::runtime::mlx_backend::weights_parent(weights).join("tokenizer.json"),
+      &opts,
+    )
+  }
+
+  /// Construct an MLX (`mlxrs`) Metal-backed engine from an **exact** `*.gguf`
+  /// file path (Apple Silicon only). The `config.json` and the `tokenizer.json`
+  /// are read from the weight file's **parent directory** (`weights.parent()`);
+  /// the gguf's embedded metadata is NOT mapped to a config, so a sibling
+  /// `config.json` is still required.
+  ///
+  /// Explicit-format MLX constructor (see
+  /// [`from_mlx_safetensors`](Self::from_mlx_safetensors)); always builds the MLX
+  /// backend, no ONNX fallback.
+  #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "gguf"))]
+  #[cfg_attr(
+    docsrs,
+    doc(cfg(all(target_os = "macos", target_arch = "aarch64", feature = "gguf")))
+  )]
+  pub fn from_mlx_gguf<P: AsRef<Path>>(weights: P, opts: Options) -> Result<Self> {
+    let weights = weights.as_ref();
+    opts.image_budget().validate()?;
+    let backend = crate::runtime::mlx_backend::MlxBackend::from_gguf(weights)?;
+    Self::assemble(
+      BackendImpl::Mlx(Box::new(backend)),
+      &crate::runtime::mlx_backend::weights_parent(weights).join("tokenizer.json"),
+      &opts,
+    )
+  }
+
   /// Shared engine assembly: load the tokenizer from `tokenizer_path`, validate
   /// its EOS + image special-token contract, and build the [`Engine`] around the
   /// already-constructed `backend`. Used by both the ONNX [`from_paths`] and the
