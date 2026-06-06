@@ -48,6 +48,7 @@ use crate::{
   options::{Options, RequestOptions},
   preproc::Preprocessor,
   runtime::{
+    backend::{BackendImpl, OrtBackend},
     decoder::Decoder,
     embed_tokens::EmbedTokens,
     sampler::{ConstrainedSampler, FreeSampler},
@@ -64,9 +65,10 @@ use toktrie::TokEnv;
 /// layout, or via [`Engine::from_paths`] for unusual file arrangements.
 pub struct Engine {
   preproc: Preprocessor,
-  vision: VisionEncoder,
-  embed: EmbedTokens,
-  decoder: Decoder,
+  /// Drives vision encode / text embed / decoder forward / KV cache.
+  /// Phase 1 holds the ORT variant; the seam lets phase 2 add an
+  /// on-device backend without touching the generation loop.
+  backend: BackendImpl,
   tokenizer: Tokenizer,
   /// Bytes of `tokenizer.json` captured at construction. Storing
   /// a `tokenizer_path` and re-reading lazily inside
@@ -255,9 +257,7 @@ impl Engine {
 
     Ok(Self {
       preproc,
-      vision,
-      embed,
-      decoder,
+      backend: BackendImpl::Ort(OrtBackend::new(vision, embed, decoder)),
       tokenizer,
       tokenizer_bytes,
       parser_factory: None,
@@ -280,9 +280,7 @@ impl Engine {
     let mut sampler = FreeSampler::new(*req, seed, self.tokenizer.get_vocab_size(true) as u32);
     generate(
       &self.preproc,
-      &mut self.vision,
-      &mut self.embed,
-      &mut self.decoder,
+      &mut self.backend,
       &self.tokenizer,
       &mut sampler,
       GenerateInputs::new(messages, images, req, self.eos_token_id),
@@ -356,9 +354,7 @@ impl Engine {
     );
     let text = generate(
       &self.preproc,
-      &mut self.vision,
-      &mut self.embed,
-      &mut self.decoder,
+      &mut self.backend,
       &self.tokenizer,
       &mut sampler,
       GenerateInputs::new(&messages, images, req, self.eos_token_id),

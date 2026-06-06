@@ -1,0 +1,289 @@
+//! Backend seam over the vision / embed / decoder / KV-cache stack.
+//!
+//! [`generate`](crate::generate::generate) drives the whole VLM pipeline
+//! through a single [`Backend`] trait instead of three concrete ORT
+//! component handles. The loop stays backend-agnostic: it owns
+//! tokenization, `<image>`-token position discovery, the sampler,
+//! detokenization, EOS handling, admission/DoS guards, and loop control.
+//! Everything that touches model weights — text embedding, per-image
+//! vision encoding + splice, and the decoder forward — goes through the
+//! trait.
+//!
+//! The design constraint that shapes this seam: the prompt embeddings AND
+//! the KV cache are **backend-internal associated types** ([`Backend::Embeds`]
+//! and [`Backend::Cache`]). Only the decoder logits (`Vec<f32>`) and token
+//! ids cross the abstraction boundary. For the ORT backend the embeds are a
+//! host `Vec<f32>` buffer and the cache is the ONNX [`KvCache`]; a future
+//! on-device backend can keep both as device tensors with no host
+//! round-trip, because nothing outside the trait ever inspects them.
+
+use crate::{
+  error::Result,
+  preproc::{Preprocessor, TileGrid},
+  runtime::{
+    decoder::{Decoder, KvCache},
+    embed_tokens::EmbedTokens,
+    vision::VisionEncoder,
+  },
+};
+
+/// Embedding dimension for text and vision outputs (1024 for LFM2.5-VL).
+const EMBED_DIM: usize = 1024;
+
+/// Drives the model-weight stage of generation: text embedding, vision
+/// encoding + splice, and the decoder forward.
+///
+/// The embeds and KV cache are associated types so each backend can hold
+/// them in whatever form avoids host round-trips. Only logits and token
+/// ids cross the boundary, so the [`generate`](crate::generate::generate)
+/// loop never manipulates embedding buffers directly.
+pub(crate) trait Backend {
+  /// Prompt + per-token embeddings, in whatever form the backend prefers
+  /// (host `Vec<f32>` for ORT; an on-device tensor for a future backend).
+  type Embeds;
+
+  /// Per-call KV / conv cache. Owned by the loop, threaded back into
+  /// [`Backend::decoder_step`].
+  type Cache;
+
+  /// Construct a fresh, zero-initialized cache for one generation call.
+  fn make_cache(&self) -> Result<Self::Cache>;
+
+  /// Build the full prompt `inputs_embeds`: embed the token ids, encode
+  /// each image, and splice the per-image vision embeds in at the given
+  /// `<image>`-token positions.
+  ///
+  /// `image_positions` lists the indices (into `input_ids`) of the
+  /// `<image>` placeholder tokens, in order. `grids` carries one resolved
+  /// [`TileGrid`] per image (same order as `images`), so the backend can
+  /// re-derive per-image token counts and re-validate the rendered layout
+  /// against the decoded image. `preproc` decodes + patchifies each image
+  /// one at a time so peak memory stays at O(1 image's pixel buffer).
+  fn prepare_prompt_embeds(
+    &mut self,
+    preproc: &Preprocessor,
+    input_ids: &[i64],
+    images: &[crate::ImageInput<'_>],
+    grids: &[TileGrid],
+    image_positions: &[usize],
+  ) -> Result<Self::Embeds>;
+
+  /// Embed a single newly-sampled token id for the decode loop.
+  fn embed_one(&mut self, token_id: i64) -> Result<Self::Embeds>;
+
+  /// Decoder forward over `embeds` (the prompt at prefill, one token per
+  /// decode step). Advances `cache` in place and returns the HOST logits
+  /// for the sampler. `seq_len` is the number of new positions this step.
+  fn decoder_step(
+    &mut self,
+    cache: &mut Self::Cache,
+    embeds: &Self::Embeds,
+    seq_len: usize,
+  ) -> Result<Vec<f32>>;
+}
+
+/// Host-side embedding buffer used by [`OrtBackend`]: a flat
+/// `[positions × 1024]` `f32` slab in the ONNX `inputs_embeds` layout.
+pub(crate) struct OrtEmbeds(Vec<f32>);
+
+impl OrtEmbeds {
+  /// Borrow the flat buffer for the decoder's `inputs_embeds` input.
+  pub(crate) fn as_slice(&self) -> &[f32] {
+    &self.0
+  }
+}
+
+/// ONNX/`ort`-backed [`Backend`]. Owns the three ONNX component sessions
+/// (vision encoder, embed-tokens, decoder); embeds are host `Vec<f32>`
+/// and the cache is the ONNX [`KvCache`].
+pub(crate) struct OrtBackend {
+  vision: VisionEncoder,
+  embed: EmbedTokens,
+  decoder: Decoder,
+}
+
+impl OrtBackend {
+  /// Construct from the three ONNX component sessions.
+  pub(crate) fn new(vision: VisionEncoder, embed: EmbedTokens, decoder: Decoder) -> Self {
+    Self {
+      vision,
+      embed,
+      decoder,
+    }
+  }
+}
+
+impl Backend for OrtBackend {
+  type Embeds = OrtEmbeds;
+  type Cache = KvCache;
+
+  fn make_cache(&self) -> Result<Self::Cache> {
+    self.decoder.new_cache()
+  }
+
+  fn prepare_prompt_embeds(
+    &mut self,
+    preproc: &Preprocessor,
+    input_ids: &[i64],
+    images: &[crate::ImageInput<'_>],
+    grids: &[TileGrid],
+    image_positions: &[usize],
+  ) -> Result<Self::Embeds> {
+    let seq_len = input_ids.len();
+    let mut text_embeds: Vec<f32> = self.embed.run(input_ids)?;
+    debug_assert_eq!(text_embeds.len(), seq_len * EMBED_DIM);
+
+    // For each image: preprocess (decode + smart_resize + flatten_to_patches)
+    // → vision encode → splice → DROP pixel buffer at iteration end. The
+    // per-image PreprocessedImage is local to each iteration and freed when
+    // the loop body exits, so peak memory is O(1 image's pixel buffer)
+    // instead of O(N).
+    let mut pos_cursor: usize = 0;
+    for (img, grid) in images.iter().zip(grids.iter()) {
+      // Decode + preprocess just this image. The decoded DynamicImage and
+      // the resulting PreprocessedImage both go out of scope at the end
+      // of this iteration, freeing their pixel buffers.
+      let decoded = match img {
+        #[cfg(not(target_arch = "wasm32"))]
+        crate::ImageInput::Path(p) => crate::preproc::decode_with_orientation(p)?,
+        crate::ImageInput::Bytes(b) => crate::preproc::decode_bytes_with_orientation(b)?,
+      };
+      let preprocessed_img = preproc.preprocess(&decoded)?;
+      drop(decoded); // free the source RGB buffer before vision.run
+
+      // The prompt was rendered using `grid` (computed from header
+      // dimensions, EXIF-corrected by image_dimensions); preprocessed_img's
+      // grid comes from the actually-decoded image. With the EXIF fix in
+      // image_dimensions these must agree; if they don't, markers and
+      // features would bind to wrong spatial positions even when total
+      // token counts happen to match (e.g., a 4×2 layout vs 2×4 layout
+      // both have 8 main tiles + same thumbnail tokens).
+      let expected_info = grid.to_placeholder_info();
+      let actual_info = preprocessed_img.to_placeholder_info();
+      if expected_info != actual_info {
+        return Err(crate::error::Error::ImageGridLayoutMismatch {
+          expected_rows: expected_info.rows(),
+          expected_cols: expected_info.cols(),
+          actual_rows: actual_info.rows(),
+          actual_cols: actual_info.cols(),
+        });
+      }
+      let n_img_tokens = grid.num_image_tokens();
+      let vision_embeds: Vec<f32> = self.vision.run(&preprocessed_img)?;
+      drop(preprocessed_img); // free pixel_values before splicing
+
+      // Vision encoder returns [num_image_tokens × 1024] flat.
+      if vision_embeds.len() != n_img_tokens * EMBED_DIM {
+        return Err(crate::error::Error::SessionShapeMismatch {
+          input: "image_features",
+          expected: "num_image_tokens * 1024",
+          got: vec![vision_embeds.len() as i64],
+        });
+      }
+
+      // Splice vision embedding for each image-token position.
+      for k in 0..n_img_tokens {
+        let tok_pos = image_positions[pos_cursor + k];
+        let dst_start = tok_pos * EMBED_DIM;
+        let src_start = k * EMBED_DIM;
+        text_embeds[dst_start..dst_start + EMBED_DIM]
+          .copy_from_slice(&vision_embeds[src_start..src_start + EMBED_DIM]);
+      }
+      pos_cursor += n_img_tokens;
+    }
+
+    Ok(OrtEmbeds(text_embeds))
+  }
+
+  fn embed_one(&mut self, token_id: i64) -> Result<Self::Embeds> {
+    Ok(OrtEmbeds(self.embed.run(&[token_id])?))
+  }
+
+  fn decoder_step(
+    &mut self,
+    cache: &mut Self::Cache,
+    embeds: &Self::Embeds,
+    seq_len: usize,
+  ) -> Result<Vec<f32>> {
+    self.decoder.step(cache, embeds.as_slice(), seq_len)
+  }
+}
+
+/// The backend [`Engine`](crate::Engine) drives generation through.
+///
+/// Single-variant in phase 1 (ORT only); a future on-device variant lands
+/// here as a second arm. The enum implements [`Backend`] by delegating to
+/// the active variant, so [`generate`](crate::generate::generate) stays
+/// generic over [`Backend`] and gains a second backend with no signature
+/// change. The associated [`Backend::Embeds`] / [`Backend::Cache`] types
+/// are themselves enums ([`EngineEmbeds`] / [`EngineCache`]) so each
+/// variant keeps its embeds + cache in its own native form — the ORT
+/// variant on the host, a future variant on-device — with no cross-variant
+/// conversion.
+pub(crate) enum BackendImpl {
+  /// ONNX/`ort` backend (the only variant in phase 1).
+  Ort(OrtBackend),
+}
+
+/// Per-variant embeds for [`BackendImpl`]. See [`BackendImpl`] for why the
+/// associated embeds type is an enum.
+pub(crate) enum EngineEmbeds {
+  /// Host `Vec<f32>` embeds for the ORT backend.
+  Ort(OrtEmbeds),
+}
+
+/// Per-variant cache for [`BackendImpl`]. See [`BackendImpl`] for why the
+/// associated cache type is an enum.
+pub(crate) enum EngineCache {
+  /// ONNX [`KvCache`] for the ORT backend.
+  Ort(KvCache),
+}
+
+impl Backend for BackendImpl {
+  type Embeds = EngineEmbeds;
+  type Cache = EngineCache;
+
+  fn make_cache(&self) -> Result<Self::Cache> {
+    match self {
+      Self::Ort(b) => Ok(EngineCache::Ort(b.make_cache()?)),
+    }
+  }
+
+  fn prepare_prompt_embeds(
+    &mut self,
+    preproc: &Preprocessor,
+    input_ids: &[i64],
+    images: &[crate::ImageInput<'_>],
+    grids: &[TileGrid],
+    image_positions: &[usize],
+  ) -> Result<Self::Embeds> {
+    match self {
+      Self::Ort(b) => Ok(EngineEmbeds::Ort(b.prepare_prompt_embeds(
+        preproc,
+        input_ids,
+        images,
+        grids,
+        image_positions,
+      )?)),
+    }
+  }
+
+  fn embed_one(&mut self, token_id: i64) -> Result<Self::Embeds> {
+    match self {
+      Self::Ort(b) => Ok(EngineEmbeds::Ort(b.embed_one(token_id)?)),
+    }
+  }
+
+  fn decoder_step(
+    &mut self,
+    cache: &mut Self::Cache,
+    embeds: &Self::Embeds,
+    seq_len: usize,
+  ) -> Result<Vec<f32>> {
+    match (self, cache, embeds) {
+      (Self::Ort(b), EngineCache::Ort(cache), EngineEmbeds::Ort(embeds)) => {
+        b.decoder_step(cache, embeds, seq_len)
+      }
+    }
+  }
+}
