@@ -25,13 +25,22 @@
 //!
 //! # Weight source
 //!
-//! The MLX backend consumes an **MLX-format checkpoint** (`config.json` +
-//! `model.safetensors`), not the ONNX graphs. The loader reads the safetensors,
-//! runs [`Lfm2Vl::sanitize`], and builds the model via [`Lfm2Vl::from_weights`].
-//! A quantized checkpoint (e.g. the `LiquidAI/LFM2.5-VL-450M-MLX-8bit` export)
-//! is detected by the `mlxrs` convention — the presence of any `<layer>.scales`
-//! sibling — and loaded with the `(group_size, bits, mode)` parsed from the
-//! `config.json` `quantization` block.
+//! The MLX backend consumes an **MLX-format checkpoint** (`config.json` + a
+//! weight file), not the ONNX graphs. The loader reads `config.json`, then
+//! probes the directory for a weight file in priority order — `model.safetensors`
+//! (always), then (when the `npz` feature is on) a `*.npz`, then (when the
+//! `gguf` feature is on) a `*.gguf` — loads it via the matching `mlxrs` loader
+//! (see [`load_weights`]), runs [`Lfm2Vl::sanitize`], and builds the model via
+//! [`Lfm2Vl::from_weights`]. A quantized checkpoint (e.g. the
+//! `LiquidAI/LFM2.5-VL-450M-MLX-8bit` export) is detected by the `mlxrs`
+//! convention — the presence of any `<layer>.scales` sibling — and loaded with
+//! the `(group_size, bits, mode)` parsed from the `config.json` `quantization`
+//! block.
+//!
+//! The model dimensions + quantization scheme are always read from
+//! `config.json`; the gguf path is a **weight load seam only** — its embedded
+//! metadata is NOT mapped to a config, so a gguf checkpoint still requires a
+//! `config.json` alongside it.
 //!
 //! # Preprocessing
 //!
@@ -59,13 +68,15 @@ use crate::{
 };
 
 /// The MLX-format config file name inside a checkpoint directory (the `mlxrs`
-/// checkpoint marker, paired with [`MLX_WEIGHTS`]).
+/// checkpoint marker, paired with a weight file).
 pub(crate) const MLX_CONFIG: &str = "config.json";
 
-/// The MLX-format weights file name. Its presence (with [`MLX_CONFIG`], and the
-/// absence of the ONNX graphs) is the signal [`Engine::from_dir`](crate::Engine)
-/// routes to the MLX backend on Apple Silicon.
-pub(crate) const MLX_WEIGHTS: &str = "model.safetensors";
+/// The MLX-format safetensors weights file name — the always-available baseline
+/// weight format. Its presence (with [`MLX_CONFIG`], a weight file in any
+/// enabled format, and the absence of the ONNX graphs) is one signal
+/// [`Engine::from_dir`](crate::Engine) routes to the MLX backend on Apple
+/// Silicon.
+pub(crate) const MLX_SAFETENSORS: &str = "model.safetensors";
 
 /// The per-layer quantization marker `mlxrs` (and mlx-lm / mlx-vlm) use: a
 /// quantized `nn.Linear` / `nn.Embedding` stores its packed weight alongside a
@@ -75,10 +86,45 @@ pub(crate) const MLX_WEIGHTS: &str = "model.safetensors";
 /// choice on.
 const QUANT_SCALES_SUFFIX: &str = ".scales";
 
+/// Report whether `dir` holds an MLX weight file in any ENABLED format:
+/// `model.safetensors` always; a `*.npz` only under the `npz` feature; a
+/// `*.gguf` only under the `gguf` feature. Mirrors the priority the loader's
+/// [`load_weights`] detector probes, so routing and loading agree on which
+/// formats count. A dir with only `model.npz` therefore routes to MLX iff `npz`
+/// is on.
+fn has_mlx_weights(dir: &Path) -> bool {
+  if dir.join(MLX_SAFETENSORS).is_file() {
+    return true;
+  }
+  #[cfg(feature = "npz")]
+  if has_extension(dir, "npz") {
+    return true;
+  }
+  #[cfg(feature = "gguf")]
+  if has_extension(dir, "gguf") {
+    return true;
+  }
+  false
+}
+
+/// Whether `dir` contains at least one file with the given `extension`. Only
+/// referenced from the `npz`/`gguf` arms of [`has_mlx_weights`], so it is
+/// `cfg`-elided on a default (safetensors-only) build.
+#[cfg(any(feature = "npz", feature = "gguf"))]
+fn has_extension(dir: &Path, extension: &str) -> bool {
+  let Ok(entries) = std::fs::read_dir(dir) else {
+    return false;
+  };
+  entries.flatten().any(|entry| {
+    let path = entry.path();
+    path.extension().and_then(|e| e.to_str()) == Some(extension) && path.is_file()
+  })
+}
+
 /// Probe `dir` and report whether the MLX backend should load it: `true` iff it
-/// contains an MLX `config.json` and a `model.safetensors` AND **neither** of
-/// `required_onnx` (the ONNX graph file name(s) the ORT path loads) is a file in
-/// `dir`.
+/// contains an MLX `config.json` and a weight file in any enabled format (see
+/// [`has_mlx_weights`]) AND **neither** of `required_onnx` (the ONNX graph file
+/// name(s) the ORT path loads) is a file in `dir`.
 ///
 /// `config.json` + `model.safetensors` are also the standard HuggingFace
 /// source-asset names, so the required ONNX graph is the disambiguator: a
@@ -90,7 +136,7 @@ const QUANT_SCALES_SUFFIX: &str = ".scales";
 /// does the real load and surfaces a typed error if the checkpoint is malformed.
 pub(crate) fn prefer_mlx(dir: &Path, required_onnx: &[&str]) -> bool {
   dir.join(MLX_CONFIG).is_file()
-    && dir.join(MLX_WEIGHTS).is_file()
+    && has_mlx_weights(dir)
     && !required_onnx.iter().any(|onnx| dir.join(onnx).is_file())
 }
 
@@ -102,6 +148,88 @@ pub(crate) fn prefer_mlx(dir: &Path, required_onnx: &[&str]) -> bool {
 /// to pick the quantization-config thread.
 fn weights_are_quantized(weights: &std::collections::HashMap<String, Array>) -> bool {
   weights.keys().any(|k| k.ends_with(QUANT_SCALES_SUFFIX))
+}
+
+/// Probe `dir` for an MLX weight file in priority order and load it via the
+/// matching `mlxrs` loader, returning the raw (pre-`sanitize`) weight map.
+///
+/// Priority:
+/// 1. `model.safetensors` → [`mlxrs::io::load_safetensors`] (always available).
+/// 2. *(feature `npz`)* a `*.npz` (`model.npz` / `weights.npz`, else the single
+///    `.npz` in the dir) → [`mlxrs::io::load_npz`].
+/// 3. *(feature `gguf`)* a `*.gguf` (`model.gguf`, else the single `.gguf`) →
+///    [`mlxrs::io::load_gguf`] (its `.0` weight map; the gguf metadata is NOT
+///    mapped to a config — `config.json` is still read separately).
+///
+/// Returns [`Error::Mlx`] (no MLX checkpoint) when no weight file in any enabled
+/// format is present. The npz/gguf branches are compiled only when the
+/// corresponding crate feature is enabled, so a default (safetensors-only) build
+/// neither compiles nor depends on them.
+fn load_weights(dir: &Path) -> Result<std::collections::HashMap<String, Array>> {
+  let safetensors = dir.join(MLX_SAFETENSORS);
+  if safetensors.is_file() {
+    return mlxrs::io::load_safetensors(&safetensors).map_err(Error::from_mlx);
+  }
+
+  #[cfg(feature = "npz")]
+  if let Some(npz) = find_weight_file(dir, "npz", &["model.npz", "weights.npz"]) {
+    return mlxrs::io::load_npz(&npz).map_err(Error::from_mlx);
+  }
+
+  #[cfg(feature = "gguf")]
+  if let Some(gguf) = find_weight_file(dir, "gguf", &["model.gguf"]) {
+    return mlxrs::io::load_gguf(&gguf)
+      .map(|(w, _meta)| w)
+      .map_err(Error::from_mlx);
+  }
+
+  Err(Error::mlx_owned(format!(
+    "no MLX checkpoint weight file in {}: expected {MLX_SAFETENSORS}{}",
+    dir.display(),
+    enabled_format_hint(),
+  )))
+}
+
+/// Suffix listing the additional weight formats the build accepts, for the
+/// "no MLX checkpoint" error. Empty on a default (safetensors-only) build.
+fn enabled_format_hint() -> &'static str {
+  match (cfg!(feature = "npz"), cfg!(feature = "gguf")) {
+    (true, true) => " (or a *.npz / *.gguf)",
+    (true, false) => " (or a *.npz)",
+    (false, true) => " (or a *.gguf)",
+    (false, false) => "",
+  }
+}
+
+/// Find a single weight file of the given `extension` in `dir`: prefer one of
+/// the `preferred` canonical names (in order), else the **sole** file with that
+/// extension. Returns `None` if none is present or the choice is ambiguous (more
+/// than one candidate and no preferred name matched), so a malformed multi-shard
+/// layout falls through to the typed "no checkpoint" error rather than picking
+/// an arbitrary file.
+///
+/// Only referenced from the `npz` / `gguf` detection branches, so it is dead
+/// (and `cfg`-elided) on a default build.
+#[cfg(any(feature = "npz", feature = "gguf"))]
+fn find_weight_file(dir: &Path, extension: &str, preferred: &[&str]) -> Option<std::path::PathBuf> {
+  for name in preferred {
+    let candidate = dir.join(name);
+    if candidate.is_file() {
+      return Some(candidate);
+    }
+  }
+  let mut sole: Option<std::path::PathBuf> = None;
+  for entry in std::fs::read_dir(dir).ok()?.flatten() {
+    let path = entry.path();
+    if path.extension().and_then(|e| e.to_str()) == Some(extension) && path.is_file() {
+      if sole.is_some() {
+        // More than one `.<ext>` file and no preferred name matched: ambiguous.
+        return None;
+      }
+      sole = Some(path);
+    }
+  }
+  sole
 }
 
 /// MLX-backed [`Backend`] for LFM2.5-VL. Owns the loaded [`Lfm2Vl`] model.
@@ -117,26 +245,28 @@ pub(crate) struct MlxBackend {
 
 impl MlxBackend {
   /// Load an [`MlxBackend`] from an MLX checkpoint directory containing
-  /// `config.json` and `model.safetensors`.
+  /// `config.json` and a weight file in any enabled format (`model.safetensors`,
+  /// or — with the `npz`/`gguf` features — a `*.npz`/`*.gguf`; see
+  /// [`load_weights`]).
   ///
-  /// Parses the [`ModelConfig`] off `config.json`, loads + [`sanitize`s the
-  /// weights](Lfm2Vl::sanitize), discriminates dense vs quantized by the
-  /// `.scales`-presence convention, and constructs the model via
+  /// Parses the [`ModelConfig`] off `config.json`, detects + loads the weight
+  /// file + [`sanitize`s it](Lfm2Vl::sanitize), discriminates dense vs quantized
+  /// by the `.scales`-presence convention, and constructs the model via
   /// [`Lfm2Vl::from_weights`] (threading the parsed `(group_size, bits, mode)`
   /// quantization for a quantized checkpoint, `None` for a dense one).
   ///
   /// # Errors
-  /// - [`Error::Io`] if `config.json` / `model.safetensors` cannot be read;
-  /// - [`Error::Mlx`] for any `mlxrs` parse / load / construction failure
-  ///   (malformed config, corrupt safetensors, weight/key mismatch).
+  /// - [`Error::Io`] if `config.json` cannot be read;
+  /// - [`Error::Mlx`] if no weight file in any enabled format is present, or for
+  ///   any `mlxrs` parse / load / construction failure (malformed config,
+  ///   corrupt weights, weight/key mismatch).
   pub(crate) fn from_dir(dir: &Path) -> Result<Self> {
     let config_path = dir.join(MLX_CONFIG);
-    let weights_path = dir.join(MLX_WEIGHTS);
 
     let config_json = std::fs::read_to_string(&config_path).map_err(Error::Io)?;
     let config = ModelConfig::from_json(&config_json).map_err(Error::from_mlx)?;
 
-    let raw = mlxrs::io::load_safetensors(&weights_path).map_err(Error::from_mlx)?;
+    let raw = load_weights(dir)?;
     let weights = Lfm2Vl::sanitize(raw).map_err(Error::from_mlx)?;
 
     // An MLX LFM2.5-VL checkpoint may be a QUANTIZED safetensors (the released
@@ -322,7 +452,7 @@ mod tests {
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).expect("mkdir tmp");
     std::fs::write(tmp.join(MLX_CONFIG), b"{}").expect("write config.json");
-    std::fs::write(tmp.join(MLX_WEIGHTS), b"\0").expect("write model.safetensors");
+    std::fs::write(tmp.join(MLX_SAFETENSORS), b"\0").expect("write model.safetensors");
     assert!(
       prefer_mlx(&tmp, &["vision_encoder.onnx", "decoder_model_merged.onnx"]),
       "config.json + model.safetensors present (no ONNX graphs) must select MLX"
@@ -340,7 +470,7 @@ mod tests {
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).expect("mkdir tmp");
     std::fs::write(tmp.join(MLX_CONFIG), b"{}").expect("write config.json");
-    std::fs::write(tmp.join(MLX_WEIGHTS), b"\0").expect("write model.safetensors");
+    std::fs::write(tmp.join(MLX_SAFETENSORS), b"\0").expect("write model.safetensors");
     std::fs::write(tmp.join("vision_encoder.onnx"), b"\0").expect("write vision onnx");
     std::fs::write(tmp.join("decoder_model_merged.onnx"), b"\0").expect("write decoder onnx");
     assert!(
@@ -449,5 +579,149 @@ mod tests {
       last_position_logits_f32(&rank2),
       Err(Error::Mlx(_))
     ));
+  }
+
+  /// Create a fresh temp dir for a format-detection test, named for `tag`.
+  fn detect_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+      "lfm_mlx_detect_{tag}_{}_{:?}",
+      std::process::id(),
+      std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create temp detect dir");
+    dir
+  }
+
+  /// `load_weights` over a dir with no weight file in any enabled format returns
+  /// the typed "no MLX checkpoint" [`Error::Mlx`] (naming `model.safetensors`),
+  /// rather than a panic.
+  #[test]
+  fn load_weights_no_weight_file_is_typed_error() {
+    let dir = detect_dir("none");
+    // The `Ok` type (`HashMap<_, Array>`) is not `Debug`, so destructure the
+    // `Result` directly rather than via `expect_err`.
+    let result = load_weights(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    match result {
+      Err(Error::Mlx(msg)) => assert!(
+        msg.contains("model.safetensors"),
+        "the no-checkpoint error must name model.safetensors, got {msg:?}"
+      ),
+      Err(other) => panic!("expected Error::Mlx for a weight-less dir, got {other:?}"),
+      Ok(_) => panic!("a dir with no weight file must be rejected"),
+    }
+  }
+
+  /// The npz weight-file detector prefers a canonical `model.npz` and otherwise
+  /// accepts the sole `.npz` in the dir, but reports `None` (ambiguous → falls
+  /// through to the typed no-checkpoint error) when several `.npz` files exist
+  /// and none is a preferred name. Empty marker files suffice — the detector
+  /// only inspects names/extensions, never contents.
+  #[cfg(feature = "npz")]
+  #[test]
+  fn find_weight_file_npz_prefers_canonical_then_sole() {
+    let sole = detect_dir("npz_sole");
+    std::fs::write(sole.join("export.npz"), b"").expect("write export.npz");
+    let picked = find_weight_file(&sole, "npz", &["model.npz", "weights.npz"])
+      .expect("the sole .npz must be selected");
+    assert_eq!(picked, sole.join("export.npz"));
+    let _ = std::fs::remove_dir_all(&sole);
+
+    let canon = detect_dir("npz_canon");
+    std::fs::write(canon.join("export.npz"), b"").expect("write export.npz");
+    std::fs::write(canon.join("model.npz"), b"").expect("write model.npz");
+    let picked = find_weight_file(&canon, "npz", &["model.npz", "weights.npz"])
+      .expect("model.npz must win over a non-canonical sibling");
+    assert_eq!(picked, canon.join("model.npz"));
+    let _ = std::fs::remove_dir_all(&canon);
+
+    let ambig = detect_dir("npz_ambig");
+    std::fs::write(ambig.join("a.npz"), b"").expect("write a.npz");
+    std::fs::write(ambig.join("b.npz"), b"").expect("write b.npz");
+    assert!(
+      find_weight_file(&ambig, "npz", &["model.npz", "weights.npz"]).is_none(),
+      "two non-canonical .npz files must be ambiguous (None)"
+    );
+    let _ = std::fs::remove_dir_all(&ambig);
+  }
+
+  /// The gguf weight-file detector prefers a canonical `model.gguf` and
+  /// otherwise accepts the sole `.gguf` in the dir.
+  #[cfg(feature = "gguf")]
+  #[test]
+  fn find_weight_file_gguf_prefers_canonical_then_sole() {
+    let sole = detect_dir("gguf_sole");
+    std::fs::write(sole.join("q8.gguf"), b"").expect("write q8.gguf");
+    let picked =
+      find_weight_file(&sole, "gguf", &["model.gguf"]).expect("the sole .gguf must be selected");
+    assert_eq!(picked, sole.join("q8.gguf"));
+    let _ = std::fs::remove_dir_all(&sole);
+
+    let canon = detect_dir("gguf_canon");
+    std::fs::write(canon.join("q8.gguf"), b"").expect("write q8.gguf");
+    std::fs::write(canon.join("model.gguf"), b"").expect("write model.gguf");
+    let picked = find_weight_file(&canon, "gguf", &["model.gguf"])
+      .expect("model.gguf must win over a non-canonical sibling");
+    assert_eq!(picked, canon.join("model.gguf"));
+    let _ = std::fs::remove_dir_all(&canon);
+  }
+
+  /// `model.safetensors` wins over a present `*.npz`/`*.gguf` regardless of which
+  /// features are on: the detector probes safetensors first. With an empty
+  /// safetensors marker present, `load_weights` reaches the real
+  /// `load_safetensors` (which surfaces an `mlxrs` parse error on the empty
+  /// file — proving safetensors was the selected branch, not npz/gguf).
+  #[test]
+  fn load_weights_prefers_safetensors_first() {
+    let dir = detect_dir("prefer_st");
+    std::fs::write(dir.join(MLX_SAFETENSORS), b"").expect("write empty safetensors");
+    #[cfg(feature = "npz")]
+    std::fs::write(dir.join("model.npz"), b"").expect("write model.npz");
+    #[cfg(feature = "gguf")]
+    std::fs::write(dir.join("model.gguf"), b"").expect("write model.gguf");
+    // The `Ok` type is not `Debug`, so destructure the `Result` directly.
+    let result = load_weights(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    match result {
+      Err(Error::Mlx(_)) => {}
+      Err(other) => panic!("expected an Error::Mlx from the safetensors loader, got {other:?}"),
+      Ok(_) => panic!("an empty safetensors must surface a load error, not succeed"),
+    }
+  }
+
+  /// A dir with only `config.json` + `model.npz` (no safetensors, no ONNX graph)
+  /// is recognized as an MLX checkpoint by `prefer_mlx` **iff** the `npz` feature
+  /// is on — the routing widens to the same formats the loader accepts. Without
+  /// `npz`, the `.npz` is not a recognized weight file and `prefer_mlx` is
+  /// `false`.
+  #[test]
+  fn prefer_mlx_npz_only_routes_iff_npz_feature() {
+    let tmp = detect_dir("probe_npz");
+    std::fs::write(tmp.join(MLX_CONFIG), b"{}").expect("write config.json");
+    std::fs::write(tmp.join("model.npz"), b"\0").expect("write model.npz");
+    let routed = prefer_mlx(&tmp, &["vision_encoder.onnx", "decoder_model_merged.onnx"]);
+    let _ = std::fs::remove_dir_all(&tmp);
+    assert_eq!(
+      routed,
+      cfg!(feature = "npz"),
+      "a config.json + model.npz dir must route to MLX iff the npz feature is on"
+    );
+  }
+
+  /// Same contract for gguf: a `config.json` + `model.gguf` dir routes to MLX
+  /// iff the `gguf` feature is on.
+  #[test]
+  fn prefer_mlx_gguf_only_routes_iff_gguf_feature() {
+    let tmp = detect_dir("probe_gguf");
+    std::fs::write(tmp.join(MLX_CONFIG), b"{}").expect("write config.json");
+    std::fs::write(tmp.join("model.gguf"), b"\0").expect("write model.gguf");
+    let routed = prefer_mlx(&tmp, &["vision_encoder.onnx", "decoder_model_merged.onnx"]);
+    let _ = std::fs::remove_dir_all(&tmp);
+    assert_eq!(
+      routed,
+      cfg!(feature = "gguf"),
+      "a config.json + model.gguf dir must route to MLX iff the gguf feature is on"
+    );
   }
 }

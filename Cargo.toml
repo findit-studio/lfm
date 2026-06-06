@@ -85,6 +85,20 @@ inference   = ["dep:ort", "dep:tokenizers", "dep:llguidance", "dep:toktrie", "de
 # `--features bundled` build would fail to expose Engine.
 bundled     = ["inference", "decoders"]
 decoders    = ["image/jpeg", "image/png"]
+# Widen which weight FORMATS the auto-selected MLX (`mlxrs`) backend accepts on
+# Apple Silicon. Off by default, the MLX path reads only `model.safetensors`
+# (and the crate builds everywhere exactly as before). With `npz`/`gguf` on, the
+# loader's format detector additionally probes a `*.npz`/`*.gguf`, and
+# `Engine::from_dir`'s MLX probe routes such a dir to MLX. Each enables the
+# matching `mlxrs` feature; `mlxrs` is a macOS-arm64-only target dependency, so
+# on every other target the `mlxrs/<fmt>` activation is a harmless no-op (the
+# npz/gguf detection code is itself `#[cfg(feature = ...)]`-gated, so it isn't
+# compiled). These are NOT a backend knob — MLX stays auto-selected by platform;
+# they only widen the accepted weight formats. (gguf is a weight load seam: its
+# embedded metadata is not mapped to a config — a `config.json` is still
+# required alongside it.)
+npz         = ["mlxrs/npz"]
+gguf        = ["mlxrs/gguf"]
 # NOTE: there is intentionally no `mlx` feature. The MLX (`mlxrs`) Metal backend
 # is selected automatically by platform — see the `mlxrs` target dependency
 # above and the `Engine::from_dir` auto-routing in `src/engine.rs`. On
