@@ -115,6 +115,28 @@ impl Engine {
   #[cfg_attr(docsrs, doc(cfg(feature = "bundled")))]
   pub fn from_dir<P: AsRef<Path>>(model_dir: P, opts: Options) -> Result<Self> {
     let dir: PathBuf = model_dir.as_ref().to_path_buf();
+
+    // Apple-Silicon backend auto-selection: when the directory is an MLX
+    // checkpoint (a `config.json` + `model.safetensors`, and NONE of the ORT
+    // path's `onnx/*.onnx` graphs present) route to the MLX (`mlxrs`) Metal
+    // backend. There is no user-facing knob — platform + checkpoint shape decide.
+    // The ONNX-graph absence is the disambiguator: `config.json` +
+    // `model.safetensors` are also the standard HuggingFace source-asset names,
+    // and the ORT path reads the `onnx/*.onnx` graphs while the MLX path never
+    // does, so a directory carrying those graphs is an ONNX checkpoint and falls
+    // through to the ONNX path below. The MLX checkpoint's `config.json` is the
+    // MLX-format config (NOT byte-equal to the bundled ONNX `config.json`), so
+    // this branch MUST precede the ONNX-specific bundled drift validations, which
+    // would otherwise reject it. Off macOS/arm64 this arm is cfg-compiled-out and
+    // only the ONNX path exists.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if crate::runtime::mlx_backend::prefer_mlx(
+      &dir,
+      &["onnx/vision_encoder.onnx", "onnx/decoder_model_merged.onnx"],
+    ) {
+      return Self::from_mlx_dir(&dir, opts);
+    }
+
     // validate preprocessor_config.json
     // matches our hardcoded algorithm constants. A model directory
     // with compatible ONNX shapes but a drifted preprocessing config
@@ -205,6 +227,10 @@ impl Engine {
   }
 
   /// Construct from explicit paths (for non-standard layouts).
+  ///
+  /// Always builds the ONNX/`ort` backend. The MLX (`mlxrs`) backend is reached
+  /// only through the platform auto-routing in [`from_dir`](Self::from_dir) /
+  /// [`from_mlx_dir`](Self::from_mlx_dir) — there is no user-facing backend knob.
   pub fn from_paths(paths: EnginePaths, opts: Options) -> Result<Self> {
     // Validate budget BEFORE any expensive work. validate_image_tokenizer_contract
     // performs an O(max_tiles²) nested scan; without this guard, an invalid
@@ -212,20 +238,57 @@ impl Engine {
     // indefinitely. Validate() also caps max_tiles at MAX_TOKENIZER_TILE_DIM=10
     // so the scan is provably bounded after this returns Ok.
     opts.image_budget().validate()?;
-    let preproc = Preprocessor::new(*opts.image_budget());
     let vision = VisionEncoder::from_path(paths.vision(), &opts)?;
     let embed = EmbedTokens::from_path(paths.embed(), &opts)?;
     let decoder = Decoder::from_path(paths.decoder(), &opts)?;
-    // Clone tokenizer path before passing it to from_file; we store it
-    // for the lazy ParserFactory which uses toktrie_hf_tokenizers::ByteTokenizer::from_file.
-    let tokenizer_path = paths.tokenizer().clone();
+    Self::assemble(
+      BackendImpl::Ort(OrtBackend::new(vision, embed, decoder)),
+      paths.tokenizer(),
+      &opts,
+    )
+  }
+
+  /// Construct an MLX (`mlxrs`) Metal-backed engine from an MLX checkpoint
+  /// directory (`config.json` + `model.safetensors` + `tokenizer.json`).
+  ///
+  /// Apple-Silicon only; on every other platform this constructor does not
+  /// exist (the `mlxrs` dependency is macOS/arm64-only). It is normally reached
+  /// via [`from_dir`](Self::from_dir)'s platform auto-routing rather than called
+  /// directly. The engine still owns tokenization, the chat template, EOS
+  /// handling, and the sampler — the MLX backend replaces only the model-weight
+  /// stages (text embed, vision encode + splice, decoder forward). The
+  /// directory's `tokenizer.json` is used (validated against the
+  /// `expand_image_placeholders` special-token contract), and the model weights
+  /// are loaded from `model.safetensors`.
+  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  #[cfg_attr(docsrs, doc(cfg(all(target_os = "macos", target_arch = "aarch64"))))]
+  pub fn from_mlx_dir<P: AsRef<Path>>(model_dir: P, opts: Options) -> Result<Self> {
+    let dir = model_dir.as_ref();
+    opts.image_budget().validate()?;
+    let backend = crate::runtime::mlx_backend::MlxBackend::from_dir(dir)?;
+    Self::assemble(
+      BackendImpl::Mlx(Box::new(backend)),
+      &dir.join("tokenizer.json"),
+      &opts,
+    )
+  }
+
+  /// Shared engine assembly: load the tokenizer from `tokenizer_path`, validate
+  /// its EOS + image special-token contract, and build the [`Engine`] around the
+  /// already-constructed `backend`. Used by both the ONNX [`from_paths`] and the
+  /// MLX [`from_mlx_dir`] paths so they share one tokenizer / EOS / parser-factory
+  /// setup.
+  ///
+  /// The caller has already validated the image budget.
+  fn assemble(backend: BackendImpl, tokenizer_path: &Path, opts: &Options) -> Result<Self> {
+    let preproc = Preprocessor::new(*opts.image_budget());
     // read bytes ONCE, then build the
     // `tokenizers::Tokenizer` from those exact bytes. The same
     // bytes are stored on the Engine and reused by the lazy
     // ParserFactory — guaranteeing the schema matcher and the
     // tokenizer/embedding stack agree, regardless of any later
     // file changes at `tokenizer_path`.
-    let tokenizer_bytes = std::fs::read(&tokenizer_path).map_err(Error::Io)?;
+    let tokenizer_bytes = std::fs::read(tokenizer_path).map_err(Error::Io)?;
     let tokenizer = Tokenizer::from_bytes(&tokenizer_bytes).map_err(Error::tokenizer)?;
 
     // EOS token: LFM2.5-VL chat models use <|im_end|> (id 7).
@@ -257,7 +320,7 @@ impl Engine {
 
     Ok(Self {
       preproc,
-      backend: BackendImpl::Ort(OrtBackend::new(vision, embed, decoder)),
+      backend,
       tokenizer,
       tokenizer_bytes,
       parser_factory: None,

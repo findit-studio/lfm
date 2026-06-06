@@ -246,6 +246,19 @@ pub enum Error {
   #[error("generation produced empty output")]
   Empty,
 
+  // ===== MLX backend (Apple Silicon only) =====
+  /// MLX (`mlxrs`) backend failure — checkpoint load, model construction, or a
+  /// device-tensor op on the Apple-Silicon path.
+  ///
+  /// `mlxrs::Error` is a structured enum; it is stringified into this variant at
+  /// the crate boundary (the same way the ONNX path's
+  /// [`Tokenizer`](Self::Tokenizer) / [`LlGuidance`](Self::LlGuidance) wrap their
+  /// sources) because lfm does not depend on `mlxrs` off macOS/arm64, so the
+  /// concrete type cannot appear in the public `Error` shape on every platform.
+  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  #[error("mlx backend: {0}")]
+  Mlx(String),
+
   // ===== Configuration =====
   /// Invalid `RequestOptions`.
   #[error("invalid RequestOptions: {0}")]
@@ -288,6 +301,33 @@ impl Error {
     E: Into<Box<dyn std::error::Error + Send + Sync>>,
   {
     Self::LlGuidance(e.into())
+  }
+
+  /// Wrap an `mlxrs::Error` (any `Display` source) as the [`Mlx`](Self::Mlx)
+  /// variant. Use at call-sites on the MLX path: `.map_err(Error::from_mlx)`.
+  /// `mlxrs::Error` is structured but cannot appear in lfm's cross-platform
+  /// `Error` shape (lfm does not depend on `mlxrs` off macOS/arm64), so it is
+  /// stringified at the boundary.
+  #[allow(dead_code)]
+  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  pub(crate) fn from_mlx<E: std::fmt::Display>(e: E) -> Self {
+    Self::Mlx(e.to_string())
+  }
+
+  /// Build an [`Mlx`](Self::Mlx) error from a static message (an MLX-path
+  /// invariant with no source error).
+  #[allow(dead_code)]
+  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  pub(crate) fn mlx(msg: &'static str) -> Self {
+    Self::Mlx(msg.to_string())
+  }
+
+  /// Build an [`Mlx`](Self::Mlx) error from an owned, runtime-built message
+  /// (e.g. one naming an offending token id or a bad logits shape).
+  #[allow(dead_code)]
+  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  pub(crate) fn mlx_owned(msg: String) -> Self {
+    Self::Mlx(msg)
   }
 }
 

@@ -312,13 +312,46 @@ mod render {
       .template_from_str(stripped_template())
       .map_err(crate::error::Error::tokenizer)?;
 
+    // Canonicalize the tools object to sorted-key order before rendering. The
+    // template emits `tools | tojson`, whose key order follows the
+    // `serde_json::Value` object's backing map. That map is a sorted `BTreeMap`
+    // by default but becomes an insertion-order `IndexMap` whenever ANY crate in
+    // the dependency graph enables `serde_json`'s `preserve_order` feature
+    // (Cargo unifies features globally — e.g. the macOS/arm64 `mlxrs` backend
+    // dependency pulls it in). Rebuilding the value with keys inserted in sorted
+    // order pins the rendered tool JSON to the same deterministic sorted output
+    // on every platform regardless of that feature, so the prompt the model sees
+    // does not silently depend on which other crates are linked.
+    let canonical_tools = tools.map(canonicalize_json_keys);
     let ctx = Value::from_serialize(&RenderContext {
       bos_token: BOS,
       messages,
-      tools,
+      tools: canonical_tools.as_ref(),
       add_generation_prompt,
     });
     tmpl.render(ctx).map_err(crate::error::Error::tokenizer)
+  }
+
+  /// Recursively rebuild a [`serde_json::Value`] with every object's keys
+  /// inserted in sorted (lexicographic) order, so the serialized key order is
+  /// deterministic regardless of whether `serde_json`'s `preserve_order` feature
+  /// is active in the dependency graph (see [`apply_chat_template`]). Arrays
+  /// recurse element-wise; scalars are returned unchanged.
+  fn canonicalize_json_keys(value: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+      Value::Object(map) => {
+        let mut keys: Vec<&String> = map.keys().collect();
+        keys.sort();
+        let mut out = serde_json::Map::new();
+        for k in keys {
+          out.insert(k.clone(), canonicalize_json_keys(&map[k]));
+        }
+        Value::Object(out)
+      }
+      Value::Array(items) => Value::Array(items.iter().map(canonicalize_json_keys).collect()),
+      other => other.clone(),
+    }
   }
 
   #[derive(Serialize)]

@@ -211,18 +211,34 @@ impl Backend for OrtBackend {
 
 /// The backend [`Engine`](crate::Engine) drives generation through.
 ///
-/// Single-variant in phase 1 (ORT only); a future on-device variant lands
-/// here as a second arm. The enum implements [`Backend`] by delegating to
-/// the active variant, so [`generate`](crate::generate::generate) stays
-/// generic over [`Backend`] and gains a second backend with no signature
-/// change. The associated [`Backend::Embeds`] / [`Backend::Cache`] types
-/// are themselves enums ([`EngineEmbeds`] / [`EngineCache`]) so each
-/// variant keeps its embeds + cache in its own native form — the ORT
-/// variant on the host, a future variant on-device — with no cross-variant
-/// conversion.
+/// The ORT variant is always present; on Apple Silicon a second on-device
+/// [`MlxBackend`](crate::runtime::mlx_backend::MlxBackend) arm is compiled in
+/// and auto-selected by checkpoint shape (see
+/// [`Engine::from_dir`](crate::Engine)). The enum implements [`Backend`] by
+/// delegating to the active variant, so [`generate`](crate::generate::generate)
+/// stays generic over [`Backend`]. The associated [`Backend::Embeds`] /
+/// [`Backend::Cache`] types are themselves enums ([`EngineEmbeds`] /
+/// [`EngineCache`]) so each variant keeps its embeds + cache in its own native
+/// form — the ORT variant on the host, the MLX variant on-device — with no
+/// cross-variant conversion.
+///
+/// An [`Engine`](crate::Engine) holds exactly one `BackendImpl` (never an array
+/// or a hot-path collection of them), so the inter-variant size difference is
+/// not a layout concern — hence the `large_enum_variant` allow. The larger MLX
+/// model is still boxed to keep the moved-around enum small.
+#[cfg_attr(
+  all(target_os = "macos", target_arch = "aarch64"),
+  allow(clippy::large_enum_variant)
+)]
 pub(crate) enum BackendImpl {
-  /// ONNX/`ort` backend (the only variant in phase 1).
+  /// ONNX/`ort` backend.
   Ort(OrtBackend),
+  /// MLX (`mlxrs`) Metal backend — Apple Silicon only. Boxed because the loaded
+  /// [`Lfm2Vl`](mlxrs::vlm::models::lfm2_vl::Lfm2Vl) model is much larger than
+  /// the ORT variant's session handles; boxing keeps `BackendImpl` small (one
+  /// `Engine` holds exactly one backend, so the indirection cost is negligible).
+  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  Mlx(Box<crate::runtime::mlx_backend::MlxBackend>),
 }
 
 /// Per-variant embeds for [`BackendImpl`]. See [`BackendImpl`] for why the
@@ -230,6 +246,9 @@ pub(crate) enum BackendImpl {
 pub(crate) enum EngineEmbeds {
   /// Host `Vec<f32>` embeds for the ORT backend.
   Ort(OrtEmbeds),
+  /// On-device mlx [`Array`](mlxrs::Array) embeds for the MLX backend.
+  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  Mlx(mlxrs::Array),
 }
 
 /// Per-variant cache for [`BackendImpl`]. See [`BackendImpl`] for why the
@@ -237,6 +256,9 @@ pub(crate) enum EngineEmbeds {
 pub(crate) enum EngineCache {
   /// ONNX [`KvCache`] for the ORT backend.
   Ort(KvCache),
+  /// The LFM2 heterogeneous per-layer KV/conv cache for the MLX backend.
+  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  Mlx(Vec<Box<dyn mlxrs::lm::cache::KvCache>>),
 }
 
 impl Backend for BackendImpl {
@@ -246,6 +268,8 @@ impl Backend for BackendImpl {
   fn make_cache(&self) -> Result<Self::Cache> {
     match self {
       Self::Ort(b) => Ok(EngineCache::Ort(b.make_cache()?)),
+      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      Self::Mlx(b) => Ok(EngineCache::Mlx(b.make_cache()?)),
     }
   }
 
@@ -265,12 +289,22 @@ impl Backend for BackendImpl {
         grids,
         image_positions,
       )?)),
+      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      Self::Mlx(b) => Ok(EngineEmbeds::Mlx(b.prepare_prompt_embeds(
+        preproc,
+        input_ids,
+        images,
+        grids,
+        image_positions,
+      )?)),
     }
   }
 
   fn embed_one(&mut self, token_id: i64) -> Result<Self::Embeds> {
     match self {
       Self::Ort(b) => Ok(EngineEmbeds::Ort(b.embed_one(token_id)?)),
+      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      Self::Mlx(b) => Ok(EngineEmbeds::Mlx(b.embed_one(token_id)?)),
     }
   }
 
@@ -284,6 +318,18 @@ impl Backend for BackendImpl {
       (Self::Ort(b), EngineCache::Ort(cache), EngineEmbeds::Ort(embeds)) => {
         b.decoder_step(cache, embeds, seq_len)
       }
+      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      (Self::Mlx(b), EngineCache::Mlx(cache), EngineEmbeds::Mlx(embeds)) => {
+        b.decoder_step(cache, embeds, seq_len)
+      }
+      // A cross-variant (backend, cache, embeds) mix is unreachable: the engine
+      // builds the cache + embeds from the SAME backend variant it dispatches
+      // on, so the tuple is always all-Ort or all-Mlx. The wildcard keeps the
+      // match exhaustive across the platform-gated variant set.
+      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      _ => Err(crate::error::Error::InvalidRequest(
+        "backend / cache / embeds variant mismatch (internal invariant violation)",
+      )),
     }
   }
 }
