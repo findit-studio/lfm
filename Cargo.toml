@@ -64,7 +64,7 @@ fast_image_resize = "6.0.0"
 # gives the LFM2.5-VL vision-language model + its NaFlex preprocessing. There is
 # intentionally NO `mlx` Cargo feature — MLX is auto-selected by platform.
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
-mlxrs = { path = "../mlxrs/mlxrs", default-features = false, features = ["lfm2-vl"] }
+mlxrs = { git = "https://github.com/Findit-AI/mlxrs", branch = "main", default-features = false, features = ["lfm2-vl"] }
 
 [dev-dependencies]
 serde_json = "1"
