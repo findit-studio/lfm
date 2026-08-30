@@ -131,6 +131,113 @@ pub enum Error {
     budget: crate::options::ImageBudget,
   },
 
+  /// The one authoritative [`ImagePlan`](crate::preproc::ImagePlan) — the plan
+  /// that rendered the prompt's image markers and sized admission control —
+  /// disagrees with what the backend's own preprocessing actually produced for
+  /// that image.
+  ///
+  /// Every backend re-derives its per-image layout from the pixels it really
+  /// decoded; a disagreement means the `<image>`-token runs in the prompt and
+  /// the vision feature rows would bind to different positions. Fail closed:
+  /// the alternative is a silent misbinding whose total token count can still
+  /// line up (e.g. a 4×2 grid's features spliced into a 2×4 marker layout).
+  #[error(
+    "image plan mismatch for image #{image}: {parameter} planned {planned}, preprocessing produced {produced} (prompt markers and vision features would bind to different positions)"
+  )]
+  ImagePlanMismatch {
+    /// Zero-based index of the offending image in the request.
+    image: usize,
+    /// Which quantity disagreed (`"sub-image count"`, `"image tokens"`, …).
+    parameter: &'static str,
+    /// The value the authoritative plan carried.
+    planned: usize,
+    /// The value the backend's preprocessing produced.
+    produced: usize,
+  },
+
+  /// A tiling parameter this build relies on disagrees with the MLX
+  /// checkpoint's own value in `config.json`.
+  ///
+  /// The MLX path preprocesses through the checkpoint's own tiling
+  /// (`Lfm2Vl::split_image`, driven by `config.json`), while the prompt's
+  /// `<image>` markers and the admission gates are rendered from `lfm`'s
+  /// [`ImageBudget`](crate::ImageBudget) plus its hardcoded patch/tile
+  /// constants. If the two disagree the marker layout and the feature block
+  /// disagree too, so the load is refused **by name** rather than silently
+  /// producing a mismatched prompt.
+  ///
+  /// The default [`ImageBudget::new()`](crate::ImageBudget::new) expresses "no
+  /// opinion" and adopts the checkpoint's tiling instead of being compared
+  /// against it; any other budget must match exactly.
+  #[error(
+    "MLX checkpoint tiling mismatch on `{parameter}`: lfm has {lfm_value}, the checkpoint's config.json has {checkpoint_value}"
+  )]
+  MlxTilingMismatch {
+    /// The disagreeing parameter's name.
+    parameter: &'static str,
+    /// The value `lfm` would use (from `ImageBudget` or a crate constant).
+    lfm_value: SmolStr,
+    /// The value the checkpoint's `config.json` carries.
+    checkpoint_value: SmolStr,
+  },
+
+  // ===== Backend / checkpoint selection =====
+  /// The checkpoint directory does not resolve to exactly one backend and no
+  /// [`Options::with_backend`](crate::Options::with_backend) pin says which to
+  /// use.
+  ///
+  /// Raised for genuinely undecidable layouts — notably a *partial* ONNX graph
+  /// set sitting next to an MLX weight set. (A **complete** ONNX graph set next
+  /// to MLX-format source assets is decided, not ambiguous: the graphs win, as
+  /// documented on [`Engine::from_dir`](crate::Engine::from_dir), and
+  /// [`Engine::backend`](crate::Engine::backend) reports the choice.)
+  #[error("ambiguous checkpoint layout in {dir}: {detail}")]
+  CheckpointLayoutAmbiguous {
+    /// The checkpoint directory that could not be classified.
+    dir: PathBuf,
+    /// What made it ambiguous.
+    detail: &'static str,
+  },
+
+  /// The directory holds an MLX checkpoint whose only weight file is in a
+  /// format this build did not enable.
+  ///
+  /// Detected up front, so the load reports the disabled format instead of
+  /// falling through to the ONNX path and failing on an unrelated missing
+  /// graph.
+  #[error(
+    "checkpoint in {dir} carries MLX weights only in the `{format}` format, which this build of lfm does not enable — rebuild with the `{format}` feature, or supply weights in an enabled format"
+  )]
+  CheckpointFormatDisabled {
+    /// The checkpoint directory.
+    dir: PathBuf,
+    /// The disabled weight format (`"npz"` / `"gguf"`).
+    format: &'static str,
+  },
+
+  /// The directory looks like a checkpoint but is missing the files the
+  /// selected backend needs.
+  #[error("incomplete checkpoint in {dir}: {detail}")]
+  CheckpointIncomplete {
+    /// The checkpoint directory.
+    dir: PathBuf,
+    /// What is missing.
+    detail: &'static str,
+  },
+
+  /// The backend pinned by [`Options::with_backend`](crate::Options::with_backend)
+  /// cannot serve this checkpoint on this platform.
+  ///
+  /// Never silently substituted — a caller who asked for MLX and got ONNX
+  /// would be running a different numerical path than requested.
+  #[error("backend `{requested}` unavailable for this checkpoint: {reason}")]
+  BackendUnavailable {
+    /// The backend the caller pinned.
+    requested: crate::options::BackendKind,
+    /// Why it cannot be served.
+    reason: &'static str,
+  },
+
   // ===== Tokenization / template =====
   /// `<image>` placeholder count mismatch with input image count.
   #[error("expected {expected} <image> placeholder(s) in prompt, got {got}")]
@@ -205,19 +312,26 @@ pub enum Error {
   )]
   SamplerNonFinite,
 
-  /// One of the ONNX session outputs contained a NaN or non-finite
-  /// value before any sampler logic ran. Covers the
-  /// embed_tokens / vision_encoder / decoder pipelines —
-  /// e.g., a numerically broken ONNX export, a vendor execution
-  /// provider with a bad kernel, or a corrupted weight file.
-  /// Fail closed at the session boundary so a single NaN can't
-  /// silently propagate through the embedding splice + decoder
-  /// attention into every subsequent step. The `stage` identifies
-  /// which session produced the bad output for diagnosis.
-  #[error("{stage} session produced non-finite output (NaN/Inf)")]
+  /// A model stage produced a NaN or infinite value before any sampler logic
+  /// ran. Covers the embed_tokens / vision_encoder / decoder pipelines on
+  /// **either** backend — e.g. a numerically broken ONNX export, a vendor
+  /// execution provider with a bad kernel, a corrupted weight file, or an MLX
+  /// kernel overflowing on a quantized checkpoint.
+  ///
+  /// Fail closed at the stage boundary so a single non-finite value can't
+  /// silently propagate through the embedding splice + decoder attention into
+  /// every subsequent step. In particular a lone `+inf` logit is rejected here
+  /// rather than admitted: greedy would always pick it, and the temperature
+  /// path's softmax degrades to a uniform distribution spread over *every*
+  /// entry — including the `-inf` entries an llguidance mask used to forbid a
+  /// token, so a schema-disallowed token could win the draw.
+  ///
+  /// The `stage` identifies which stage produced the bad output. Both backends
+  /// raise the same variant for the same defect, so the ONNX and MLX roads
+  /// stay behaviourally identical at this boundary.
+  #[error("{stage} stage produced non-finite output (NaN/Inf)")]
   SessionNonFiniteOutput {
-    /// Which ONNX session: `"embed_tokens"`, `"vision_encoder"`,
-    /// or `"decoder"`.
+    /// Which stage: `"embed_tokens"`, `"vision_encoder"`, or `"decoder"`.
     stage: &'static str,
   },
 

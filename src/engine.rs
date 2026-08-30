@@ -45,10 +45,11 @@ use crate::{
   },
   error::{Error, Result},
   generate::{GenerateInputs, generate},
-  options::{Options, RequestOptions},
-  preproc::Preprocessor,
+  options::{BackendKind, ImageBudget, Options, RequestOptions},
+  preproc::{ImagePlan, Preprocessor},
   runtime::{
-    backend::{BackendImpl, OrtBackend},
+    backend::{Backend, BackendImpl, OrtBackend},
+    checkpoint::{self, CheckpointLayout},
     decoder::Decoder,
     embed_tokens::EmbedTokens,
     sampler::{ConstrainedSampler, FreeSampler},
@@ -102,41 +103,62 @@ impl Engine {
   ///   preprocessor_config.json
   /// ```
   ///
-  /// **Strict constructor.** Validates `preprocessor_config.json`
-  /// matches our hardcoded preprocessing constants AND validates the
-  /// supplied `tokenizer.json` byte-matches the bundled blob — a
-  /// custom tokenizer whose normal vocabulary drifts from what the
-  /// embedding table expects would silently corrupt prompts.
-  /// Requires the `bundled` feature so the
-  /// byte-compare reference is available; without it, use
-  /// [`Engine::from_paths`] (the unchecked escape hatch for advanced
-  /// callers pairing custom tokenizers with custom ONNX).
+  /// **Strict constructor.** Whichever backend the directory selects, the
+  /// checkpoint is validated against what this build of `lfm` hardcodes before
+  /// the constructor returns:
+  ///
+  /// - the supplied `tokenizer.json` must byte-match the bundled blob — a
+  ///   custom tokenizer whose normal vocabulary drifts from what the embedding
+  ///   table expects would silently corrupt every prompt;
+  /// - `chat_template.jinja` must byte-match the bundled template the renderer
+  ///   actually uses;
+  /// - the model's real context limit must match
+  ///   [`MODEL_CONTEXT_TOKENS`](crate::options::MODEL_CONTEXT_TOKENS), which the
+  ///   admission gates trust;
+  /// - the preprocessing geometry must match — for ONNX that is
+  ///   `preprocessor_config.json` against the crate's constants; for MLX it is
+  ///   the checkpoint's `config.json` tiling against those constants and against
+  ///   the [`ImageBudget`] the prompt's markers are rendered from.
+  ///
+  /// Requires the `bundled` feature so the byte-compare references are
+  /// available. The named escape hatches are [`Engine::from_paths`] (ONNX) and
+  /// [`Engine::from_mlx_dir_unchecked`] and friends (MLX).
+  ///
+  /// # Backend selection
+  ///
+  /// The layout decides, and the decision is observable through
+  /// [`Engine::backend`]. A **complete** `onnx/` graph set selects ONNX even
+  /// when MLX-format assets sit beside it, because `config.json` +
+  /// `model.safetensors` are also the standard HuggingFace source-asset names —
+  /// an export shipping those next to its graphs is an ONNX checkpoint.
+  /// [`Options::with_backend`] overrides that, and every layout that has no
+  /// documented answer (a half-present graph set beside MLX weights, weights in
+  /// a format this build disabled, an MLX checkpoint on a non-Apple-Silicon
+  /// host) is a named error rather than a fall-through to an unrelated
+  /// missing-graph failure.
   #[cfg(feature = "bundled")]
   #[cfg_attr(docsrs, doc(cfg(feature = "bundled")))]
   pub fn from_dir<P: AsRef<Path>>(model_dir: P, opts: Options) -> Result<Self> {
     let dir: PathBuf = model_dir.as_ref().to_path_buf();
-
-    // Apple-Silicon backend auto-selection: when the directory is an MLX
-    // checkpoint (a `config.json` + `model.safetensors`, and NONE of the ORT
-    // path's `onnx/*.onnx` graphs present) route to the MLX (`mlxrs`) Metal
-    // backend. There is no user-facing knob — platform + checkpoint shape decide.
-    // The ONNX-graph absence is the disambiguator: `config.json` +
-    // `model.safetensors` are also the standard HuggingFace source-asset names,
-    // and the ORT path reads the `onnx/*.onnx` graphs while the MLX path never
-    // does, so a directory carrying those graphs is an ONNX checkpoint and falls
-    // through to the ONNX path below. The MLX checkpoint's `config.json` is the
-    // MLX-format config (NOT byte-equal to the bundled ONNX `config.json`), so
-    // this branch MUST precede the ONNX-specific bundled drift validations, which
-    // would otherwise reject it. Off macOS/arm64 this arm is cfg-compiled-out and
-    // only the ONNX path exists.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    if crate::runtime::mlx_backend::prefer_mlx(
-      &dir,
-      &["onnx/vision_encoder.onnx", "onnx/decoder_model_merged.onnx"],
-    ) {
-      return Self::from_mlx_dir(&dir, opts);
+    match select_backend(&dir, opts.backend())? {
+      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      BackendKind::Mlx => Self::from_mlx_dir(&dir, opts),
+      // `select_backend` has already refused an MLX selection on a platform
+      // that does not compile the backend, so this arm is unreachable there;
+      // it keeps the match exhaustive across the platform-gated variant set.
+      #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+      BackendKind::Mlx => Err(Error::BackendUnavailable {
+        requested: BackendKind::Mlx,
+        reason: "the MLX backend is compiled only on macOS/arm64 (aarch64-apple-darwin)",
+      }),
+      _ => Self::from_onnx_checkpoint_dir(&dir, opts),
     }
+  }
 
+  /// The ONNX half of [`Engine::from_dir`]: the strict drift validations
+  /// against the bundled assets, then the three graphs.
+  #[cfg(feature = "bundled")]
+  fn from_onnx_checkpoint_dir(dir: &Path, opts: Options) -> Result<Self> {
     // validate preprocessor_config.json
     // matches our hardcoded algorithm constants. A model directory
     // with compatible ONNX shapes but a drifted preprocessing config
@@ -244,33 +266,64 @@ impl Engine {
     Self::assemble(
       BackendImpl::Ort(OrtBackend::new(vision, embed, decoder)),
       paths.tokenizer(),
-      &opts,
+      *opts.image_budget(),
     )
   }
 
   /// Construct an MLX (`mlxrs`) Metal-backed engine from an MLX checkpoint
-  /// directory (`config.json` + `model.safetensors` + `tokenizer.json`).
+  /// directory (`config.json` + a weight set + `tokenizer.json`).
   ///
   /// Apple-Silicon only; on every other platform this constructor does not
   /// exist (the `mlxrs` dependency is macOS/arm64-only). It is normally reached
-  /// via [`from_dir`](Self::from_dir)'s platform auto-routing rather than called
+  /// via [`from_dir`](Self::from_dir)'s auto-routing rather than called
   /// directly. The engine still owns tokenization, the chat template, EOS
   /// handling, and the sampler — the MLX backend replaces only the model-weight
-  /// stages (text embed, vision encode + splice, decoder forward). The
-  /// directory's `tokenizer.json` is used (validated against the
-  /// `expand_image_placeholders` special-token contract), and the model weights
-  /// are loaded from `model.safetensors`.
+  /// stages (text embed, vision encode + splice, decoder forward).
+  ///
+  /// **Strict constructor**, matching [`from_dir`](Self::from_dir): the
+  /// directory's `tokenizer.json` must byte-match the bundled blob and its
+  /// `chat_template.jinja` must byte-match the bundled template, on top of the
+  /// structural contract every MLX road enforces (see
+  /// [`from_mlx_dir_unchecked`](Self::from_mlx_dir_unchecked)). Use the
+  /// `_unchecked` door for a custom checkpoint.
+  #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "bundled"))]
+  #[cfg_attr(
+    docsrs,
+    doc(cfg(all(target_os = "macos", target_arch = "aarch64", feature = "bundled")))
+  )]
+  pub fn from_mlx_dir<P: AsRef<Path>>(model_dir: P, opts: Options) -> Result<Self> {
+    let dir = model_dir.as_ref();
+    validate_mlx_checkpoint_identity(dir)?;
+    Self::from_mlx_dir_unchecked(dir, opts)
+  }
+
+  /// Construct an MLX engine from a checkpoint directory **without** the
+  /// bundled-identity validations.
+  ///
+  /// This is the named door for a custom MLX checkpoint: a fine-tune with its
+  /// own tokenizer, or a re-export whose `chat_template.jinja` differs from the
+  /// one this crate renders with. Skipping those checks means YOU are asserting
+  /// that the checkpoint's vocabulary and prompt format match what `lfm`
+  /// renders; if they do not, prompts are corrupted silently.
+  ///
+  /// What is **not** skippable, because `lfm`'s own arithmetic depends on it and
+  /// no assertion by the caller can make it safe:
+  ///
+  /// - the model's context limit must equal
+  ///   [`MODEL_CONTEXT_TOKENS`](crate::options::MODEL_CONTEXT_TOKENS), which the
+  ///   admission gates use unconditionally;
+  /// - the checkpoint's patch size, downsample factor, tile size and `<image>`
+  ///   token id must equal the constants baked into this crate's token math;
+  /// - the checkpoint's tiling must be one the prompt's markers can express,
+  ///   and must agree with a non-default [`ImageBudget`] (see
+  ///   [`Error::MlxTilingMismatch`](crate::Error::MlxTilingMismatch)).
   #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
   #[cfg_attr(docsrs, doc(cfg(all(target_os = "macos", target_arch = "aarch64"))))]
-  pub fn from_mlx_dir<P: AsRef<Path>>(model_dir: P, opts: Options) -> Result<Self> {
+  pub fn from_mlx_dir_unchecked<P: AsRef<Path>>(model_dir: P, opts: Options) -> Result<Self> {
     let dir = model_dir.as_ref();
     opts.image_budget().validate()?;
     let backend = crate::runtime::mlx_backend::MlxBackend::from_dir(dir)?;
-    Self::assemble(
-      BackendImpl::Mlx(Box::new(backend)),
-      &dir.join("tokenizer.json"),
-      &opts,
-    )
+    Self::assemble_mlx(backend, &dir.join("tokenizer.json"), &opts)
   }
 
   /// Construct an MLX (`mlxrs`) Metal-backed engine from an **exact**
@@ -278,68 +331,151 @@ impl Engine {
   ///
   /// The explicit-format counterpart to [`from_mlx_dir`](Self::from_mlx_dir): use
   /// it when you already know the checkpoint is an MLX safetensors file and where
-  /// it lives. The `config.json` and the `tokenizer.json` are read from the
-  /// weight file's **parent directory** (`weights.parent()`). There is no ONNX
-  /// fallback — this constructor always builds the MLX backend.
+  /// it lives. The `config.json`, `chat_template.jinja` and `tokenizer.json` are
+  /// read from the weight file's **parent directory** (`weights.parent()`).
+  /// There is no ONNX fallback — this constructor always builds the MLX backend,
+  /// and it is strict; see
+  /// [`from_mlx_safetensors_unchecked`](Self::from_mlx_safetensors_unchecked).
+  #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "bundled"))]
+  #[cfg_attr(
+    docsrs,
+    doc(cfg(all(target_os = "macos", target_arch = "aarch64", feature = "bundled")))
+  )]
+  pub fn from_mlx_safetensors<P: AsRef<Path>>(weights: P, opts: Options) -> Result<Self> {
+    let weights = weights.as_ref();
+    validate_mlx_checkpoint_identity(crate::runtime::mlx_backend::weights_parent(weights))?;
+    Self::from_mlx_safetensors_unchecked(weights, opts)
+  }
+
+  /// [`from_mlx_safetensors`](Self::from_mlx_safetensors) without the
+  /// bundled-identity validations — see
+  /// [`from_mlx_dir_unchecked`](Self::from_mlx_dir_unchecked) for exactly what
+  /// that does and does not skip.
   #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
   #[cfg_attr(docsrs, doc(cfg(all(target_os = "macos", target_arch = "aarch64"))))]
-  pub fn from_mlx_safetensors<P: AsRef<Path>>(weights: P, opts: Options) -> Result<Self> {
+  pub fn from_mlx_safetensors_unchecked<P: AsRef<Path>>(weights: P, opts: Options) -> Result<Self> {
     let weights = weights.as_ref();
     opts.image_budget().validate()?;
     let backend = crate::runtime::mlx_backend::MlxBackend::from_safetensors(weights)?;
-    Self::assemble(
-      BackendImpl::Mlx(Box::new(backend)),
+    Self::assemble_mlx(
+      backend,
       &crate::runtime::mlx_backend::weights_parent(weights).join("tokenizer.json"),
       &opts,
     )
   }
 
   /// Construct an MLX (`mlxrs`) Metal-backed engine from an **exact** `*.npz`
-  /// file path (Apple Silicon only). The `config.json` and the `tokenizer.json`
-  /// are read from the weight file's **parent directory** (`weights.parent()`).
+  /// file path (Apple Silicon only). The sibling assets are read from the weight
+  /// file's **parent directory** (`weights.parent()`).
   ///
   /// Explicit-format MLX constructor (see
   /// [`from_mlx_safetensors`](Self::from_mlx_safetensors)); always builds the MLX
-  /// backend, no ONNX fallback.
+  /// backend, no ONNX fallback, strict.
+  #[cfg(all(
+    target_os = "macos",
+    target_arch = "aarch64",
+    feature = "npz",
+    feature = "bundled"
+  ))]
+  #[cfg_attr(
+    docsrs,
+    doc(cfg(all(
+      target_os = "macos",
+      target_arch = "aarch64",
+      feature = "npz",
+      feature = "bundled"
+    )))
+  )]
+  pub fn from_mlx_npz<P: AsRef<Path>>(weights: P, opts: Options) -> Result<Self> {
+    let weights = weights.as_ref();
+    validate_mlx_checkpoint_identity(crate::runtime::mlx_backend::weights_parent(weights))?;
+    Self::from_mlx_npz_unchecked(weights, opts)
+  }
+
+  /// [`from_mlx_npz`](Self::from_mlx_npz) without the bundled-identity
+  /// validations — see [`from_mlx_dir_unchecked`](Self::from_mlx_dir_unchecked).
   #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "npz"))]
   #[cfg_attr(
     docsrs,
     doc(cfg(all(target_os = "macos", target_arch = "aarch64", feature = "npz")))
   )]
-  pub fn from_mlx_npz<P: AsRef<Path>>(weights: P, opts: Options) -> Result<Self> {
+  pub fn from_mlx_npz_unchecked<P: AsRef<Path>>(weights: P, opts: Options) -> Result<Self> {
     let weights = weights.as_ref();
     opts.image_budget().validate()?;
     let backend = crate::runtime::mlx_backend::MlxBackend::from_npz(weights)?;
-    Self::assemble(
-      BackendImpl::Mlx(Box::new(backend)),
+    Self::assemble_mlx(
+      backend,
       &crate::runtime::mlx_backend::weights_parent(weights).join("tokenizer.json"),
       &opts,
     )
   }
 
   /// Construct an MLX (`mlxrs`) Metal-backed engine from an **exact** `*.gguf`
-  /// file path (Apple Silicon only). The `config.json` and the `tokenizer.json`
-  /// are read from the weight file's **parent directory** (`weights.parent()`);
-  /// the gguf's embedded metadata is NOT mapped to a config, so a sibling
-  /// `config.json` is still required.
+  /// file path (Apple Silicon only). The sibling assets are read from the weight
+  /// file's **parent directory** (`weights.parent()`); the gguf's embedded
+  /// metadata is NOT mapped to a config, so a sibling `config.json` is still
+  /// required.
   ///
   /// Explicit-format MLX constructor (see
   /// [`from_mlx_safetensors`](Self::from_mlx_safetensors)); always builds the MLX
-  /// backend, no ONNX fallback.
+  /// backend, no ONNX fallback, strict.
+  #[cfg(all(
+    target_os = "macos",
+    target_arch = "aarch64",
+    feature = "gguf",
+    feature = "bundled"
+  ))]
+  #[cfg_attr(
+    docsrs,
+    doc(cfg(all(
+      target_os = "macos",
+      target_arch = "aarch64",
+      feature = "gguf",
+      feature = "bundled"
+    )))
+  )]
+  pub fn from_mlx_gguf<P: AsRef<Path>>(weights: P, opts: Options) -> Result<Self> {
+    let weights = weights.as_ref();
+    validate_mlx_checkpoint_identity(crate::runtime::mlx_backend::weights_parent(weights))?;
+    Self::from_mlx_gguf_unchecked(weights, opts)
+  }
+
+  /// [`from_mlx_gguf`](Self::from_mlx_gguf) without the bundled-identity
+  /// validations — see [`from_mlx_dir_unchecked`](Self::from_mlx_dir_unchecked).
   #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "gguf"))]
   #[cfg_attr(
     docsrs,
     doc(cfg(all(target_os = "macos", target_arch = "aarch64", feature = "gguf")))
   )]
-  pub fn from_mlx_gguf<P: AsRef<Path>>(weights: P, opts: Options) -> Result<Self> {
+  pub fn from_mlx_gguf_unchecked<P: AsRef<Path>>(weights: P, opts: Options) -> Result<Self> {
     let weights = weights.as_ref();
     opts.image_budget().validate()?;
     let backend = crate::runtime::mlx_backend::MlxBackend::from_gguf(weights)?;
-    Self::assemble(
-      BackendImpl::Mlx(Box::new(backend)),
+    Self::assemble_mlx(
+      backend,
       &crate::runtime::mlx_backend::weights_parent(weights).join("tokenizer.json"),
       &opts,
     )
+  }
+
+  /// The MLX road's structural contract, then assembly.
+  ///
+  /// Runs on EVERY MLX constructor, strict or `_unchecked`: the context limit
+  /// the admission gates trust, the preprocessing constants this crate's token
+  /// math bakes in, and the reconciliation between the caller's
+  /// [`ImageBudget`] and the checkpoint's own tiling. The budget that survives
+  /// that reconciliation — the checkpoint's own, when the caller passed the
+  /// default — is what the engine's [`Preprocessor`] renders every prompt from,
+  /// so the markers and the features are planned by the same parameters.
+  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  fn assemble_mlx(
+    backend: crate::runtime::mlx_backend::MlxBackend,
+    tokenizer_path: &Path,
+    opts: &Options,
+  ) -> Result<Self> {
+    backend.validate_context_limit()?;
+    let budget = backend.effective_budget(opts.image_budget())?;
+    Self::assemble(BackendImpl::Mlx(Box::new(backend)), tokenizer_path, budget)
   }
 
   /// Shared engine assembly: load the tokenizer from `tokenizer_path`, validate
@@ -348,9 +484,15 @@ impl Engine {
   /// MLX [`from_mlx_dir`] paths so they share one tokenizer / EOS / parser-factory
   /// setup.
   ///
+  /// `budget` is the **effective** image budget — the caller's on the ONNX road,
+  /// and the one reconciled against the checkpoint on the MLX road. Everything
+  /// downstream (marker rendering, admission floors, the backend's own planning)
+  /// reads it from the [`Preprocessor`] built here, so there is exactly one
+  /// budget in play per engine.
+  ///
   /// The caller has already validated the image budget.
-  fn assemble(backend: BackendImpl, tokenizer_path: &Path, opts: &Options) -> Result<Self> {
-    let preproc = Preprocessor::new(*opts.image_budget());
+  fn assemble(backend: BackendImpl, tokenizer_path: &Path, budget: ImageBudget) -> Result<Self> {
+    let preproc = Preprocessor::new(budget);
     // read bytes ONCE, then build the
     // `tokenizers::Tokenizer` from those exact bytes. The same
     // bytes are stored on the Engine and reused by the lazy
@@ -380,7 +522,7 @@ impl Engine {
     // those markers into byte-level tokens while the <image>-token
     // count still matches, corrupting position-token embeddings on
     // every multi-tile prompt with no error reported.
-    validate_image_tokenizer_contract(&tokenizer, opts.image_budget().max_tiles())?;
+    validate_image_tokenizer_contract(&tokenizer, budget.max_tiles())?;
 
     let next_seed = std::time::SystemTime::now()
       .duration_since(std::time::UNIX_EPOCH)
@@ -396,6 +538,65 @@ impl Engine {
       eos_token_id,
       next_seed,
     })
+  }
+
+  /// Which backend this engine actually runs on.
+  ///
+  /// Backend selection is decided by the checkpoint layout (see
+  /// [`from_dir`](Self::from_dir)) or pinned by
+  /// [`Options::with_backend`](crate::Options::with_backend); either way the
+  /// outcome is reportable rather than opaque, which matters because the two
+  /// backends are different numerical paths over the same model.
+  pub fn backend(&self) -> BackendKind {
+    self.backend.kind()
+  }
+
+  /// The **effective** image budget this engine renders prompts from.
+  ///
+  /// On the ONNX road that is the budget from [`Options`]. On the MLX road a
+  /// default [`ImageBudget`] is replaced by the checkpoint's own tiling (see
+  /// [`from_mlx_dir_unchecked`](Self::from_mlx_dir_unchecked)), so reading it
+  /// back is the way to see what the model will actually do.
+  pub fn image_budget(&self) -> &ImageBudget {
+    self.preproc.budget()
+  }
+
+  /// The authoritative [`ImagePlan`] for each image, from header dimensions
+  /// only — no full decode.
+  ///
+  /// This is the same plan `generate` / `run` will use: the marker layout, the
+  /// `<image>`-token count, and the number of sub-images the backend's
+  /// preprocessing must produce. Useful to size or reject a request before
+  /// paying for inference, and to compare what two backends would do with the
+  /// same image.
+  pub fn plan_images(&self, images: &[ImageInput<'_>]) -> Result<Vec<ImagePlan>> {
+    crate::generate::plan_images(&self.preproc, &self.backend, images)
+  }
+
+  /// Run everything up to and including the decoder prefill, and return the
+  /// last-position logits — the model's next-token distribution for this
+  /// prompt.
+  ///
+  /// The full admission control, image planning, prompt rendering and vision
+  /// splice run exactly as they do in [`generate`](Self::generate); only the
+  /// decode loop is skipped. The row is guaranteed finite (a non-finite one is
+  /// [`Error::SessionNonFiniteOutput`](crate::Error::SessionNonFiniteOutput)).
+  ///
+  /// `req`'s sampler fields are unused — no token is drawn — but
+  /// `max_new_tokens` still participates in the context-budget admission
+  /// checks, so the returned distribution is one a matching
+  /// [`generate`](Self::generate) call would really have sampled from.
+  pub fn next_token_logits(
+    &mut self,
+    messages: &[ChatMessage],
+    images: &[ImageInput<'_>],
+    req: &RequestOptions,
+  ) -> Result<Vec<f32>> {
+    req.validate()?;
+    let inputs = GenerateInputs::new(messages, images, req, self.eos_token_id);
+    let prefilled =
+      crate::generate::prefill(&self.preproc, &mut self.backend, &self.tokenizer, &inputs)?;
+    Ok(prefilled.logits)
   }
 
   /// Free-form generation (no schema constraint).
@@ -458,7 +659,7 @@ impl Engine {
         .preproc
         .budget()
         .min_image_tokens()
-        .saturating_add(crate::generate::IMAGE_BLOCK_WRAPPER_TOKENS),
+        .saturating_add(crate::preproc::IMAGE_BLOCK_WRAPPER_TOKENS),
       req.max_new_tokens(),
     )?;
 
@@ -519,6 +720,95 @@ impl Engine {
     self.parser_factory = Some(arc.clone());
     Ok(arc)
   }
+}
+
+// =========================================================================
+// Backend selection
+// =========================================================================
+
+/// Decide which backend a model directory describes, honouring an explicit
+/// [`Options::with_backend`](crate::Options::with_backend) pin.
+///
+/// Every outcome is either a backend or a named error. The three that used to
+/// fall through to the ONNX path and die on a missing graph — a weight set in a
+/// disabled format, a half-present graph set beside MLX weights, and an MLX
+/// checkpoint on a host with no MLX backend — are now reported for what they
+/// are.
+fn select_backend(dir: &Path, pinned: Option<BackendKind>) -> Result<BackendKind> {
+  // (default choice, MLX servable from this dir, ONNX servable from this dir)
+  let (default_choice, mlx_available, onnx_available) = match checkpoint::detect(dir) {
+    // A complete graph set is the documented disambiguator, so ONNX wins by
+    // default — but when MLX assets sit alongside, a pin can select them.
+    CheckpointLayout::Onnx { mlx_alongside } => (BackendKind::Onnx, mlx_alongside, true),
+    CheckpointLayout::Mlx => (BackendKind::Mlx, true, false),
+    CheckpointLayout::MlxFormatDisabled(format) => {
+      return Err(Error::CheckpointFormatDisabled {
+        dir: dir.to_path_buf(),
+        format,
+      });
+    }
+    CheckpointLayout::Incomplete(detail) => {
+      return Err(Error::CheckpointIncomplete {
+        dir: dir.to_path_buf(),
+        detail,
+      });
+    }
+    // An explicit pin is exactly the disambiguation this layout needs; without
+    // one there is no defensible default, so say so instead of guessing.
+    CheckpointLayout::Ambiguous(detail) => {
+      let Some(kind) = pinned else {
+        return Err(Error::CheckpointLayoutAmbiguous {
+          dir: dir.to_path_buf(),
+          detail,
+        });
+      };
+      return require_backend_compiled(kind);
+    }
+  };
+
+  match pinned {
+    Some(BackendKind::Mlx) if !mlx_available => Err(Error::BackendUnavailable {
+      requested: BackendKind::Mlx,
+      reason: "the directory holds no MLX checkpoint (config.json plus a weight set in a format this build enables)",
+    }),
+    Some(BackendKind::Onnx) if !onnx_available => Err(Error::BackendUnavailable {
+      requested: BackendKind::Onnx,
+      reason: "the directory holds no complete ONNX graph set under onnx/",
+    }),
+    Some(kind) => require_backend_compiled(kind),
+    None => require_backend_compiled(default_choice),
+  }
+}
+
+/// Refuse a backend this target does not compile.
+///
+/// `mlxrs` is a macOS/arm64-only target dependency, so an MLX checkpoint opened
+/// on any other host has no backend to run on. Naming that beats reporting a
+/// missing `onnx/vision_encoder.onnx`, which is what a directory of MLX files
+/// used to produce.
+fn require_backend_compiled(kind: BackendKind) -> Result<BackendKind> {
+  #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+  if matches!(kind, BackendKind::Mlx) {
+    return Err(Error::BackendUnavailable {
+      requested: BackendKind::Mlx,
+      reason: "the MLX backend is compiled only on macOS/arm64 (aarch64-apple-darwin)",
+    });
+  }
+  Ok(kind)
+}
+
+/// The bundled-identity half of the MLX road's strict contract: the
+/// checkpoint's `tokenizer.json` and `chat_template.jinja` must byte-match the
+/// blobs this crate renders and tokenizes with.
+///
+/// These are the two assertions a caller can legitimately waive for a custom
+/// checkpoint (hence the `_unchecked` constructors); the structural contract in
+/// [`Engine::assemble_mlx`] cannot be waived.
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "bundled"))]
+fn validate_mlx_checkpoint_identity(dir: &Path) -> Result<()> {
+  validate_tokenizer_matches_bundled(&dir.join("tokenizer.json"))?;
+  validate_chat_template_matches_bundled(&dir.join("chat_template.jinja"))?;
+  Ok(())
 }
 
 // =========================================================================
@@ -861,12 +1151,73 @@ fn validate_chat_template_matches_bundled(path: &Path) -> Result<()> {
     ));
   }
   let supplied = std::fs::read(path).map_err(Error::Io)?;
-  if supplied != crate::bundled::CHAT_TEMPLATE_JINJA {
+  if !chat_templates_render_alike(&supplied, crate::bundled::CHAT_TEMPLATE_JINJA) {
     return Err(Error::InvalidRequest(
-      "supplied chat_template.jinja bytes do not match the bundled chat template — engine renders with bundled template; mismatched model template would produce semantically wrong prompts even when <image> counts line up",
+      "supplied chat_template.jinja does not render the same prompt as the bundled chat template — engine renders with bundled template; mismatched model template would produce semantically wrong prompts even when <image> counts line up",
     ));
   }
   Ok(())
+}
+
+/// Whether two Jinja chat templates render identical prompts.
+///
+/// This is a **drift detector**, not a checksum: what matters is whether the
+/// checkpoint expects a different prompt format than the one this crate renders
+/// with. Two normalizations are applied, both provably output-neutral, and
+/// nothing else — every emitting construct is still compared byte for byte, so
+/// a changed role envelope, image-block wrapping, or literal is still refused:
+///
+/// - **Jinja comments** (`{# … #}`) are removed. A comment cannot reach the
+///   rendered output by construction.
+/// - **Leading whitespace** is trimmed. The bundled template's first emitting
+///   construct is `{{- bos_token -}}`, whose `-` strips the whitespace before
+///   it, so leading whitespace cannot reach the output either. Trailing
+///   whitespace is NOT trimmed: nothing guarantees it is stripped, so a
+///   difference there is still drift.
+///
+/// The motivating case is real: `LiquidAI/LFM2.5-VL-450M-MLX-8bit` ships the
+/// same template as the ONNX export with a two-line
+/// `{# <|tool_list_start|> detection hint for mlx_lm #}` header prepended. A
+/// byte-equality check refuses that checkpoint over a comment — making the
+/// strict MLX constructor unusable against the released weights while catching
+/// nothing.
+#[cfg(feature = "bundled")]
+fn chat_templates_render_alike(supplied: &[u8], bundled: &[u8]) -> bool {
+  strip_jinja_comments(supplied).trim_ascii_start()
+    == strip_jinja_comments(bundled).trim_ascii_start()
+}
+
+/// Remove every `{# … #}` span from a Jinja template.
+///
+/// An unterminated `{#` is left verbatim rather than swallowing the rest of the
+/// file: a template that cannot be tokenized is drift, and silently discarding
+/// its tail would hide that.
+#[cfg(feature = "bundled")]
+fn strip_jinja_comments(template: &[u8]) -> Vec<u8> {
+  const OPEN: &[u8] = b"{#";
+  const CLOSE: &[u8] = b"#}";
+  let mut out = Vec::with_capacity(template.len());
+  let mut rest = template;
+  while let Some(start) = find_subslice(rest, OPEN) {
+    let Some(end) = find_subslice(&rest[start + OPEN.len()..], CLOSE) else {
+      break; // unterminated comment — keep the remainder verbatim
+    };
+    out.extend_from_slice(&rest[..start]);
+    rest = &rest[start + OPEN.len() + end + CLOSE.len()..];
+  }
+  out.extend_from_slice(rest);
+  out
+}
+
+/// Index of the first occurrence of `needle` in `haystack`.
+#[cfg(feature = "bundled")]
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+  if needle.is_empty() || haystack.len() < needle.len() {
+    return None;
+  }
+  haystack
+    .windows(needle.len())
+    .position(|window| window == needle)
 }
 
 #[cfg(feature = "bundled")]
@@ -1315,5 +1666,56 @@ mod tests {
     let ok = dir.join("chat_template-ok.jinja");
     std::fs::write(&ok, crate::bundled::CHAT_TEMPLATE_JINJA).unwrap();
     assert!(validate_chat_template_matches_bundled(&ok).is_ok());
+  }
+
+  /// The template check is a drift detector, not a checksum: a template that
+  /// renders the same prompt must pass, and one that renders a different prompt
+  /// must not.
+  ///
+  /// The accepted case is the released `LiquidAI/LFM2.5-VL-450M-MLX-8bit`
+  /// checkpoint, which ships the bundled template with a two-line Jinja comment
+  /// prepended for mlx_lm's tool detection. Comments cannot reach the rendered
+  /// output, and the leading whitespace they leave behind is swallowed by the
+  /// template's own `{{- bos_token -}}`.
+  #[test]
+  #[cfg(feature = "bundled")]
+  fn chat_template_comment_header_is_not_drift_but_content_is() {
+    let bundled = crate::bundled::CHAT_TEMPLATE_JINJA;
+
+    // The real MLX-8bit header: a comment plus a blank line.
+    let mut mlx_style = b"{# <|tool_list_start|> detection hint for mlx_lm #}\n\n".to_vec();
+    mlx_style.extend_from_slice(bundled);
+    assert!(
+      chat_templates_render_alike(&mlx_style, bundled),
+      "a prepended Jinja comment cannot change the rendered prompt and must not be reported as drift"
+    );
+
+    // A comment in the MIDDLE is equally output-neutral.
+    let mut inner = bundled.to_vec();
+    let insert_at = bundled.len() / 2;
+    inner.splice(
+      insert_at..insert_at,
+      b"{# mid-template note #}".iter().copied(),
+    );
+    assert!(chat_templates_render_alike(&inner, bundled));
+
+    // Real content changes are still refused: a mutated literal…
+    let mut mutated = bundled.to_vec();
+    let last = mutated.len() - 1;
+    mutated[last] = mutated[last].wrapping_add(1);
+    assert!(!chat_templates_render_alike(&mutated, bundled));
+
+    // …trailing whitespace, which nothing guarantees is trimmed away…
+    let mut trailing = bundled.to_vec();
+    trailing.push(b'\n');
+    assert!(!chat_templates_render_alike(&trailing, bundled));
+
+    // …and an unterminated comment, which leaves the template untokenizable.
+    let mut unterminated = b"{# never closed\n".to_vec();
+    unterminated.extend_from_slice(bundled);
+    assert!(
+      !chat_templates_render_alike(&unterminated, bundled),
+      "an unterminated comment must not swallow the rest of the file"
+    );
   }
 }

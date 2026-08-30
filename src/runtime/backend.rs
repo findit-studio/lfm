@@ -19,7 +19,8 @@
 
 use crate::{
   error::Result,
-  preproc::{Preprocessor, TileGrid},
+  options::BackendKind,
+  preproc::{ImagePlan, Preprocessor},
   runtime::{
     decoder::{Decoder, KvCache},
     embed_tokens::EmbedTokens,
@@ -46,25 +47,56 @@ pub(crate) trait Backend {
   /// [`Backend::decoder_step`].
   type Cache;
 
+  /// Which backend this is. Reported by
+  /// [`Engine::backend`](crate::Engine::backend) so auto-selection is
+  /// observable.
+  fn kind(&self) -> BackendKind;
+
   /// Construct a fresh, zero-initialized cache for one generation call.
   fn make_cache(&self) -> Result<Self::Cache>;
+
+  /// Produce the ONE authoritative [`ImagePlan`] for an image of the given
+  /// (EXIF-corrected) header dimensions.
+  ///
+  /// The plan is made by the backend that will execute it, because the tiling
+  /// that decides the marker layout must be the same tiling that produces the
+  /// feature rows — for the ONNX backend that is `lfm`'s ported
+  /// [`pick_tile_grid`](crate::preproc::tile_grid::pick_tile_grid); for the MLX
+  /// backend it is additionally ratified against the checkpoint's own planner.
+  /// The [`generate`](crate::generate::generate) loop then renders the prompt,
+  /// runs admission control, and hands the very same plans back to
+  /// [`prepare_prompt_embeds`](Self::prepare_prompt_embeds).
+  ///
+  /// `index` is the image's position in the request, used only to name the
+  /// image in errors.
+  fn plan_image(
+    &self,
+    preproc: &Preprocessor,
+    index: usize,
+    width: u32,
+    height: u32,
+  ) -> Result<ImagePlan>;
 
   /// Build the full prompt `inputs_embeds`: embed the token ids, encode
   /// each image, and splice the per-image vision embeds in at the given
   /// `<image>`-token positions.
   ///
   /// `image_positions` lists the indices (into `input_ids`) of the
-  /// `<image>` placeholder tokens, in order. `grids` carries one resolved
-  /// [`TileGrid`] per image (same order as `images`), so the backend can
-  /// re-derive per-image token counts and re-validate the rendered layout
-  /// against the decoded image. `preproc` decodes + patchifies each image
-  /// one at a time so peak memory stays at O(1 image's pixel buffer).
+  /// `<image>` placeholder tokens, in order. `plans` carries the authoritative
+  /// [`ImagePlan`] per image (same order as `images`) — the plans the prompt's
+  /// markers were rendered from. The backend MUST re-derive its layout from the
+  /// pixels it actually decoded and reject any disagreement with
+  /// [`Error::ImagePlanMismatch`](crate::Error::ImagePlanMismatch); a
+  /// disagreement whose total token count happens to line up would otherwise
+  /// bind features to the wrong positions silently. `preproc` decodes +
+  /// patchifies each image one at a time so peak memory stays at O(1 image's
+  /// pixel buffer).
   fn prepare_prompt_embeds(
     &mut self,
     preproc: &Preprocessor,
     input_ids: &[i64],
     images: &[crate::ImageInput<'_>],
-    grids: &[TileGrid],
+    plans: &[ImagePlan],
     image_positions: &[usize],
   ) -> Result<Self::Embeds>;
 
@@ -117,8 +149,28 @@ impl Backend for OrtBackend {
   type Embeds = OrtEmbeds;
   type Cache = KvCache;
 
+  fn kind(&self) -> BackendKind {
+    BackendKind::Onnx
+  }
+
   fn make_cache(&self) -> Result<Self::Cache> {
     self.decoder.new_cache()
+  }
+
+  /// The ONNX road's plan is `lfm`'s own ported tiling under the engine's
+  /// [`ImageBudget`](crate::ImageBudget) — the same
+  /// [`pick_tile_grid`](crate::preproc::tile_grid::pick_tile_grid) the
+  /// per-image [`Preprocessor::preprocess`] re-runs on the decoded pixels, so
+  /// the plan and the execution are the same function of the same budget.
+  fn plan_image(
+    &self,
+    preproc: &Preprocessor,
+    _index: usize,
+    width: u32,
+    height: u32,
+  ) -> Result<ImagePlan> {
+    let grid = crate::preproc::tile_grid::pick_tile_grid(width, height, preproc.budget())?;
+    Ok(ImagePlan::from_placeholder(grid.to_placeholder_info()))
   }
 
   fn prepare_prompt_embeds(
@@ -126,7 +178,7 @@ impl Backend for OrtBackend {
     preproc: &Preprocessor,
     input_ids: &[i64],
     images: &[crate::ImageInput<'_>],
-    grids: &[TileGrid],
+    plans: &[ImagePlan],
     image_positions: &[usize],
   ) -> Result<Self::Embeds> {
     let seq_len = input_ids.len();
@@ -139,7 +191,7 @@ impl Backend for OrtBackend {
     // the loop body exits, so peak memory is O(1 image's pixel buffer)
     // instead of O(N).
     let mut pos_cursor: usize = 0;
-    for (img, grid) in images.iter().zip(grids.iter()) {
+    for (index, (img, plan)) in images.iter().zip(plans.iter()).enumerate() {
       // Decode + preprocess just this image. The decoded DynamicImage and
       // the resulting PreprocessedImage both go out of scope at the end
       // of this iteration, freeing their pixel buffers.
@@ -151,14 +203,14 @@ impl Backend for OrtBackend {
       let preprocessed_img = preproc.preprocess(&decoded)?;
       drop(decoded); // free the source RGB buffer before vision.run
 
-      // The prompt was rendered using `grid` (computed from header
-      // dimensions, EXIF-corrected by image_dimensions); preprocessed_img's
-      // grid comes from the actually-decoded image. With the EXIF fix in
-      // image_dimensions these must agree; if they don't, markers and
-      // features would bind to wrong spatial positions even when total
-      // token counts happen to match (e.g., a 4×2 layout vs 2×4 layout
-      // both have 8 main tiles + same thumbnail tokens).
-      let expected_info = grid.to_placeholder_info();
+      // The prompt was rendered from `plan` (computed from header dimensions,
+      // EXIF-corrected by image_dimensions); preprocessed_img's layout comes
+      // from the actually-decoded image. With the EXIF fix in image_dimensions
+      // these must agree; if they don't, markers and features would bind to
+      // wrong spatial positions even when total token counts happen to match
+      // (e.g., a 4×2 layout vs 2×4 layout both have 8 main tiles + the same
+      // thumbnail tokens).
+      let expected_info = *plan.placeholder();
       let actual_info = preprocessed_img.to_placeholder_info();
       if expected_info != actual_info {
         return Err(crate::error::Error::ImageGridLayoutMismatch {
@@ -168,7 +220,17 @@ impl Backend for OrtBackend {
           actual_cols: actual_info.cols(),
         });
       }
-      let n_img_tokens = grid.num_image_tokens();
+      // The layouts match field-for-field, so the token counts must too; check
+      // it anyway, because this is the number the splice indexes with.
+      if preprocessed_img.num_image_tokens() != plan.image_tokens() {
+        return Err(crate::error::Error::ImagePlanMismatch {
+          image: index,
+          parameter: "image tokens",
+          planned: plan.image_tokens(),
+          produced: preprocessed_img.num_image_tokens(),
+        });
+      }
+      let n_img_tokens = plan.image_tokens();
       let vision_embeds: Vec<f32> = self.vision.run(&preprocessed_img)?;
       drop(preprocessed_img); // free pixel_values before splicing
 
@@ -265,6 +327,14 @@ impl Backend for BackendImpl {
   type Embeds = EngineEmbeds;
   type Cache = EngineCache;
 
+  fn kind(&self) -> BackendKind {
+    match self {
+      Self::Ort(b) => b.kind(),
+      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      Self::Mlx(b) => b.kind(),
+    }
+  }
+
   fn make_cache(&self) -> Result<Self::Cache> {
     match self {
       Self::Ort(b) => Ok(EngineCache::Ort(b.make_cache()?)),
@@ -273,12 +343,26 @@ impl Backend for BackendImpl {
     }
   }
 
+  fn plan_image(
+    &self,
+    preproc: &Preprocessor,
+    index: usize,
+    width: u32,
+    height: u32,
+  ) -> Result<ImagePlan> {
+    match self {
+      Self::Ort(b) => b.plan_image(preproc, index, width, height),
+      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      Self::Mlx(b) => b.plan_image(preproc, index, width, height),
+    }
+  }
+
   fn prepare_prompt_embeds(
     &mut self,
     preproc: &Preprocessor,
     input_ids: &[i64],
     images: &[crate::ImageInput<'_>],
-    grids: &[TileGrid],
+    plans: &[ImagePlan],
     image_positions: &[usize],
   ) -> Result<Self::Embeds> {
     match self {
@@ -286,7 +370,7 @@ impl Backend for BackendImpl {
         preproc,
         input_ids,
         images,
-        grids,
+        plans,
         image_positions,
       )?)),
       #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -294,7 +378,7 @@ impl Backend for BackendImpl {
         preproc,
         input_ids,
         images,
-        grids,
+        plans,
         image_positions,
       )?)),
     }

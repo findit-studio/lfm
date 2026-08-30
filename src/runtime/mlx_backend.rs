@@ -6,8 +6,9 @@
 //! features the rest of the [`Backend`] seam lives under), because `mlxrs`
 //! binds the Metal-backed MLX C++ runtime through `mlx-c` FFI and has no
 //! other target. There is **no** `mlx` Cargo feature — the backend is
-//! selected automatically by platform + checkpoint shape (see Cargo.toml and
-//! [`Engine`](crate::Engine)'s `from_dir`).
+//! selected by platform + checkpoint shape (see Cargo.toml and
+//! [`Engine`](crate::Engine)'s `from_dir`), and a caller can pin it
+//! explicitly with [`Options::with_backend`](crate::Options::with_backend).
 //!
 //! # Design
 //!
@@ -47,53 +48,63 @@
 //! path** directly and read the sibling `config.json` from the file's parent
 //! directory, for callers who already know the format and location.
 //!
-//! # Preprocessing
+//! # Preprocessing and the one authoritative image plan
 //!
-//! The MLX path uses `mlxrs`'s **own** NaFlex tiling/preprocessing
-//! ([`Lfm2Vl::split_image`]) rather than lfm's ONNX [`Preprocessor`] — the
-//! patch geometry, normalization, and grid-token math are the model's, so the
-//! spliced image features bind to the positions `get_input_embeddings` expects.
-//! Images are decoded EXIF-aware via lfm's existing
+//! The MLX path preprocesses with `mlxrs`'s **own** tiling
+//! ([`Lfm2Vl::split_image`], driven by the checkpoint's `config.json`) rather
+//! than `lfm`'s ONNX [`Preprocessor`] — the patch geometry, normalization, and
+//! grid-token math are the model's, so the spliced image features bind to the
+//! positions `get_input_embeddings` expects. Images are decoded EXIF-aware via
+//! `lfm`'s existing
 //! [`decode_with_orientation`](crate::preproc::decode_with_orientation) /
 //! [`decode_bytes_with_orientation`](crate::preproc::decode_bytes_with_orientation),
 //! then handed to `split_image` as interleaved RGB bytes.
+//!
+//! But the prompt's `<image>` / `<|img_row_R_col_C|>` / `<|img_thumbnail|>`
+//! markers and the context-budget admission gates are rendered by `lfm`, from
+//! `lfm`'s [`ImageBudget`]. If the two tilings disagree the markers and the
+//! feature block disagree, and when the totals happen to coincide the features
+//! bind to the wrong spatial positions with no error at all. Three gates make
+//! that unrepresentable:
+//!
+//! 1. **Load time** — [`MlxBackend::effective_budget`] compares every tiling
+//!    parameter `lfm` renders markers from against the checkpoint's own value
+//!    and refuses **by name**
+//!    ([`Error::MlxTilingMismatch`]). The default
+//!    [`ImageBudget::new()`](crate::ImageBudget::new) expresses "no opinion"
+//!    and adopts the checkpoint's tiling instead; the engine then renders every
+//!    prompt from the checkpoint's numbers.
+//! 2. **Plan time** — [`MlxBackend::plan_image`] builds the plan from `lfm`'s
+//!    ported tiling under that budget, then ratifies it against the
+//!    checkpoint's own planner ([`plan_tiles`]): grid, thumbnail presence and
+//!    sub-image count must agree.
+//! 3. **Execute time** — [`MlxBackend::prepare_prompt_embeds`] reads back the
+//!    real patch grid of every sub-image `split_image` produced and checks the
+//!    per-sub-image and total `<image>`-token counts against the plan.
+//!
+//! Any disagreement is [`Error::ImagePlanMismatch`], never a silent splice.
 
 use std::path::Path;
 
 use mlxrs::{
   Array, Dtype,
   lm::{cache::KvCache, model::Model as LmModel},
-  vlm::models::lfm2_vl::{Lfm2Vl, Lfm2VlImageInputs, config::ModelConfig},
+  vlm::models::lfm2_vl::{
+    Lfm2Vl, Lfm2VlImageInputs, TilePlan, config::ModelConfig, num_image_tokens_from_patch_grid,
+    plan_tiles,
+  },
 };
+use smol_str::SmolStr;
 
 use crate::{
   error::{Error, Result},
-  preproc::Preprocessor,
-  runtime::backend::Backend,
+  options::{BackendKind, ImageBudget},
+  preproc::{
+    ImagePlan, Preprocessor,
+    tile_grid::{DOWNSAMPLE_FACTOR, FULL_TILE_SIZE, PATCH_SIZE, pick_tile_grid},
+  },
+  runtime::{backend::Backend, checkpoint::MLX_CONFIG},
 };
-
-/// The MLX-format config file name inside a checkpoint directory (the `mlxrs`
-/// checkpoint marker, paired with a weight file).
-pub(crate) const MLX_CONFIG: &str = "config.json";
-
-/// The MLX-format safetensors weights file name — the always-available baseline
-/// weight format. Its presence (with [`MLX_CONFIG`], a weight set in any enabled
-/// format, and the absence of the ONNX graphs) is one signal
-/// [`Engine::from_dir`](crate::Engine) routes to the MLX backend on Apple
-/// Silicon.
-pub(crate) const MLX_SAFETENSORS: &str = "model.safetensors";
-
-/// The legacy single-file safetensors weights name. Some older MLX checkpoints
-/// ship their weights as `weights.safetensors` rather than `model.safetensors`;
-/// [`mlxrs::io::load_weights_from_dir`] accepts it as a fallback tier, so its
-/// presence (with [`MLX_CONFIG`]) also routes to the MLX backend.
-pub(crate) const MLX_SAFETENSORS_LEGACY: &str = "weights.safetensors";
-
-/// The sharded-checkpoint index file name. A multi-shard safetensors export
-/// (`model-00001-of-0000N.safetensors` + …) ships a `model.safetensors.index.json`
-/// weight map instead of a single `model.safetensors`; [`mlxrs::io::load_weights_from_dir`]
-/// loads it, so its presence (with [`MLX_CONFIG`]) also routes to the MLX backend.
-pub(crate) const MLX_SAFETENSORS_INDEX: &str = "model.safetensors.index.json";
 
 /// The per-layer quantization marker `mlxrs` (and mlx-lm / mlx-vlm) use: a
 /// quantized `nn.Linear` / `nn.Embedding` stores its packed weight alongside a
@@ -102,67 +113,6 @@ pub(crate) const MLX_SAFETENSORS_INDEX: &str = "model.safetensors.index.json";
 /// convention [`Lfm2Vl::from_weights`] keys its per-layer dense-vs-quantized
 /// choice on.
 const QUANT_SCALES_SUFFIX: &str = ".scales";
-
-/// Report whether `dir` holds an MLX weight set in any ENABLED format:
-/// a sharded `model.safetensors.index.json` always; a single `model.safetensors`
-/// (or the legacy `weights.safetensors`) always; a `*.npz` only under the `npz`
-/// feature; a `*.gguf` only under the `gguf` feature. Mirrors the formats
-/// [`mlxrs::io::load_weights_from_dir`] loads, so routing and loading agree on
-/// which checkpoints count. A dir with only `model.npz` therefore routes to MLX
-/// iff `npz` is on.
-fn has_mlx_weights(dir: &Path) -> bool {
-  if dir.join(MLX_SAFETENSORS_INDEX).is_file() {
-    return true;
-  }
-  if dir.join(MLX_SAFETENSORS).is_file() {
-    return true;
-  }
-  if dir.join(MLX_SAFETENSORS_LEGACY).is_file() {
-    return true;
-  }
-  #[cfg(feature = "npz")]
-  if has_extension(dir, "npz") {
-    return true;
-  }
-  #[cfg(feature = "gguf")]
-  if has_extension(dir, "gguf") {
-    return true;
-  }
-  false
-}
-
-/// Whether `dir` contains at least one file with the given `extension`. Only
-/// referenced from the `npz`/`gguf` arms of [`has_mlx_weights`], so it is
-/// `cfg`-elided on a default (safetensors-only) build.
-#[cfg(any(feature = "npz", feature = "gguf"))]
-fn has_extension(dir: &Path, extension: &str) -> bool {
-  let Ok(entries) = std::fs::read_dir(dir) else {
-    return false;
-  };
-  entries.flatten().any(|entry| {
-    let path = entry.path();
-    path.extension().and_then(|e| e.to_str()) == Some(extension) && path.is_file()
-  })
-}
-
-/// Probe `dir` and report whether the MLX backend should load it: `true` iff it
-/// contains an MLX `config.json` and a weight file in any enabled format (see
-/// [`has_mlx_weights`]) AND **neither** of `required_onnx` (the ONNX graph file
-/// name(s) the ORT path loads) is a file in `dir`.
-///
-/// `config.json` + `model.safetensors` are also the standard HuggingFace
-/// source-asset names, so the required ONNX graph is the disambiguator: a
-/// directory that ships those HF sources next to the `*.onnx` graphs the ORT
-/// backend reads is an ONNX checkpoint and must route to ONNX. Because the MLX
-/// backend never reads the `*.onnx` graphs while the ONNX backend does, the
-/// presence of a required graph means "this is an ONNX checkpoint" and selects
-/// ONNX. Pure filesystem existence checks (no file I/O): the winning constructor
-/// does the real load and surfaces a typed error if the checkpoint is malformed.
-pub(crate) fn prefer_mlx(dir: &Path, required_onnx: &[&str]) -> bool {
-  dir.join(MLX_CONFIG).is_file()
-    && has_mlx_weights(dir)
-    && !required_onnx.iter().any(|onnx| dir.join(onnx).is_file())
-}
 
 /// Discriminate a dense from a quantized MLX checkpoint by the `mlxrs`
 /// convention: a quantized checkpoint carries at least one `<layer>.scales`
@@ -185,6 +135,65 @@ pub(crate) fn weights_parent(weights: &Path) -> &Path {
     .parent()
     .filter(|p| !p.as_os_str().is_empty())
     .unwrap_or_else(|| Path::new("."))
+}
+
+/// Refuse **by name** when a value `lfm` relies on differs from the
+/// checkpoint's own. Naming the parameter, both values, and their sources is
+/// the whole point: a bare "tiling mismatch" leaves the caller to bisect their
+/// `ImageBudget` against a `config.json` they may never have opened.
+fn require_same<T>(parameter: &'static str, lfm_value: T, checkpoint_value: T) -> Result<()>
+where
+  T: PartialEq + std::fmt::Display,
+{
+  if lfm_value != checkpoint_value {
+    return Err(Error::MlxTilingMismatch {
+      parameter,
+      lfm_value: SmolStr::new(lfm_value.to_string()),
+      checkpoint_value: SmolStr::new(checkpoint_value.to_string()),
+    });
+  }
+  Ok(())
+}
+
+/// Narrow a checkpoint's `i32` cardinality field to `usize`, naming the field
+/// if it is negative (a `config.json` that cannot describe a real tiling).
+fn config_count(field: &'static str, value: i32) -> Result<usize> {
+  usize::try_from(value).map_err(|_| {
+    Error::mlx_owned(format!(
+      "checkpoint config.json `{field}` is negative ({value}); it must be a non-negative count"
+    ))
+  })
+}
+
+/// Express the checkpoint's own tiling parameters as an [`ImageBudget`] — the
+/// vocabulary `lfm`'s prompt rendering and admission gates speak.
+///
+/// `do_image_splitting = false` has no direct counterpart in [`ImageBudget`];
+/// upstream's `_preprocess` disables splitting by forcing
+/// `min_tiles = max_tiles = 1`, and `mlxrs`'s [`plan_tiles`] treats that band
+/// as equivalent, so the flag is folded into the tile band the same way.
+fn checkpoint_budget(config: &ModelConfig) -> Result<ImageBudget> {
+  let splitting = config.do_image_splitting && !(config.min_tiles == 1 && config.max_tiles == 1);
+  let (min_tiles, max_tiles) = if splitting {
+    (
+      config_count("min_tiles", config.min_tiles)?,
+      config_count("max_tiles", config.max_tiles)?,
+    )
+  } else {
+    (1, 1)
+  };
+  let budget = ImageBudget::new()
+    .with_min_image_tokens(config_count("min_image_tokens", config.min_image_tokens)?)
+    .with_max_image_tokens(config_count("max_image_tokens", config.max_image_tokens)?)
+    .with_min_tiles(min_tiles)
+    .with_max_tiles(max_tiles)
+    .with_use_thumbnail(config.use_thumbnail)
+    .with_max_pixels_tolerance(config.max_pixels_tolerance);
+  // A checkpoint whose tiling `lfm` cannot express — e.g. `max_tiles > 10`,
+  // beyond the bundled tokenizer's `<|img_row_R_col_C|>` marker grid — is
+  // rejected here rather than producing markers that tokenize as plain text.
+  budget.validate()?;
+  Ok(budget)
 }
 
 /// MLX-backed [`Backend`] for LFM2.5-VL. Owns the loaded [`Lfm2Vl`] model.
@@ -301,6 +310,113 @@ impl MlxBackend {
     Ok(Self { model })
   }
 
+  /// Refuse a checkpoint whose real positional limit differs from the
+  /// [`MODEL_CONTEXT_TOKENS`](crate::options::MODEL_CONTEXT_TOKENS) constant
+  /// `generate`'s admission gates trust.
+  ///
+  /// The MLX-road counterpart of the ONNX road's
+  /// `validate_config_context_matches_bundled`, read from the loaded
+  /// `ModelConfig` rather than re-parsing `config.json`, so it asserts against
+  /// the very value the model was built with. A smaller-context export would
+  /// otherwise load fine and then accept prompts up to 128 K that it cannot
+  /// serve, failing late or generating with invalid position state.
+  pub(crate) fn validate_context_limit(&self) -> Result<()> {
+    let context = self.model.config().text_config.max_position_embeddings;
+    require_same(
+      "text_config.max_position_embeddings",
+      i64::try_from(crate::options::MODEL_CONTEXT_TOKENS).unwrap_or(i64::MAX),
+      i64::from(context),
+    )
+  }
+
+  /// Reconcile the caller's [`ImageBudget`] with the checkpoint's own tiling
+  /// and return the budget the engine must render every prompt from.
+  ///
+  /// Two classes of parameter, two policies:
+  ///
+  /// - **Constants `lfm` hardcodes** (`PATCH_SIZE`, `DOWNSAMPLE_FACTOR`,
+  ///   `FULL_TILE_SIZE`, the `<image>` token id) are baked into
+  ///   `TileGrid`'s token math and the tokenizer's marker table — they cannot be
+  ///   adopted at runtime, so a checkpoint that disagrees is always refused by
+  ///   name.
+  /// - **Budget knobs** (`min`/`max_image_tokens`, `min`/`max_tiles`,
+  ///   `use_thumbnail`, `max_pixels_tolerance`) are caller-tunable, but the MLX
+  ///   path cannot honour them: `split_image` reads the checkpoint's
+  ///   `config.json`, not this budget. So the default
+  ///   [`ImageBudget::new()`](crate::ImageBudget::new) — "no opinion" — adopts
+  ///   the checkpoint's values, and any OTHER budget must match the checkpoint
+  ///   exactly or the load is refused by name. Refusing is the point: the
+  ///   released `LiquidAI/LFM2.5-VL-450M-MLX-8bit` ships `use_thumbnail: false`,
+  ///   so a caller passing `ImageBudget::fast()` (or any hand-tuned budget that
+  ///   disagrees) previously got markers for one layout and features for
+  ///   another.
+  ///
+  /// # Errors
+  /// [`Error::MlxTilingMismatch`] naming the first disagreeing parameter;
+  /// [`Error::InvalidBudget`] if the checkpoint's own tiling is one `lfm`
+  /// cannot express (e.g. `max_tiles` past the tokenizer's 10×10 marker grid).
+  pub(crate) fn effective_budget(&self, requested: &ImageBudget) -> Result<ImageBudget> {
+    let config = self.model.config();
+
+    // ── constants: never adoptable ─────────────────────────────────────────
+    require_same(
+      "vision_config.patch_size",
+      i64::from(PATCH_SIZE),
+      i64::from(config.vision_config.patch_size),
+    )?;
+    require_same(
+      "encoder_patch_size",
+      i64::from(PATCH_SIZE),
+      i64::from(config.encoder_patch_size),
+    )?;
+    require_same(
+      "downsample_factor",
+      i64::from(DOWNSAMPLE_FACTOR),
+      i64::from(config.downsample_factor),
+    )?;
+    require_same(
+      "tile_size",
+      i64::from(FULL_TILE_SIZE),
+      i64::from(config.tile_size),
+    )?;
+    require_same(
+      "image_token_index",
+      i64::from(crate::chat_template::IMAGE_TOKEN_ID),
+      i64::from(config.image_token_index),
+    )?;
+
+    let checkpoint = checkpoint_budget(config)?;
+
+    // ── budget knobs: adopt the checkpoint's when the caller expressed no
+    //    opinion, otherwise demand an exact match ────────────────────────────
+    if *requested == ImageBudget::new() {
+      return Ok(checkpoint);
+    }
+    require_same(
+      "min_image_tokens",
+      requested.min_image_tokens(),
+      checkpoint.min_image_tokens(),
+    )?;
+    require_same(
+      "max_image_tokens",
+      requested.max_image_tokens(),
+      checkpoint.max_image_tokens(),
+    )?;
+    require_same("min_tiles", requested.min_tiles(), checkpoint.min_tiles())?;
+    require_same("max_tiles", requested.max_tiles(), checkpoint.max_tiles())?;
+    require_same(
+      "use_thumbnail",
+      requested.use_thumbnail(),
+      checkpoint.use_thumbnail(),
+    )?;
+    require_same(
+      "max_pixels_tolerance",
+      requested.max_pixels_tolerance(),
+      checkpoint.max_pixels_tolerance(),
+    )?;
+    Ok(checkpoint)
+  }
+
   /// Build a `(1, seq)` i32 `input_ids` [`Array`] from host token ids, rejecting
   /// any id outside `i32` range with a typed error.
   ///
@@ -321,42 +437,185 @@ impl MlxBackend {
   }
 }
 
+/// Ratify an [`ImagePlan`] built from `lfm`'s ported tiling against the
+/// checkpoint's OWN planner.
+///
+/// Gate 2 of the three described in the [module docs](self). The load-time gate
+/// already proved the two use identical parameters, and both are faithful ports
+/// of the same HuggingFace `resize_and_split`; this asserts the ports actually
+/// agree on THIS image before the prompt is rendered from the plan. Everything
+/// [`TilePlan`] exposes is compared — split flag, grid, thumbnail presence, and
+/// sub-image count.
+fn ratify_plan(index: usize, plan: &ImagePlan, tiles: &TilePlan) -> Result<()> {
+  let info = plan.placeholder();
+  // `TilePlan::grid()` is `(grid_width, grid_height)`; `lfm`'s marker layout is
+  // (rows, cols) = (grid_height, grid_width).
+  let (grid_width, grid_height) = tiles.grid();
+  for (parameter, planned, produced) in [
+    ("tile-grid rows", info.rows(), grid_height as usize),
+    ("tile-grid cols", info.cols(), grid_width as usize),
+    (
+      "thumbnail sub-images",
+      usize::from(info.thumbnail_tokens().is_some()),
+      usize::from(tiles.has_thumbnail()),
+    ),
+    (
+      "multi-tile split",
+      usize::from(info.rows() > 1 || info.cols() > 1),
+      usize::from(tiles.is_split()),
+    ),
+  ] {
+    if planned != produced {
+      return Err(Error::ImagePlanMismatch {
+        image: index,
+        parameter,
+        planned,
+        produced,
+      });
+    }
+  }
+  let produced = config_count(
+    "sub_image_count",
+    tiles.sub_image_count().map_err(Error::from_mlx)? as i32,
+  )?;
+  if produced != plan.sub_images() {
+    return Err(Error::ImagePlanMismatch {
+      image: index,
+      parameter: "sub-image count",
+      planned: plan.sub_images(),
+      produced,
+    });
+  }
+  Ok(())
+}
+
+/// Check the sub-images `split_image` actually produced against the plan the
+/// prompt's markers were rendered from.
+///
+/// Gate 3 of the three described in the [module docs](self), and the only one
+/// that sees real pixels. Each sub-image's `<image>`-token count is recomputed
+/// with `mlxrs`'s own [`num_image_tokens_from_patch_grid`] from the patch grid
+/// the tile really carries, in the HF batch order `split_image` documents
+/// (tiles row-major, then the thumbnail).
+fn verify_sub_images(
+  index: usize,
+  plan: &ImagePlan,
+  tiles: &[Lfm2VlImageInputs],
+  downsample_factor: i32,
+) -> Result<()> {
+  if tiles.len() != plan.sub_images() {
+    return Err(Error::ImagePlanMismatch {
+      image: index,
+      parameter: "sub-image count",
+      planned: plan.sub_images(),
+      produced: tiles.len(),
+    });
+  }
+  let info = plan.placeholder();
+  let last = tiles.len().saturating_sub(1);
+  let mut produced_tokens = 0usize;
+  for (position, tile) in tiles.iter().enumerate() {
+    let (rows, cols) = tile.grid().map_err(Error::from_mlx)?;
+    let tokens =
+      num_image_tokens_from_patch_grid(rows, cols, downsample_factor).map_err(Error::from_mlx)?;
+    let tokens = config_count("sub-image token count", tokens)?;
+    // The thumbnail is the LAST sub-image when the plan carries one; every
+    // other position is a main tile.
+    let planned = match info.thumbnail_tokens() {
+      Some(thumbnail) if position == last => thumbnail,
+      _ => info.tokens_per_main_tile(),
+    };
+    if tokens != planned {
+      return Err(Error::ImagePlanMismatch {
+        image: index,
+        parameter: "tokens per sub-image",
+        planned,
+        produced: tokens,
+      });
+    }
+    produced_tokens = produced_tokens.saturating_add(tokens);
+  }
+  if produced_tokens != plan.image_tokens() {
+    return Err(Error::ImagePlanMismatch {
+      image: index,
+      parameter: "image tokens",
+      planned: plan.image_tokens(),
+      produced: produced_tokens,
+    });
+  }
+  Ok(())
+}
+
 impl Backend for MlxBackend {
   /// On-device prompt / per-token embeddings (an mlx `Array`); no host copy.
   type Embeds = Array;
   /// The LFM2 heterogeneous per-layer cache (`Lfm2Vl::make_cache`).
   type Cache = Vec<Box<dyn KvCache>>;
 
+  fn kind(&self) -> BackendKind {
+    BackendKind::Mlx
+  }
+
   fn make_cache(&self) -> Result<Self::Cache> {
     Ok(self.model.make_cache())
   }
 
-  /// Build the full prompt `inputs_embeds` on device: embed the token ids and
-  /// splice each image's NaFlex features in, using `mlxrs`'s OWN tiling /
-  /// preprocessing.
+  /// Plan one image, then ratify the plan against the checkpoint's own planner.
   ///
-  /// The ORT-specific `preproc` / `grids` / `image_positions` are intentionally
-  /// **ignored** here: the MLX path drives `mlxrs`'s native NaFlex
-  /// [`split_image`](Lfm2Vl::split_image) + the mask-driven
-  /// `get_input_embeddings` splice (which locates the `<image>`-token positions
-  /// itself from `input_ids` and the model's `image_token_index`). Each image is
-  /// decoded EXIF-aware (lfm's `decode_*_with_orientation`), projected to
-  /// interleaved RGB bytes, tiled by `split_image`, and the resulting per-tile
-  /// [`Lfm2VlImageInputs`] are collected; `get_input_embeddings` then embeds the
-  /// ids and merges the concatenated image features.
+  /// `preproc`'s budget is the **effective** budget the engine installed at
+  /// load — either adopted from this checkpoint or proven equal to it by
+  /// [`Self::effective_budget`] — so `lfm`'s ported tiling and the checkpoint's
+  /// run on identical parameters. [`plan_tiles`] is then asked the same
+  /// question and every field it exposes must agree.
+  fn plan_image(
+    &self,
+    preproc: &Preprocessor,
+    index: usize,
+    width: u32,
+    height: u32,
+  ) -> Result<ImagePlan> {
+    let grid = pick_tile_grid(width, height, preproc.budget())?;
+    let plan = ImagePlan::from_placeholder(grid.to_placeholder_info());
+    let processor = self.model.processor_config().map_err(Error::from_mlx)?;
+    let tiles = plan_tiles(height, width, &processor).map_err(Error::from_mlx)?;
+    ratify_plan(index, &plan, &tiles)?;
+    Ok(plan)
+  }
+
+  /// Build the full prompt `inputs_embeds` on device: embed the token ids and
+  /// splice each image's NaFlex features in, using `mlxrs`'s OWN tiling.
+  ///
+  /// Each image is decoded EXIF-aware (`lfm`'s `decode_*_with_orientation`),
+  /// projected to interleaved RGB bytes, tiled by
+  /// [`split_image`](Lfm2Vl::split_image), and **checked against its
+  /// [`ImagePlan`]** — the plan the prompt's `<image>` runs were rendered from
+  /// — before any feature is spliced. `get_input_embeddings` then embeds the
+  /// ids and merges the concatenated image features at the `<image>`-token
+  /// positions it locates itself from the model's `image_token_index`, which is
+  /// why `image_positions` is not consumed here: `generate` has already proven
+  /// that count equals the plans' total.
   fn prepare_prompt_embeds(
     &mut self,
     _preproc: &Preprocessor,
     input_ids: &[i64],
     images: &[crate::ImageInput<'_>],
-    _grids: &[crate::preproc::TileGrid],
+    plans: &[ImagePlan],
     _image_positions: &[usize],
   ) -> Result<Self::Embeds> {
+    if plans.len() != images.len() {
+      return Err(Error::ImagePlanMismatch {
+        image: images.len(),
+        parameter: "plans per image",
+        planned: plans.len(),
+        produced: images.len(),
+      });
+    }
+    let downsample_factor = self.model.config().downsample_factor;
     // Collect every image's tiled NaFlex sub-image inputs, in image order, then
-    // sub-image order (the same order `expand_image_tokens` lays the
-    // `<image>`-token runs the embed splices into).
+    // sub-image order — the same order the rendered marker layout lays its
+    // `<image>`-token runs in.
     let mut all_inputs: Vec<Lfm2VlImageInputs> = Vec::new();
-    for img in images {
+    for (index, (img, plan)) in images.iter().zip(plans.iter()).enumerate() {
       // Decode EXIF-aware via lfm's own decoders (reused, not reimplemented),
       // then project to the interleaved `width * height * 3` RGB bytes
       // `split_image` consumes. `decode_rgb` is the fallible (try_reserve)
@@ -374,6 +633,7 @@ impl Backend for MlxBackend {
         .model
         .split_image(&rgb, width, height)
         .map_err(Error::from_mlx)?;
+      verify_sub_images(index, plan, &tiles, downsample_factor)?;
       all_inputs.extend(tiles);
     }
 
@@ -428,9 +688,18 @@ impl Backend for MlxBackend {
 /// dtype-strict, so without the `astype` it would fail. `astype` produces a NEW
 /// array, so the model's tensors are never mutated.
 ///
+/// The row is then rejected if ANY entry is non-finite, exactly as the ORT
+/// [`Decoder::step`](crate::runtime::decoder::Decoder::step) does. A raw decoder
+/// row has no legitimate `±inf` or NaN — the `-inf`s the samplers work with are
+/// masks THEY apply — so a non-finite entry here is a broken forward, and
+/// admitting it lets greedy lock onto a `+inf` position and collapses the
+/// temperature path's softmax to a uniform draw across every entry, mask
+/// included.
+///
 /// # Errors
 /// - [`Error::Mlx`] if the logits are not rank-3 `(1, seq, vocab)` with `seq >=
-///   1`, or for any slice / astype / eval / read failure.
+///   1`, or for any slice / astype / eval / read failure;
+/// - [`Error::SessionNonFiniteOutput`] if any logit is NaN or infinite.
 fn last_position_logits_f32(logits: &Array) -> Result<Vec<f32>> {
   let shape = logits.shape();
   if shape.len() != 3 || shape[0] != 1 || shape[1] < 1 {
@@ -449,64 +718,17 @@ fn last_position_logits_f32(logits: &Array) -> Result<Vec<f32>> {
     .astype(Dtype::F32)
     .map_err(Error::from_mlx)?;
   row.eval().map_err(Error::from_mlx)?;
-  row.to_vec::<f32>().map_err(Error::from_mlx)
+  let row = row.to_vec::<f32>().map_err(Error::from_mlx)?;
+  if row.iter().any(|v| !v.is_finite()) {
+    return Err(Error::SessionNonFiniteOutput { stage: "decoder" });
+  }
+  Ok(row)
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
-
-  /// A directory holding BOTH an MLX `config.json` and `model.safetensors`, with
-  /// neither ONNX graph present, is an MLX checkpoint — `prefer_mlx` routes it to
-  /// the MLX backend.
-  #[test]
-  fn prefer_mlx_true_for_mlx_checkpoint_dir() {
-    let tmp = std::env::temp_dir().join(format!("lfm_mlx_probe_mlx_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp).expect("mkdir tmp");
-    std::fs::write(tmp.join(MLX_CONFIG), b"{}").expect("write config.json");
-    std::fs::write(tmp.join(MLX_SAFETENSORS), b"\0").expect("write model.safetensors");
-    assert!(
-      prefer_mlx(&tmp, &["vision_encoder.onnx", "decoder_model_merged.onnx"]),
-      "config.json + model.safetensors present (no ONNX graphs) must select MLX"
-    );
-    let _ = std::fs::remove_dir_all(&tmp);
-  }
-
-  /// When the ONNX graphs are present, the directory is an ONNX checkpoint and
-  /// routes to ONNX — even if it also carries `config.json` + `model.safetensors`
-  /// (which double as the HuggingFace source-asset names). The ONNX graphs are
-  /// the disambiguator, so `prefer_mlx` is `false`.
-  #[test]
-  fn prefer_mlx_false_when_onnx_graphs_present() {
-    let tmp = std::env::temp_dir().join(format!("lfm_mlx_probe_onnx_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp).expect("mkdir tmp");
-    std::fs::write(tmp.join(MLX_CONFIG), b"{}").expect("write config.json");
-    std::fs::write(tmp.join(MLX_SAFETENSORS), b"\0").expect("write model.safetensors");
-    std::fs::write(tmp.join("vision_encoder.onnx"), b"\0").expect("write vision onnx");
-    std::fs::write(tmp.join("decoder_model_merged.onnx"), b"\0").expect("write decoder onnx");
-    assert!(
-      !prefer_mlx(&tmp, &["vision_encoder.onnx", "decoder_model_merged.onnx"]),
-      "the ONNX graphs disambiguate: a dir carrying them must route to ONNX"
-    );
-    let _ = std::fs::remove_dir_all(&tmp);
-  }
-
-  /// A bare `config.json` without `model.safetensors` is NOT an MLX checkpoint —
-  /// `prefer_mlx` is `false`.
-  #[test]
-  fn prefer_mlx_false_without_weights() {
-    let tmp = std::env::temp_dir().join(format!("lfm_mlx_probe_noweights_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp).expect("mkdir tmp");
-    std::fs::write(tmp.join(MLX_CONFIG), b"{}").expect("write config.json");
-    assert!(
-      !prefer_mlx(&tmp, &["vision_encoder.onnx", "decoder_model_merged.onnx"]),
-      "a lone config.json (no model.safetensors) must NOT select MLX"
-    );
-    let _ = std::fs::remove_dir_all(&tmp);
-  }
+  use crate::{chat_template::ImagePlaceholderInfo, runtime::checkpoint::MLX_SAFETENSORS};
 
   /// `weights_are_quantized` flips on the FIRST `<layer>.scales` sibling and is
   /// `false` for a `.weight`/`.bias`-only (dense) map — even one carrying a
@@ -594,16 +816,49 @@ mod tests {
     ));
   }
 
-  /// Create a fresh temp dir for a format-detection test, named for `tag`.
-  fn detect_dir(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-      "lfm_mlx_detect_{tag}_{}_{:?}",
-      std::process::id(),
-      std::thread::current().id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create temp detect dir");
-    dir
+  /// A non-finite decoder row is rejected at the MLX stage boundary with the
+  /// same [`Error::SessionNonFiniteOutput`] the ORT decoder raises — including
+  /// the lone `+inf` case, which greedy would otherwise always pick and which
+  /// collapses the temperature path's softmax onto a uniform draw over every
+  /// entry (masked entries included).
+  #[test]
+  fn last_position_logits_rejects_non_finite_row() {
+    for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+      let flat = vec![1.0_f32, 2.0, 3.0, bad];
+      let logits =
+        Array::from_slice::<f32>(&flat, &(1usize, 1usize, 4usize)).expect("build logits");
+      assert!(
+        matches!(
+          last_position_logits_f32(&logits),
+          Err(Error::SessionNonFiniteOutput { stage: "decoder" })
+        ),
+        "a {bad} logit must be rejected at the decoder boundary"
+      );
+    }
+    // A fully finite row still passes.
+    let ok = Array::from_slice::<f32>(&[1.0_f32, 2.0], &(1usize, 1usize, 2usize)).expect("ok");
+    assert_eq!(
+      last_position_logits_f32(&ok).expect("finite row"),
+      vec![1.0_f32, 2.0]
+    );
+  }
+
+  /// [`weights_parent`] returns the file's parent directory for a path with a
+  /// directory component, and the current directory (`.`) — never the filesystem
+  /// root — for a bare filename, so an explicit-format constructor handed
+  /// `"model.safetensors"` reads `./config.json`.
+  #[test]
+  fn weights_parent_resolves_parent_else_current_dir() {
+    assert_eq!(
+      weights_parent(Path::new("/ckpt/model.safetensors")),
+      Path::new("/ckpt")
+    );
+    assert_eq!(
+      weights_parent(Path::new("ckpt/model.npz")),
+      Path::new("ckpt")
+    );
+    // A bare filename has an empty parent; it must map to `.`, not `""`.
+    assert_eq!(weights_parent(Path::new(MLX_SAFETENSORS)), Path::new("."));
   }
 
   /// A `config.json` that PARSES but fails the full [`ModelConfig::validate`] on
@@ -615,7 +870,13 @@ mod tests {
   /// (expensive) weight load, not after it in `from_weights`.
   #[test]
   fn from_dir_rejects_invalid_config_before_weight_load() {
-    let dir = detect_dir("invalid_cfg");
+    let dir = std::env::temp_dir().join(format!(
+      "lfm_mlx_invalid_cfg_{}_{:?}",
+      std::process::id(),
+      std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create temp dir");
     // Valid JSON with present (defaulted) tower objects — so it PARSES — but a
     // top-level `model_type` the validator rejects. The two tower configs are
     // required keys; an empty `{}` for each supplies them with their defaulted,
@@ -638,95 +899,93 @@ mod tests {
     );
   }
 
-  /// [`weights_parent`] returns the file's parent directory for a path with a
-  /// directory component, and the current directory (`.`) — never the filesystem
-  /// root — for a bare filename, so an explicit-format constructor handed
-  /// `"model.safetensors"` reads `./config.json`.
+  /// The checkpoint's tiling maps onto an [`ImageBudget`] one-for-one, and
+  /// `do_image_splitting: false` folds into the degenerate `min = max = 1` tile
+  /// band — the encoding upstream's `_preprocess` uses and the one `lfm`'s
+  /// `pick_tile_grid` reads as "splitting off".
   #[test]
-  fn weights_parent_resolves_parent_else_current_dir() {
+  fn checkpoint_budget_mirrors_config_and_folds_splitting_flag() {
+    let config = ModelConfig::from_json(
+      r#"{"text_config": {}, "vision_config": {}, "min_tiles": 2, "max_tiles": 8,
+          "min_image_tokens": 32, "max_image_tokens": 128, "use_thumbnail": false,
+          "max_pixels_tolerance": 1.5}"#,
+    )
+    .expect("parse config");
+    let budget = checkpoint_budget(&config).expect("budget from config");
+    assert_eq!(budget.min_tiles(), 2);
+    assert_eq!(budget.max_tiles(), 8);
+    assert_eq!(budget.min_image_tokens(), 32);
+    assert_eq!(budget.max_image_tokens(), 128);
+    assert!(!budget.use_thumbnail());
+    assert_eq!(budget.max_pixels_tolerance(), 1.5);
+
+    let no_split = ModelConfig::from_json(
+      r#"{"text_config": {}, "vision_config": {}, "do_image_splitting": false,
+          "min_tiles": 2, "max_tiles": 8}"#,
+    )
+    .expect("parse config");
+    let budget = checkpoint_budget(&no_split).expect("budget from config");
     assert_eq!(
-      weights_parent(Path::new("/ckpt/model.safetensors")),
-      Path::new("/ckpt")
-    );
-    assert_eq!(
-      weights_parent(Path::new("ckpt/model.npz")),
-      Path::new("ckpt")
-    );
-    // A bare filename has an empty parent; it must map to `.`, not `""`.
-    assert_eq!(
-      weights_parent(Path::new("model.safetensors")),
-      Path::new(".")
+      (budget.min_tiles(), budget.max_tiles()),
+      (1, 1),
+      "do_image_splitting=false must fold into the degenerate 1..=1 tile band"
     );
   }
 
-  /// A SHARDED MLX checkpoint — `config.json` + `model.safetensors.index.json`
-  /// (the weight map for a multi-shard export) with NO single `model.safetensors`
-  /// and no ONNX graph — is an MLX checkpoint: `prefer_mlx` routes it to MLX,
-  /// because [`mlxrs::io::load_weights_from_dir`] loads the sharded layout via
-  /// the index.
+  /// A checkpoint whose tile grid exceeds the bundled tokenizer's 10×10
+  /// `<|img_row_R_col_C|>` marker table cannot be rendered by `lfm` at all, so
+  /// it is rejected rather than silently emitting markers that tokenize as
+  /// plain text.
   #[test]
-  fn prefer_mlx_true_for_sharded_index_only() {
-    let tmp = detect_dir("probe_shard");
-    std::fs::write(tmp.join(MLX_CONFIG), b"{}").expect("write config.json");
-    std::fs::write(tmp.join(MLX_SAFETENSORS_INDEX), b"{}").expect("write index.json");
-    let routed = prefer_mlx(&tmp, &["vision_encoder.onnx", "decoder_model_merged.onnx"]);
-    let _ = std::fs::remove_dir_all(&tmp);
-    assert!(
-      routed,
-      "config.json + model.safetensors.index.json (sharded, no ONNX graph) must select MLX"
-    );
+  fn checkpoint_budget_rejects_unrenderable_tile_grid() {
+    let config = ModelConfig::from_json(
+      r#"{"text_config": {}, "vision_config": {}, "min_tiles": 2, "max_tiles": 32}"#,
+    )
+    .expect("parse config");
+    assert!(matches!(
+      checkpoint_budget(&config),
+      Err(Error::InvalidBudget(_))
+    ));
   }
 
-  /// A LEGACY single-file MLX checkpoint — `config.json` + `weights.safetensors`
-  /// (the older single-file name) with NO `model.safetensors` and no ONNX graph
-  /// — is an MLX checkpoint: `prefer_mlx` routes it to MLX, because
-  /// [`mlxrs::io::load_weights_from_dir`] accepts `weights.safetensors` as a
-  /// fallback tier.
+  /// The plan ratification compares every field `TilePlan` exposes and names
+  /// the first disagreement. `TilePlan` cannot be constructed directly from
+  /// outside `mlxrs`, so drive it through the real `plan_tiles` and mismatch
+  /// the plan side instead.
   #[test]
-  fn prefer_mlx_true_for_legacy_weights_safetensors() {
-    let tmp = detect_dir("probe_legacy");
-    std::fs::write(tmp.join(MLX_CONFIG), b"{}").expect("write config.json");
-    std::fs::write(tmp.join(MLX_SAFETENSORS_LEGACY), b"\0").expect("write weights.safetensors");
-    let routed = prefer_mlx(&tmp, &["vision_encoder.onnx", "decoder_model_merged.onnx"]);
-    let _ = std::fs::remove_dir_all(&tmp);
-    assert!(
-      routed,
-      "config.json + weights.safetensors (legacy single-file, no ONNX graph) must select MLX"
-    );
-  }
+  fn ratify_plan_names_the_disagreeing_field() {
+    let processor = mlxrs::vlm::models::lfm2_vl::Lfm2VlProcessorConfig::new(396, 2, 16, 1024)
+      .expect("processor config")
+      .with_tiling(true, 2, 10, true, 64, 256, 16, 512, 2.0)
+      .expect("tiling");
+    // A large image: `plan_tiles` splits it into a multi-tile grid.
+    let tiles = plan_tiles(2048, 2048, &processor).expect("plan tiles");
+    assert!(tiles.is_split(), "2048x2048 must split under this config");
 
-  /// A dir with only `config.json` + `model.npz` (no safetensors, no ONNX graph)
-  /// is recognized as an MLX checkpoint by `prefer_mlx` **iff** the `npz` feature
-  /// is on — the routing widens to the same formats the loader accepts. Without
-  /// `npz`, the `.npz` is not a recognized weight file and `prefer_mlx` is
-  /// `false`.
-  #[test]
-  fn prefer_mlx_npz_only_routes_iff_npz_feature() {
-    let tmp = detect_dir("probe_npz");
-    std::fs::write(tmp.join(MLX_CONFIG), b"{}").expect("write config.json");
-    std::fs::write(tmp.join("model.npz"), b"\0").expect("write model.npz");
-    let routed = prefer_mlx(&tmp, &["vision_encoder.onnx", "decoder_model_merged.onnx"]);
-    let _ = std::fs::remove_dir_all(&tmp);
-    assert_eq!(
-      routed,
-      cfg!(feature = "npz"),
-      "a config.json + model.npz dir must route to MLX iff the npz feature is on"
-    );
-  }
+    // A single-tile plan cannot ratify against a split TilePlan, and the error
+    // must name which field disagreed.
+    let single = ImagePlan::from_placeholder(ImagePlaceholderInfo::new(1, 1, 64, None));
+    match ratify_plan(3, &single, &tiles) {
+      Err(Error::ImagePlanMismatch {
+        image, parameter, ..
+      }) => {
+        assert_eq!(image, 3, "the error must name the offending image");
+        assert!(
+          parameter.contains("rows") || parameter.contains("cols"),
+          "expected a grid-shaped parameter, got {parameter:?}"
+        );
+      }
+      other => panic!("expected ImagePlanMismatch, got {other:?}"),
+    }
 
-  /// Same contract for gguf: a `config.json` + `model.gguf` dir routes to MLX
-  /// iff the `gguf` feature is on.
-  #[test]
-  fn prefer_mlx_gguf_only_routes_iff_gguf_feature() {
-    let tmp = detect_dir("probe_gguf");
-    std::fs::write(tmp.join(MLX_CONFIG), b"{}").expect("write config.json");
-    std::fs::write(tmp.join("model.gguf"), b"\0").expect("write model.gguf");
-    let routed = prefer_mlx(&tmp, &["vision_encoder.onnx", "decoder_model_merged.onnx"]);
-    let _ = std::fs::remove_dir_all(&tmp);
-    assert_eq!(
-      routed,
-      cfg!(feature = "gguf"),
-      "a config.json + model.gguf dir must route to MLX iff the gguf feature is on"
-    );
+    // The plan that matches the checkpoint's own layout ratifies cleanly.
+    let (grid_width, grid_height) = tiles.grid();
+    let matching = ImagePlan::from_placeholder(ImagePlaceholderInfo::new(
+      grid_height as usize,
+      grid_width as usize,
+      256,
+      tiles.has_thumbnail().then_some(256),
+    ));
+    ratify_plan(0, &matching, &tiles).expect("the checkpoint's own layout must ratify");
   }
 }

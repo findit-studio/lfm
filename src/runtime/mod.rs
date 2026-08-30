@@ -5,6 +5,13 @@
 // feature set as `generate` / `Engine` (inference + decoders).
 #[cfg(feature = "decoders")]
 pub(crate) mod backend;
+// Checkpoint-layout detection is the selector `Engine::from_dir` routes on. It
+// is platform-independent (a non-macOS host must still be able to say "this is
+// an MLX checkpoint and this platform has no MLX backend" rather than reporting
+// a missing ONNX graph), so it lives beside the `backend` seam under the same
+// gate rather than inside the macOS-only `mlx_backend`.
+#[cfg(feature = "decoders")]
+pub(crate) mod checkpoint;
 pub(crate) mod decoder;
 pub(crate) mod embed_tokens;
 // The MLX (mlxrs) backend is the Apple-Silicon-only on-device alternative to

@@ -14,6 +14,8 @@ use crate::{
   options::ImageBudget,
 };
 
+pub mod image_plan;
+pub use image_plan::{IMAGE_BLOCK_WRAPPER_TOKENS, ImagePlan};
 pub mod tile_grid;
 pub use tile_grid::TileGrid;
 mod target_ratios;
