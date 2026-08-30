@@ -628,6 +628,11 @@ pub struct Options {
   /// [`Engine::from_dir`](crate::Engine::from_dir) choose from the checkpoint
   /// layout; `Some(kind)` demands that backend and fails loudly when it cannot
   /// be served.
+  ///
+  /// `#[serde(default)]` so an `Options` document written before this field
+  /// existed still deserializes — an absent pin IS the auto-select default, so
+  /// filling it in is exactly right rather than a papered-over omission.
+  #[cfg_attr(feature = "serde", serde(default))]
   backend: Option<BackendKind>,
   #[cfg(feature = "inference")]
   optimization_level: GraphOptLevelMirror,
@@ -811,6 +816,34 @@ impl From<GraphOptLevelMirror> for GraphOptimizationLevel {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// An `Options` document written before the backend pin existed still
+  /// deserializes: an absent `backend` key means auto-select, which is the
+  /// default the field carries anyway.
+  #[test]
+  #[cfg(feature = "serde")]
+  fn options_deserialize_without_backend_key() {
+    let json = serde_json::to_value(Options::new()).expect("serialize Options");
+    let mut map = json.as_object().expect("object").clone();
+    assert!(
+      map.remove("backend").is_some(),
+      "the field must be present when serialized"
+    );
+    let restored: Options =
+      serde_json::from_value(serde_json::Value::Object(map)).expect("deserialize without backend");
+    assert_eq!(restored.backend(), None);
+    assert_eq!(restored, Options::new());
+  }
+
+  /// A pin round-trips through serde as the backend's own name.
+  #[test]
+  #[cfg(feature = "serde")]
+  fn backend_pin_round_trips() {
+    let opts = Options::new().with_backend(BackendKind::Mlx);
+    let json = serde_json::to_string(&opts).expect("serialize");
+    let back: Options = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back.backend(), Some(BackendKind::Mlx));
+  }
 
   // ===== RequestOptions =====
 
