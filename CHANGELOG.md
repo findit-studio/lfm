@@ -36,7 +36,8 @@ and this crate adheres to [Semantic Versioning](https://semver.org/).
 - `Engine::from_mlx_dir_unchecked` / `from_mlx_safetensors_unchecked` /
   `from_mlx_npz_unchecked` / `from_mlx_gguf_unchecked` — the named door for a
   custom MLX checkpoint, skipping the bundled tokenizer / chat-template identity
-  checks (but not the structural contract).
+  checks and the declared preprocessing contract (but not the structural
+  contract).
 - ORT/MLX parity integration test (`t10`), gated on `LFM_ONNX_MODEL_PATH` (or
   `LFM_MODEL_PATH`) **and** `LFM_MLX_MODEL_PATH`; it compares the preprocessing
   plans, the prefill logit rows, and the schema-constrained JSON completion,
@@ -101,6 +102,17 @@ and this crate adheres to [Semantic Versioning](https://semver.org/).
   sub-image at each position decodes to the position its marker names, by
   row-major expansion fixtures replacing the reversed ones, and by a non-square
   multi-tile image added to the ORT/MLX parity run.
+- **Strict MLX constructors validate the preprocessing contract.** They checked
+  `tokenizer.json` and `chat_template.jinja` only, while `mlxrs` hardcodes
+  `image_mean = image_std = 0.5`, rescale `1/255` and bilinear resampling
+  (`Lfm2Vl::processor_config` never reads them from the checkpoint). A revision
+  shipping different normalization, a different rescale factor, or a
+  non-bilinear `resample` therefore loaded cleanly and fed systematically wrong
+  pixels to the vision tower with every count, grid and dimension check green —
+  the version-skew class the ONNX strict constructor already refused.
+  `Engine::from_mlx_dir`, `from_mlx_safetensors`, `from_mlx_npz` and
+  `from_mlx_gguf` now all validate it (a missing `preprocessor_config.json` also
+  fails closed); the `_unchecked` doors remain the only escape.
 - A non-finite decoder logit row is rejected before either sampler. Only `-inf`
   is a value this crate writes on purpose (vocab-tail masking, the llguidance
   allow-mask, repetition-penalty overflow); a NaN or `+inf` arriving from the

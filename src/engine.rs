@@ -115,10 +115,12 @@ impl Engine {
   /// - the model's real context limit must match
   ///   [`MODEL_CONTEXT_TOKENS`](crate::options::MODEL_CONTEXT_TOKENS), which the
   ///   admission gates trust;
-  /// - the preprocessing geometry must match — for ONNX that is
-  ///   `preprocessor_config.json` against the crate's constants; for MLX it is
-  ///   the checkpoint's `config.json` tiling against those constants and against
-  ///   the [`ImageBudget`] the prompt's markers are rendered from.
+  /// - the preprocessing must match. Both roads read the pixel arithmetic their
+  ///   patchifier bakes in — normalization, rescale factor, resampling — from
+  ///   `preprocessor_config.json`. ONNX additionally validates the tiling
+  ///   geometry from that file; MLX validates the equivalent from the
+  ///   checkpoint's own `config.json`, against those constants and against the
+  ///   [`ImageBudget`] the prompt's markers are rendered from.
   ///
   /// Requires the `bundled` feature so the byte-compare references are
   /// available. The named escape hatches are [`Engine::from_paths`] (ONNX) and
@@ -283,9 +285,11 @@ impl Engine {
   /// stages (text embed, vision encode + splice, decoder forward).
   ///
   /// **Strict constructor**, matching [`from_dir`](Self::from_dir): the
-  /// directory's `tokenizer.json` must byte-match the bundled blob and its
-  /// `chat_template.jinja` must byte-match the bundled template, on top of the
-  /// structural contract every MLX road enforces (see
+  /// directory's `tokenizer.json` must byte-match the bundled blob, its
+  /// `chat_template.jinja` must byte-match the bundled template, and its
+  /// `preprocessor_config.json` must declare the normalization, rescale factor
+  /// and resampling the MLX processor bakes in — on top of the structural
+  /// contract every MLX road enforces (see
   /// [`from_mlx_dir_unchecked`](Self::from_mlx_dir_unchecked)). Use the
   /// `_unchecked` door for a custom checkpoint.
   #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "bundled"))]
@@ -303,10 +307,13 @@ impl Engine {
   /// bundled-identity validations.
   ///
   /// This is the named door for a custom MLX checkpoint: a fine-tune with its
-  /// own tokenizer, or a re-export whose `chat_template.jinja` differs from the
-  /// one this crate renders with. Skipping those checks means YOU are asserting
-  /// that the checkpoint's vocabulary and prompt format match what `lfm`
-  /// renders; if they do not, prompts are corrupted silently.
+  /// own tokenizer, a re-export whose `chat_template.jinja` differs from the one
+  /// this crate renders with, or one whose `preprocessor_config.json` declares
+  /// different normalization / rescale / resampling than the MLX processor
+  /// bakes in. Skipping those checks means YOU are asserting that the
+  /// checkpoint's vocabulary, prompt format and pixel arithmetic match what
+  /// `lfm` and `mlxrs` apply; if they do not, prompts and vision inputs are
+  /// corrupted silently.
   ///
   /// What is **not** skippable, because `lfm`'s own arithmetic depends on it and
   /// no assertion by the caller can make it safe:
@@ -799,17 +806,35 @@ fn require_backend_compiled(kind: BackendKind) -> Result<BackendKind> {
   Ok(kind)
 }
 
-/// The bundled-identity half of the MLX road's strict contract: the
-/// checkpoint's `tokenizer.json` and `chat_template.jinja` must byte-match the
-/// blobs this crate renders and tokenizes with.
+/// The waivable half of the MLX road's strict contract: the checkpoint's
+/// `tokenizer.json` and `chat_template.jinja` must byte-match the blobs this
+/// crate renders and tokenizes with, and its `preprocessor_config.json` must
+/// declare the pixel arithmetic the MLX processor bakes in.
 ///
-/// These are the two assertions a caller can legitimately waive for a custom
-/// checkpoint (hence the `_unchecked` constructors); the structural contract in
-/// [`Engine::assemble_mlx`] cannot be waived.
+/// Runs on EVERY strict MLX constructor — [`Engine::from_mlx_dir`],
+/// [`Engine::from_mlx_safetensors`], `Engine::from_mlx_npz` and
+/// `Engine::from_mlx_gguf` all route through here — so the preprocessing
+/// contract cannot be enforced on one door and skipped on another.
+///
+/// These are the assertions a caller can legitimately waive for a custom
+/// checkpoint (hence the `_unchecked` constructors, which remain the only
+/// escape); the structural contract in [`Engine::assemble_mlx`] cannot be
+/// waived.
+///
+/// The preprocessing check belongs here rather than in `assemble_mlx` because
+/// it is waivable in exactly the sense the other two are: a fine-tune may
+/// legitimately have been trained under different normalization, and asserting
+/// that is what `_unchecked` means. What it must not do is pass silently —
+/// `mlxrs` hardcodes `image_mean = image_std = 0.5`, rescale `1/255` and
+/// bilinear resampling (`Lfm2Vl::processor_config` never reads those from the
+/// checkpoint), so a revision that changes any of them would feed
+/// systematically wrong pixels to the vision tower with every count, grid and
+/// dimension check still green. See [`check_preprocessing_pixel_contract`].
 #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "bundled"))]
 fn validate_mlx_checkpoint_identity(dir: &Path) -> Result<()> {
   validate_tokenizer_matches_bundled(&dir.join("tokenizer.json"))?;
   validate_chat_template_matches_bundled(&dir.join("chat_template.jinja"))?;
+  validate_mlx_preprocessing_contract(&dir.join("preprocessor_config.json"))?;
   Ok(())
 }
 
@@ -900,155 +925,222 @@ fn validate_image_tokenizer_contract(tokenizer: &Tokenizer, max_tiles: usize) ->
 }
 
 // =========================================================================
-// Preprocessor-config drift detector ()
+// Preprocessor-config drift detectors
 // =========================================================================
 
-/// Validate the model's `preprocessor_config.json` matches our hardcoded
-/// preprocessing-algorithm constants (patch_size, downsample_factor,
-/// tile_size, image_mean, image_std). Drift between any of these and
-/// the values our `flatten_to_patches` / `smart_resize` / `pick_tile_grid`
-/// rely on would produce visually-wrong embeddings without an obvious
-/// runtime error.
+/// Read + parse a checkpoint's `preprocessor_config.json`, failing closed when
+/// it is absent.
 ///
-/// Budget-tunable fields (min/max image_tokens, min/max tiles,
-/// max_pixels_tolerance, use_thumbnail) are deliberately NOT checked
-/// here — callers can override them via `Options::image_budget()`.
-///
-/// Used only by `from_dir` (where the model directory has the config
-/// alongside the ONNX files). `from_onnx_dir` uses bundled assets and
-/// our own constants by construction, so no drift is possible.
+/// The strict drift detectors are the whole point of these checks; letting a
+/// missing file skip them defeats it. A stripped-down checkpoint directory
+/// belongs on one of the named unchecked doors instead
+/// ([`Engine::from_paths`] on the ONNX road,
+/// `Engine::from_mlx_*_unchecked` on the MLX road).
 #[cfg_attr(not(feature = "bundled"), allow(dead_code))]
-fn validate_preprocessor_config(path: &Path) -> Result<()> {
-  // fail closed on missing config. The
-  // strict drift detector is the whole point of this check; allowing
-  // its absence to skip validation defeats it. If a caller has a
-  // stripped-down model directory without preprocessor_config.json,
-  // they should use `from_paths` (which explicitly opts out) or
-  // `from_onnx_dir` (which uses bundled assets).
+fn read_preprocessor_config(path: &Path) -> Result<serde_json::Value> {
   if !path.exists() {
     return Err(Error::InvalidRequest(
-      "model directory missing preprocessor_config.json — use from_paths to bypass strict drift checks",
+      "model directory missing preprocessor_config.json — use from_paths (ONNX) or from_mlx_*_unchecked (MLX) to bypass strict drift checks",
     ));
   }
   let raw = std::fs::read_to_string(path).map_err(Error::Io)?;
-  let cfg: serde_json::Value = serde_json::from_str(&raw)
-    .map_err(|e| Error::tokenizer(format!("preprocessor_config.json parse failure: {e}")))?;
+  serde_json::from_str(&raw)
+    .map_err(|e| Error::tokenizer(format!("preprocessor_config.json parse failure: {e}")))
+}
 
-  // Helpers
-  let read_u64 = |key: &'static str| -> Result<u64> {
-    cfg
-      .get(key)
-      .and_then(|v| v.as_u64())
-      .ok_or(Error::InvalidRequest(
-        "preprocessor_config.json missing required integer field — wrong model revision?",
-      ))
-  };
-  let read_bool = |key: &'static str| -> Result<bool> {
-    cfg
-      .get(key)
-      .and_then(|v| v.as_bool())
-      .ok_or(Error::InvalidRequest(
-        "preprocessor_config.json missing required boolean field — wrong model revision?",
-      ))
-  };
-  let read_str = |key: &'static str| -> Result<&str> {
-    cfg
-      .get(key)
-      .and_then(|v| v.as_str())
-      .ok_or(Error::InvalidRequest(
-        "preprocessor_config.json missing required string field — wrong model revision?",
-      ))
-  };
-  let read_f64 = |key: &'static str| -> Result<f64> {
-    cfg
-      .get(key)
-      .and_then(|v| v.as_f64())
-      .ok_or(Error::InvalidRequest(
-        "preprocessor_config.json missing required number field — wrong model revision?",
-      ))
-  };
-  let read_f32_array3 = |key: &'static str| -> Result<[f32; 3]> {
-    let arr = cfg
-      .get(key)
-      .and_then(|v| v.as_array())
-      .ok_or(Error::InvalidRequest(
-        "preprocessor_config.json missing required [f32; 3] field — wrong model revision?",
-      ))?;
-    if arr.len() != 3 {
-      return Err(Error::InvalidRequest(
-        "preprocessor_config.json field is not a 3-element array — wrong model revision?",
-      ));
-    }
-    let mut out = [0f32; 3];
-    for (i, v) in arr.iter().enumerate() {
-      out[i] = v.as_f64().ok_or(Error::InvalidRequest(
-        "preprocessor_config.json array element is not a number — wrong model revision?",
-      ))? as f32;
-    }
-    Ok(out)
-  };
+#[cfg_attr(not(feature = "bundled"), allow(dead_code))]
+fn cfg_u64(cfg: &serde_json::Value, key: &'static str) -> Result<u64> {
+  cfg
+    .get(key)
+    .and_then(|v| v.as_u64())
+    .ok_or(Error::InvalidRequest(
+      "preprocessor_config.json missing required integer field — wrong model revision?",
+    ))
+}
 
-  // Round-20 baseline: model-fixed dimensional constants.
-  if read_u64("encoder_patch_size")? != crate::preproc::tile_grid::PATCH_SIZE as u64 {
+#[cfg_attr(not(feature = "bundled"), allow(dead_code))]
+fn cfg_bool(cfg: &serde_json::Value, key: &'static str) -> Result<bool> {
+  cfg
+    .get(key)
+    .and_then(|v| v.as_bool())
+    .ok_or(Error::InvalidRequest(
+      "preprocessor_config.json missing required boolean field — wrong model revision?",
+    ))
+}
+
+#[cfg_attr(not(feature = "bundled"), allow(dead_code))]
+fn cfg_str<'a>(cfg: &'a serde_json::Value, key: &'static str) -> Result<&'a str> {
+  cfg
+    .get(key)
+    .and_then(|v| v.as_str())
+    .ok_or(Error::InvalidRequest(
+      "preprocessor_config.json missing required string field — wrong model revision?",
+    ))
+}
+
+#[cfg_attr(not(feature = "bundled"), allow(dead_code))]
+fn cfg_f64(cfg: &serde_json::Value, key: &'static str) -> Result<f64> {
+  cfg
+    .get(key)
+    .and_then(|v| v.as_f64())
+    .ok_or(Error::InvalidRequest(
+      "preprocessor_config.json missing required number field — wrong model revision?",
+    ))
+}
+
+#[cfg_attr(not(feature = "bundled"), allow(dead_code))]
+fn cfg_f32_array3(cfg: &serde_json::Value, key: &'static str) -> Result<[f32; 3]> {
+  let arr = cfg
+    .get(key)
+    .and_then(|v| v.as_array())
+    .ok_or(Error::InvalidRequest(
+      "preprocessor_config.json missing required [f32; 3] field — wrong model revision?",
+    ))?;
+  if arr.len() != 3 {
     return Err(Error::InvalidRequest(
-      "preprocessor_config.json encoder_patch_size != 16 (lfm crate hardcoded) — wrong model revision?",
+      "preprocessor_config.json field is not a 3-element array — wrong model revision?",
     ));
   }
-  if read_u64("downsample_factor")? != crate::preproc::tile_grid::DOWNSAMPLE_FACTOR as u64 {
-    return Err(Error::InvalidRequest(
-      "preprocessor_config.json downsample_factor != 2 (lfm crate hardcoded) — wrong model revision?",
-    ));
+  let mut out = [0f32; 3];
+  for (i, v) in arr.iter().enumerate() {
+    out[i] = v.as_f64().ok_or(Error::InvalidRequest(
+      "preprocessor_config.json array element is not a number — wrong model revision?",
+    ))? as f32;
   }
-  if read_u64("tile_size")? != crate::preproc::tile_grid::FULL_TILE_SIZE as u64 {
-    return Err(Error::InvalidRequest(
-      "preprocessor_config.json tile_size != 512 (lfm crate hardcoded) — wrong model revision?",
-    ));
-  }
+  Ok(out)
+}
 
-  // also validate every preprocessing
-  // semantic the Rust code hardcodes. Any of these flipped vs the
-  // model's training-time config would produce wrong embeddings.
+/// The preprocessing arithmetic BOTH roads bake in rather than read.
+///
+/// Every value here is a compile-time constant of some pixel pipeline, so a
+/// checkpoint revision that changes one is not something either road can
+/// honour — it can only be refused:
+///
+/// - the ONNX road's [`flatten_to_patches`](crate::preproc) computes
+///   `(b / 255) * 2 - 1`, i.e. rescale `1/255` then `(x - 0.5) / 0.5`, and
+///   resizes with a PIL-compatible bilinear filter;
+/// - the MLX road's `mlxrs` `tile_image` folds the same contract into
+///   `x * (1/255)/std + (-mean/std)` with `image_mean = image_std = 0.5`
+///   (`Lfm2VlProcessorConfig::new`'s defaults — `Lfm2Vl::processor_config`
+///   never overrides them from the checkpoint) and resizes with
+///   `ResizeFilter::Bilinear`.
+///
+/// So a revision shipping ImageNet normalization, a different rescale factor,
+/// a non-bilinear `resample`, or `do_normalize: false` would load fine and feed
+/// systematically wrong pixels to the vision tower, with every count, grid and
+/// dimension check still passing. This is the version-skew class the strict
+/// constructors exist to refuse, on either road.
+///
+/// Budget-tunable fields (min/max image_tokens, min/max tiles,
+/// `max_pixels_tolerance`, `use_thumbnail`) are deliberately NOT checked here —
+/// callers override them via `Options::image_budget()`, and the MLX road
+/// reconciles them against the checkpoint's own `config.json` in
+/// `MlxBackend::effective_budget`.
+#[cfg_attr(not(feature = "bundled"), allow(dead_code))]
+fn check_preprocessing_pixel_contract(cfg: &serde_json::Value) -> Result<()> {
   for (key, expected) in [
     ("do_resize", true),
     ("do_rescale", true),
     ("do_normalize", true),
     ("do_pad", true),
-    ("do_image_splitting", true),
   ] {
-    if read_bool(key)? != expected {
+    if cfg_bool(cfg, key)? != expected {
       return Err(Error::InvalidRequest(
         "preprocessor_config.json boolean preprocessing flag differs from lfm crate hardcoded value — wrong model revision?",
       ));
     }
   }
 
-  // data_format: must be channels_first. Our flatten_to_patches
-  // produces (C, H, W) order — see PATCH_SIZE × PATCH_SIZE × 3 unfold.
-  if read_str("data_format")? != "channels_first" {
+  // data_format: the layout upstream feeds `convert_image_to_patches`, whose
+  // final reshape collapses (patch, patch, C) — so both of this crate's
+  // patchifiers emit HWC bytes per patch. `channels_last` would be a different
+  // byte order for both.
+  if cfg_str(cfg, "data_format")? != "channels_first" {
     return Err(Error::InvalidRequest(
       "preprocessor_config.json data_format != channels_first — wrong model revision?",
     ));
   }
 
-  // resample: 2 = PIL BILINEAR. We use image::imageops::FilterType::Triangle
-  // which is bilinear; matches.
-  if read_u64("resample")? != 2 {
+  // resample: 2 = PIL BILINEAR. The ONNX road resizes with
+  // `fast_image_resize`'s Pillow-compatible bilinear convolution; the MLX road
+  // with `mlxrs`'s `ResizeFilter::Bilinear`.
+  if cfg_u64(cfg, "resample")? != 2 {
     return Err(Error::InvalidRequest(
       "preprocessor_config.json resample != 2 (BILINEAR) — wrong model revision?",
     ));
   }
 
-  // rescale_factor: 1/255 = 0.003921568627... — our flatten_to_patches
-  // computes (px / 255.0) * 2.0 - 1.0, where /255.0 IS the rescale.
-  let rf = read_f64("rescale_factor")?;
+  // rescale_factor: 1/255, the divisor both roads bake into their normalization.
+  let rf = cfg_f64(cfg, "rescale_factor")?;
   if (rf - (1.0 / 255.0)).abs() > 1e-9 {
     return Err(Error::InvalidRequest(
       "preprocessor_config.json rescale_factor != 1/255 — wrong model revision?",
     ));
   }
 
-  // size = {height: 512, width: 512}. Mirrors tile_size but checked
-  // separately because some HF processors use `size` independently.
+  // Normalization: `(px/255)*2 - 1` is `(px/255 - 0.5) / 0.5`, so image_mean and
+  // image_std must both be [0.5, 0.5, 0.5].
+  for (key, expected) in [("image_mean", [0.5f32; 3]), ("image_std", [0.5f32; 3])] {
+    let got = cfg_f32_array3(cfg, key)?;
+    for (g, e) in got.iter().zip(expected.iter()) {
+      if (g - e).abs() > 1e-4 {
+        return Err(Error::InvalidRequest(
+          "preprocessor_config.json image_mean/image_std differs from [0.5, 0.5, 0.5] (lfm crate hardcoded normalization) — wrong model revision?",
+        ));
+      }
+    }
+  }
+  Ok(())
+}
+
+/// Validate the model's `preprocessor_config.json` for the **ONNX** road: the
+/// shared pixel contract plus the tiling geometry this crate's ported
+/// `pick_tile_grid` / `smart_resize` hardcode.
+///
+/// The geometry half is ONNX-only because the MLX road reads the same
+/// quantities from the checkpoint's `config.json` instead — the loaded
+/// `ModelConfig` is checked against the identical constants in
+/// `MlxBackend::effective_budget`'s `require_baked_in_contract`, which is
+/// stronger (it asserts against the values the model was actually built with),
+/// and `do_image_splitting` is *honoured* there rather than baked, folded into
+/// the tile band by `checkpoint_budget`.
+///
+/// Used only by `from_dir` (where the model directory has the config alongside
+/// the ONNX files). `from_onnx_dir` uses bundled assets and our own constants
+/// by construction, so no drift is possible.
+#[cfg_attr(not(feature = "bundled"), allow(dead_code))]
+fn validate_preprocessor_config(path: &Path) -> Result<()> {
+  let cfg = read_preprocessor_config(path)?;
+  check_preprocessing_pixel_contract(&cfg)?;
+
+  // Model-fixed dimensional constants.
+  if cfg_u64(&cfg, "encoder_patch_size")? != crate::preproc::tile_grid::PATCH_SIZE as u64 {
+    return Err(Error::InvalidRequest(
+      "preprocessor_config.json encoder_patch_size != 16 (lfm crate hardcoded) — wrong model revision?",
+    ));
+  }
+  if cfg_u64(&cfg, "downsample_factor")? != crate::preproc::tile_grid::DOWNSAMPLE_FACTOR as u64 {
+    return Err(Error::InvalidRequest(
+      "preprocessor_config.json downsample_factor != 2 (lfm crate hardcoded) — wrong model revision?",
+    ));
+  }
+  if cfg_u64(&cfg, "tile_size")? != crate::preproc::tile_grid::FULL_TILE_SIZE as u64 {
+    return Err(Error::InvalidRequest(
+      "preprocessor_config.json tile_size != 512 (lfm crate hardcoded) — wrong model revision?",
+    ));
+  }
+
+  // do_image_splitting: the ONNX road derives splitting from the budget's tile
+  // band, not from this flag, so a checkpoint that disables splitting would be
+  // split anyway. (The MLX road honours it — see this function's doc.)
+  if !cfg_bool(&cfg, "do_image_splitting")? {
+    return Err(Error::InvalidRequest(
+      "preprocessor_config.json boolean preprocessing flag differs from lfm crate hardcoded value — wrong model revision?",
+    ));
+  }
+
+  // size = {height: 512, width: 512}. Mirrors tile_size but checked separately
+  // because some HF processors use `size` independently.
   let size = cfg
     .get("size")
     .and_then(|v| v.as_object())
@@ -1062,21 +1154,20 @@ fn validate_preprocessor_config(path: &Path) -> Result<()> {
       ));
     }
   }
-
-  // Normalization: our flatten_to_patches does (px/255)*2 - 1, which
-  // is equivalent to (px/255 - 0.5) / 0.5 = subtract 0.5 then divide
-  // by 0.5. So image_mean and image_std must both be [0.5, 0.5, 0.5].
-  for (key, expected) in [("image_mean", [0.5f32; 3]), ("image_std", [0.5f32; 3])] {
-    let got = read_f32_array3(key)?;
-    for (g, e) in got.iter().zip(expected.iter()) {
-      if (g - e).abs() > 1e-4 {
-        return Err(Error::InvalidRequest(
-          "preprocessor_config.json image_mean/image_std differs from [0.5, 0.5, 0.5] (lfm crate hardcoded normalization) — wrong model revision?",
-        ));
-      }
-    }
-  }
   Ok(())
+}
+
+/// Validate the **MLX** road's half of the preprocessing contract: the pixel
+/// arithmetic `mlxrs` bakes in, read from the checkpoint's
+/// `preprocessor_config.json`.
+///
+/// The MLX geometry (patch size, downsample factor, tile size, tile band,
+/// thumbnail policy) is validated from the loaded `ModelConfig` instead, so
+/// only the shared pixel contract is read from this file.
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "bundled"))]
+fn validate_mlx_preprocessing_contract(path: &Path) -> Result<()> {
+  let cfg = read_preprocessor_config(path)?;
+  check_preprocessing_pixel_contract(&cfg)
 }
 
 // =========================================================================
@@ -1828,6 +1919,219 @@ mod tests {
     assert!(
       !chat_templates_render_alike(&drifted, bundled),
       "a `{{# … #}}` inside a quoted string is rendered text, not a comment — it must be drift"
+    );
+  }
+  // =======================================================================
+  // Preprocessing-contract drift (both roads)
+  // =======================================================================
+
+  /// The mutations that make a checkpoint's declared pixel arithmetic disagree
+  /// with what BOTH patchifiers bake in. Each is `(name, json patch applied to
+  /// the bundled preprocessor_config)`.
+  ///
+  /// Every one of these leaves the tile grid, the sub-image count and every
+  /// `<image>`-token total identical, so nothing downstream can notice: the
+  /// vision tower simply receives systematically wrong numbers.
+  #[cfg(feature = "bundled")]
+  fn preprocessing_skew_cases() -> Vec<(&'static str, serde_json::Value)> {
+    use serde_json::json;
+    vec![
+      ("image_mean", json!([0.485, 0.456, 0.406])),
+      ("image_std", json!([0.229, 0.224, 0.225])),
+      ("rescale_factor", json!(1.0 / 127.5)),
+      ("resample", json!(3)),
+      ("do_normalize", json!(false)),
+      ("do_rescale", json!(false)),
+      ("do_resize", json!(false)),
+      ("do_pad", json!(false)),
+      ("data_format", json!("channels_last")),
+    ]
+  }
+
+  /// Apply one skew case to the bundled `preprocessor_config.json` and return
+  /// the mutated bytes.
+  #[cfg(feature = "bundled")]
+  fn skewed_preprocessor_config(key: &str, value: &serde_json::Value) -> Vec<u8> {
+    let mut cfg: serde_json::Value =
+      serde_json::from_slice(crate::bundled::PREPROCESSOR_CONFIG_JSON)
+        .expect("bundled preprocessor_config.json is valid JSON");
+    cfg
+      .as_object_mut()
+      .expect("preprocessor_config.json is an object")
+      .insert(key.to_string(), value.clone());
+    serde_json::to_vec_pretty(&cfg).expect("serialize mutated config")
+  }
+
+  /// The shared pixel contract refuses every normalization / rescale /
+  /// resampling skew, and accepts the bundled config unchanged.
+  #[test]
+  #[cfg(feature = "bundled")]
+  fn preprocessing_pixel_contract_refuses_normalization_and_resampling_skew() {
+    let clean: serde_json::Value =
+      serde_json::from_slice(crate::bundled::PREPROCESSOR_CONFIG_JSON).unwrap();
+    assert!(
+      check_preprocessing_pixel_contract(&clean).is_ok(),
+      "the bundled preprocessor_config.json must satisfy the contract it defines"
+    );
+
+    for (key, value) in preprocessing_skew_cases() {
+      let mutated: serde_json::Value =
+        serde_json::from_slice(&skewed_preprocessor_config(key, &value)).unwrap();
+      let result = check_preprocessing_pixel_contract(&mutated);
+      assert!(
+        matches!(result, Err(Error::InvalidRequest(_))),
+        "a checkpoint declaring {key} = {value} must be refused, got {result:?}"
+      );
+    }
+  }
+
+  /// A missing `preprocessor_config.json` fails closed rather than skipping the
+  /// contract, and the failure names the unchecked doors.
+  #[test]
+  #[cfg(feature = "bundled")]
+  fn missing_preprocessor_config_fails_closed() {
+    let dir = std::env::temp_dir().join(format!("lfm-test-preproc-missing-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let missing = dir.join("preprocessor_config.json");
+    let _ = std::fs::remove_file(&missing);
+    let result = read_preprocessor_config(&missing);
+    assert!(
+      matches!(&result, Err(Error::InvalidRequest(msg)) if msg.contains("unchecked")),
+      "absence must be refused by name, got {result:?}"
+    );
+  }
+
+  /// The ONNX strict road refuses the same skew — `from_dir`'s validator is
+  /// built on the shared contract, so this is a regression guard on the
+  /// composition, not a duplicate of the contract test.
+  #[test]
+  #[cfg(feature = "bundled")]
+  fn onnx_preprocessor_validator_refuses_skew_and_accepts_bundled() {
+    let dir = std::env::temp_dir().join(format!("lfm-test-preproc-onnx-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let ok = dir.join("preprocessor_config.json");
+    std::fs::write(&ok, crate::bundled::PREPROCESSOR_CONFIG_JSON).unwrap();
+    assert!(validate_preprocessor_config(&ok).is_ok());
+
+    for (key, value) in preprocessing_skew_cases() {
+      let path = dir.join(format!("preprocessor_config-{key}.json"));
+      std::fs::write(&path, skewed_preprocessor_config(key, &value)).unwrap();
+      let result = validate_preprocessor_config(&path);
+      assert!(
+        matches!(result, Err(Error::InvalidRequest(_))),
+        "ONNX strict road must refuse {key} = {value}, got {result:?}"
+      );
+    }
+  }
+
+  /// Every STRICT MLX constructor refuses a checkpoint whose declared
+  /// preprocessing disagrees with what `mlxrs` bakes in — and `_unchecked`
+  /// stays the only escape.
+  ///
+  /// The checkpoint directory is deliberately weightless: a strict constructor
+  /// validates identity BEFORE it loads anything, so a refusal that names
+  /// `preprocessor_config.json` proves the gate ran, and the clean directory's
+  /// different failure (no `config.json` / no weights) proves the gate was
+  /// passed rather than short-circuiting everything.
+  #[test]
+  #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "bundled"))]
+  fn strict_mlx_constructors_refuse_preprocessing_skew() {
+    let root = std::env::temp_dir().join(format!("lfm-test-mlx-preproc-{}", std::process::id()));
+
+    let write_checkpoint = |name: &str, preprocessor: &[u8]| -> PathBuf {
+      let dir = root.join(name);
+      std::fs::create_dir_all(&dir).unwrap();
+      std::fs::write(dir.join("tokenizer.json"), crate::bundled::TOKENIZER_JSON).unwrap();
+      std::fs::write(
+        dir.join("chat_template.jinja"),
+        crate::bundled::CHAT_TEMPLATE_JINJA,
+      )
+      .unwrap();
+      std::fs::write(dir.join("preprocessor_config.json"), preprocessor).unwrap();
+      dir
+    };
+
+    let names_preprocessing = |e: &Error| e.to_string().contains("preprocessor_config.json");
+
+    // ── the skewed checkpoints are refused, by name ──────────────────────
+    for (key, value) in preprocessing_skew_cases() {
+      let dir = write_checkpoint(key, &skewed_preprocessor_config(key, &value));
+
+      let err = Engine::from_mlx_dir(&dir, Options::default())
+        .err()
+        .unwrap_or_else(|| panic!("from_mlx_dir must refuse {key} = {value}"));
+      assert!(
+        names_preprocessing(&err),
+        "from_mlx_dir must refuse {key} = {value} by naming preprocessor_config.json, got {err}"
+      );
+
+      // The explicit-format doors read the sibling config from the weight
+      // file's parent, so the same skew must stop them too.
+      let weights = dir.join("model.safetensors");
+      let err = Engine::from_mlx_safetensors(&weights, Options::default())
+        .err()
+        .unwrap_or_else(|| panic!("from_mlx_safetensors must refuse {key} = {value}"));
+      assert!(
+        names_preprocessing(&err),
+        "from_mlx_safetensors must refuse {key} = {value}, got {err}"
+      );
+
+      #[cfg(feature = "npz")]
+      {
+        let err = Engine::from_mlx_npz(dir.join("weights.npz"), Options::default())
+          .err()
+          .unwrap_or_else(|| panic!("from_mlx_npz must refuse {key} = {value}"));
+        assert!(names_preprocessing(&err), "from_mlx_npz: {err}");
+      }
+      #[cfg(feature = "gguf")]
+      {
+        let err = Engine::from_mlx_gguf(dir.join("weights.gguf"), Options::default())
+          .err()
+          .unwrap_or_else(|| panic!("from_mlx_gguf must refuse {key} = {value}"));
+        assert!(names_preprocessing(&err), "from_mlx_gguf: {err}");
+      }
+    }
+
+    // ── absence fails closed on the MLX road too ─────────────────────────
+    let bare = root.join("no-preprocessor-config");
+    std::fs::create_dir_all(&bare).unwrap();
+    std::fs::write(bare.join("tokenizer.json"), crate::bundled::TOKENIZER_JSON).unwrap();
+    std::fs::write(
+      bare.join("chat_template.jinja"),
+      crate::bundled::CHAT_TEMPLATE_JINJA,
+    )
+    .unwrap();
+    let err = Engine::from_mlx_dir(&bare, Options::default())
+      .err()
+      .expect("a checkpoint without preprocessor_config.json must be refused");
+    assert!(
+      names_preprocessing(&err),
+      "absence must be named, got {err}"
+    );
+
+    // ── a conforming checkpoint gets PAST the gate (and then fails on the
+    //    weights it does not have), so the gate is not refusing everything ──
+    let clean = write_checkpoint("clean", crate::bundled::PREPROCESSOR_CONFIG_JSON);
+    let err = Engine::from_mlx_dir(&clean, Options::default())
+      .err()
+      .expect("a weightless checkpoint cannot load");
+    assert!(
+      !names_preprocessing(&err),
+      "a conforming preprocessor_config.json must pass the gate; failure was {err}"
+    );
+
+    // ── `_unchecked` is the escape: it never consults the file at all ─────
+    let skewed = write_checkpoint(
+      "unchecked-escape",
+      &skewed_preprocessor_config("image_mean", &serde_json::json!([0.1, 0.2, 0.3])),
+    );
+    let err = Engine::from_mlx_dir_unchecked(&skewed, Options::default())
+      .err()
+      .expect("a weightless checkpoint cannot load");
+    assert!(
+      !names_preprocessing(&err),
+      "the unchecked door must not run the preprocessing gate; failure was {err}"
     );
   }
 }
