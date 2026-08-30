@@ -50,13 +50,31 @@ and this crate adheres to [Semantic Versioning](https://semver.org/).
   checkpoint whose tiling parameters disagree with a non-default `ImageBudget`
   is refused by name; a default `ImageBudget` adopts the checkpoint's own tiling
   instead.
-- `chat_template.jinja` drift detection compares rendered-prompt equivalence
-  rather than raw bytes: Jinja comments and leading whitespace (which the
-  template's own `{{- bos_token -}}` strips) are normalized away, while every
-  emitting construct is still compared byte for byte. The released
-  `LiquidAI/LFM2.5-VL-450M-MLX-8bit` ships the bundled template with an added
-  `{# … #}` header for mlx_lm, which byte-equality refused for no behavioural
-  reason.
+- Both roads refuse a checkpoint whose `config.json` sets
+  `use_image_special_tokens: false` — by name on the MLX road
+  (`Error::MlxTilingMismatch`), as a strict-constructor drift error on the ONNX
+  road. This crate always brackets an image block with `<|image_start|>` /
+  `<|image_end|>` and always budgets both tokens, so such a checkpoint would be
+  prompted with two tokens its processor contract omits while every token count
+  still matched. An absent key means `true` (upstream's default) and is
+  accepted.
+- The MLX execute-time gate now re-derives the tile layout from the dimensions
+  it actually decoded and ratifies it against the plan the prompt's markers were
+  rendered from, before any feature is spliced. A path-backed image is opened
+  once for header planning and again for decoding; a file replaced in between
+  (1920×1080 → 1080×1920) yields a transposed grid whose sub-image count and
+  per-sub-image token counts are identical, so the previous count-only gate
+  admitted it and spliced row-major features under markers for the old layout.
+- `chat_template.jinja` drift detection normalizes exactly one thing before an
+  otherwise byte-exact comparison: the template's **leading** run of Jinja
+  comments and whitespace. The released `LiquidAI/LFM2.5-VL-450M-MLX-8bit` ships
+  the bundled template with a `{# … #}` header prepended for mlx_lm, which
+  byte-equality refused for no behavioural reason; at offset zero a `{#`
+  unambiguously opens a comment and the whitespace it leaves is swallowed by the
+  template's own `{{- bos_token -}}`. Comments elsewhere are NOT normalized —
+  `{#` opens a comment only in template-text context, so erasing every span
+  would rewrite `{{- "sys{# drift #}tem" -}}` into the bundled
+  `{{- "system" -}}` and pass a checkpoint that renders a different prompt.
 
 ### Fixed
 

@@ -78,9 +78,14 @@
 //!    ported tiling under that budget, then ratifies it against the
 //!    checkpoint's own planner ([`plan_tiles`]): grid, thumbnail presence and
 //!    sub-image count must agree.
-//! 3. **Execute time** — [`MlxBackend::prepare_prompt_embeds`] reads back the
-//!    real patch grid of every sub-image `split_image` produced and checks the
-//!    per-sub-image and total `<image>`-token counts against the plan.
+//! 3. **Execute time** — [`MlxBackend::prepare_prompt_embeds`] re-runs gate 2
+//!    against the dimensions it actually DECODED (a path-backed image is opened
+//!    once for header planning and again here, so the file may have changed in
+//!    between), then reads back the real patch grid of every sub-image
+//!    `split_image` produced and checks the per-sub-image and total
+//!    `<image>`-token counts against the plan. Both halves are needed: a
+//!    transposed grid leaves every count identical, and matching grids still
+//!    say nothing about the patch grid a produced sub-image really carries.
 //!
 //! Any disagreement is [`Error::ImagePlanMismatch`], never a silent splice.
 
@@ -163,6 +168,65 @@ fn config_count(field: &'static str, value: i32) -> Result<usize> {
       "checkpoint config.json `{field}` is negative ({value}); it must be a non-negative count"
     ))
   })
+}
+
+/// Refuse, by name, every checkpoint value `lfm` **bakes in** rather than reads.
+///
+/// These are not budget knobs: each one is compiled into this crate's token
+/// math, its marker table, or its prompt rendering, so it cannot be adopted from
+/// a checkpoint at runtime — a disagreement can only be refused.
+///
+/// - The preprocessing geometry (`patch_size`, `encoder_patch_size`,
+///   `downsample_factor`, `tile_size`) and the `<image>` token id drive
+///   `TileGrid`'s arithmetic and the tokenizer's marker table.
+/// - `use_image_special_tokens` is upstream's switch for bracketing an image
+///   block with `image_start` / `image_end` (`config.py:87`, default `true`).
+///   `lfm` has no such switch: [`crate::chat_template::expand_image_placeholders`]
+///   always emits `<|image_start|>` / `<|image_end|>` and
+///   [`ImagePlan`] always budgets
+///   [`IMAGE_BLOCK_WRAPPER_TOKENS`](crate::preproc::IMAGE_BLOCK_WRAPPER_TOKENS)
+///   for them. A `false` checkpoint therefore gets a prompt carrying two tokens
+///   its processor contract omits — and every count still lines up, because the
+///   brackets are not `<image>` tokens and the plan budgets exactly what it
+///   renders, so neither the plan-time nor the execute-time gate can see it.
+///   Refusing by name is the choice over carrying the policy through
+///   `ImagePlan` / marker rendering / structural admission: the brackets are
+///   pinned identically on the ONNX road (the bundled `config.json` ships
+///   `use_image_special_tokens: true`, and `from_dir` refuses a `false` one),
+///   so honouring the flag would mean parameterizing the crate's one prompt
+///   contract into two — the second of which no released checkpoint exercises
+///   and no parity test can validate.
+fn require_baked_in_contract(config: &ModelConfig) -> Result<()> {
+  require_same(
+    "vision_config.patch_size",
+    i64::from(PATCH_SIZE),
+    i64::from(config.vision_config.patch_size),
+  )?;
+  require_same(
+    "encoder_patch_size",
+    i64::from(PATCH_SIZE),
+    i64::from(config.encoder_patch_size),
+  )?;
+  require_same(
+    "downsample_factor",
+    i64::from(DOWNSAMPLE_FACTOR),
+    i64::from(config.downsample_factor),
+  )?;
+  require_same(
+    "tile_size",
+    i64::from(FULL_TILE_SIZE),
+    i64::from(config.tile_size),
+  )?;
+  require_same(
+    "image_token_index",
+    i64::from(crate::chat_template::IMAGE_TOKEN_ID),
+    i64::from(config.image_token_index),
+  )?;
+  require_same(
+    "use_image_special_tokens",
+    true,
+    config.use_image_special_tokens,
+  )
 }
 
 /// Express the checkpoint's own tiling parameters as an [`ImageBudget`] — the
@@ -334,11 +398,13 @@ impl MlxBackend {
   ///
   /// Two classes of parameter, two policies:
   ///
-  /// - **Constants `lfm` hardcodes** (`PATCH_SIZE`, `DOWNSAMPLE_FACTOR`,
-  ///   `FULL_TILE_SIZE`, the `<image>` token id) are baked into
-  ///   `TileGrid`'s token math and the tokenizer's marker table — they cannot be
-  ///   adopted at runtime, so a checkpoint that disagrees is always refused by
-  ///   name.
+  /// - **Values `lfm` bakes in** (`PATCH_SIZE`, `DOWNSAMPLE_FACTOR`,
+  ///   `FULL_TILE_SIZE`, the `<image>` token id, and the
+  ///   `use_image_special_tokens` bracketing policy) are compiled into
+  ///   `TileGrid`'s token math, the tokenizer's marker table and the prompt
+  ///   renderer — they cannot be adopted at runtime, so a checkpoint that
+  ///   disagrees is always refused by name (see
+  ///   [`require_baked_in_contract`]).
   /// - **Budget knobs** (`min`/`max_image_tokens`, `min`/`max_tiles`,
   ///   `use_thumbnail`, `max_pixels_tolerance`) are caller-tunable, but the MLX
   ///   path cannot honour them: `split_image` reads the checkpoint's
@@ -358,32 +424,8 @@ impl MlxBackend {
   pub(crate) fn effective_budget(&self, requested: &ImageBudget) -> Result<ImageBudget> {
     let config = self.model.config();
 
-    // ── constants: never adoptable ─────────────────────────────────────────
-    require_same(
-      "vision_config.patch_size",
-      i64::from(PATCH_SIZE),
-      i64::from(config.vision_config.patch_size),
-    )?;
-    require_same(
-      "encoder_patch_size",
-      i64::from(PATCH_SIZE),
-      i64::from(config.encoder_patch_size),
-    )?;
-    require_same(
-      "downsample_factor",
-      i64::from(DOWNSAMPLE_FACTOR),
-      i64::from(config.downsample_factor),
-    )?;
-    require_same(
-      "tile_size",
-      i64::from(FULL_TILE_SIZE),
-      i64::from(config.tile_size),
-    )?;
-    require_same(
-      "image_token_index",
-      i64::from(crate::chat_template::IMAGE_TOKEN_ID),
-      i64::from(config.image_token_index),
-    )?;
+    // ── baked-in values: never adoptable ───────────────────────────────────
+    require_baked_in_contract(config)?;
 
     let checkpoint = checkpoint_budget(config)?;
 
@@ -415,6 +457,30 @@ impl MlxBackend {
       checkpoint.max_pixels_tolerance(),
     )?;
     Ok(checkpoint)
+  }
+
+  /// Ask the checkpoint's OWN planner what `width`×`height` tiles into, and
+  /// ratify `plan` — the plan the prompt's markers were rendered from — against
+  /// the answer.
+  ///
+  /// Run at BOTH ends of the plan's life, which is the point of it being one
+  /// method: at plan time against the image's header dimensions, and again at
+  /// execute time against the dimensions actually decoded. The second call is
+  /// what closes the re-read window — a path-backed image is opened once for
+  /// header planning and again for decoding, so a file replaced in between
+  /// (1920×1080 → 1080×1920) reaches the splice as the transposed grid. Its
+  /// sub-image count and every per-sub-image token count are identical, so
+  /// [`verify_sub_images`] cannot see it; only the grid comparison can.
+  fn ratify_against_checkpoint(
+    &self,
+    index: usize,
+    plan: &ImagePlan,
+    width: u32,
+    height: u32,
+  ) -> Result<()> {
+    let processor = self.model.processor_config().map_err(Error::from_mlx)?;
+    let tiles = plan_tiles(height, width, &processor).map_err(Error::from_mlx)?;
+    ratify_plan(index, plan, &tiles)
   }
 
   /// Build a `(1, seq)` i32 `input_ids` [`Array`] from host token ids, rejecting
@@ -576,9 +642,7 @@ impl Backend for MlxBackend {
   ) -> Result<ImagePlan> {
     let grid = pick_tile_grid(width, height, preproc.budget())?;
     let plan = ImagePlan::from_placeholder(grid.to_placeholder_info());
-    let processor = self.model.processor_config().map_err(Error::from_mlx)?;
-    let tiles = plan_tiles(height, width, &processor).map_err(Error::from_mlx)?;
-    ratify_plan(index, &plan, &tiles)?;
+    self.ratify_against_checkpoint(index, &plan, width, height)?;
     Ok(plan)
   }
 
@@ -629,6 +693,12 @@ impl Backend for MlxBackend {
       let (rgb, width, height) =
         mlxrs::vlm::image::decode_rgb(&decoded).map_err(Error::from_mlx)?;
       drop(decoded); // free the DynamicImage before tiling/encoding.
+      // Re-derive the layout from the dimensions actually DECODED and ratify it
+      // against the plan the markers were rendered from, before a single
+      // feature is spliced. `verify_sub_images` below compares counts, which a
+      // transposed grid (2×4 → 4×2, after a path-backed image was replaced
+      // between the header read and this one) leaves untouched.
+      self.ratify_against_checkpoint(index, plan, width, height)?;
       let tiles = self
         .model
         .split_image(&rgb, width, height)
@@ -987,5 +1057,119 @@ mod tests {
       tiles.has_thumbnail().then_some(256),
     ));
     ratify_plan(0, &matching, &tiles).expect("the checkpoint's own layout must ratify");
+  }
+
+  /// The re-read defence: a landscape image and its portrait transpose tile
+  /// into MIRRORED grids with the SAME sub-image count and the SAME per-tile
+  /// token count, so every quantity [`verify_sub_images`] compares is
+  /// identical — a 1920×1080 file replaced by a 1080×1920 one between the
+  /// header read and the decode would splice row-major features from the new
+  /// layout under markers rendered for the old. Only the grid comparison
+  /// [`MlxBackend::ratify_against_checkpoint`] runs on the DECODED dimensions
+  /// can refuse it, and it must name the offending axis.
+  #[test]
+  fn ratify_plan_catches_a_transposed_grid_with_equal_token_totals() {
+    let processor = mlxrs::vlm::models::lfm2_vl::Lfm2VlProcessorConfig::new(396, 2, 16, 1024)
+      .expect("processor config")
+      .with_tiling(true, 2, 10, true, 64, 256, 16, 512, 2.0)
+      .expect("tiling");
+
+    // `plan_tiles(height, width, …)`: the planned image, then the transpose the
+    // execute-time decode would see.
+    let planned = plan_tiles(1080, 1920, &processor).expect("plan landscape");
+    let decoded = plan_tiles(1920, 1080, &processor).expect("plan portrait");
+    assert!(planned.is_split() && decoded.is_split());
+    assert_eq!(
+      planned.grid(),
+      {
+        let (w, h) = decoded.grid();
+        (h, w)
+      },
+      "the two must be exact transposes, or this is not the equal-token case"
+    );
+    assert_ne!(
+      planned.grid(),
+      decoded.grid(),
+      "a square grid would make the swap undetectable AND harmless — pick a non-square one"
+    );
+    assert_eq!(
+      planned.sub_image_count().expect("planned sub-images"),
+      decoded.sub_image_count().expect("decoded sub-images"),
+      "the sub-image count must be equal, so the count gates cannot see the swap"
+    );
+
+    let (grid_width, grid_height) = planned.grid();
+    let plan = ImagePlan::from_placeholder(ImagePlaceholderInfo::new(
+      grid_height as usize,
+      grid_width as usize,
+      256,
+      planned.has_thumbnail().then_some(256),
+    ));
+    // Same dimensions → ratifies. Transposed dimensions → refused by axis.
+    ratify_plan(0, &plan, &planned).expect("the planned layout must ratify");
+    match ratify_plan(7, &plan, &decoded) {
+      Err(Error::ImagePlanMismatch {
+        image,
+        parameter,
+        planned: p,
+        produced,
+      }) => {
+        assert_eq!(image, 7, "the error must name the offending image");
+        assert!(
+          parameter.contains("rows") || parameter.contains("cols"),
+          "expected a grid axis, got {parameter:?}"
+        );
+        assert_ne!(p, produced, "the named values must actually differ");
+      }
+      other => panic!("a transposed grid must be refused, got {other:?}"),
+    }
+  }
+
+  /// `use_image_special_tokens: false` is a checkpoint whose processor contract
+  /// omits the `<|image_start|>` / `<|image_end|>` brackets this crate always
+  /// renders and always budgets. Every count still matches — the brackets are
+  /// not `<image>` tokens — so the plan-time and execute-time gates are blind to
+  /// it; the load-time contract refuses it BY NAME instead. The default
+  /// (`true`, and absent ⇒ `true`) passes, as do the geometry constants.
+  #[test]
+  fn baked_in_contract_refuses_disabled_image_special_tokens() {
+    let parse = |json: &str| ModelConfig::from_json(json).expect("parse config");
+
+    // A config with the crate's own geometry and the brackets turned OFF.
+    let off = parse(
+      r#"{"text_config": {}, "vision_config": {}, "image_token_index": 396,
+          "use_image_special_tokens": false}"#,
+    );
+    match require_baked_in_contract(&off) {
+      Err(Error::MlxTilingMismatch {
+        parameter,
+        lfm_value,
+        checkpoint_value,
+      }) => {
+        assert_eq!(parameter, "use_image_special_tokens");
+        assert_eq!(lfm_value.as_str(), "true");
+        assert_eq!(checkpoint_value.as_str(), "false");
+      }
+      other => panic!("a false bracketing policy must be refused by name, got {other:?}"),
+    }
+
+    // Explicit `true` and an absent key (upstream's default) both pass.
+    let on = parse(
+      r#"{"text_config": {}, "vision_config": {}, "image_token_index": 396,
+          "use_image_special_tokens": true}"#,
+    );
+    require_baked_in_contract(&on).expect("use_image_special_tokens=true must pass");
+    let absent = parse(r#"{"text_config": {}, "vision_config": {}, "image_token_index": 396}"#);
+    require_baked_in_contract(&absent).expect("an absent key defaults to true and must pass");
+
+    // The geometry half still refuses by name.
+    let bad_tile = parse(
+      r#"{"text_config": {}, "vision_config": {}, "image_token_index": 396,
+          "tile_size": 384}"#,
+    );
+    match require_baked_in_contract(&bad_tile) {
+      Err(Error::MlxTilingMismatch { parameter, .. }) => assert_eq!(parameter, "tile_size"),
+      other => panic!("expected a tile_size mismatch, got {other:?}"),
+    }
   }
 }

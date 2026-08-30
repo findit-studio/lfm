@@ -198,8 +198,10 @@ impl Engine {
     // but a smaller-context decoder export would otherwise load
     // successfully, and requests up to 128 K tokens would pass
     // admission then fail late or generate with invalid position
-    // state. Same theme as the chat_template drift check.
-    validate_config_context_matches_bundled(&dir.join("config.json"))?;
+    // state. The same gate refuses a config.json that turns the image
+    // brackets off, which this crate's renderer and ImagePlan both hardcode.
+    // Same theme as the chat_template drift check.
+    validate_config_contract_matches_bundled(&dir.join("config.json"))?;
     let onnx = dir.join("onnx");
     Self::from_paths(
       EnginePaths::new(
@@ -1081,26 +1083,27 @@ fn validate_preprocessor_config(path: &Path) -> Result<()> {
 // Tokenizer-bytes drift detector (bundled feature only)
 // =========================================================================
 
-/// Verify the supplied `tokenizer.json` byte-matches the bundled blob.
-/// a tokenizer with the same special-token IDs
-/// but a drifted normal vocabulary would pass the per-token contract
-/// check yet still encode normal text into different IDs that don't
-/// match the embedding table — silent global prompt corruption.
+/// Validate the two `config.json` values this crate bakes in rather than reads:
+/// the model's real context limit and its image-bracketing policy.
 ///
-/// Called from `from_dir` (strict constructor) only; `from_paths`
-/// remains the explicit escape hatch for callers intentionally
-/// pairing custom tokenizers with custom ONNX.
-/// Validate the model's `config.json` exposes a
-/// `text_config.max_position_embeddings` (or top-level
-/// `max_position_embeddings`) that matches our hard-coded
-/// [`crate::options::MODEL_CONTEXT_TOKENS`].
-/// finding 1: generate()'s admission gates trust this constant; a
-/// model exported with a smaller positional embedding range would
-/// pass byte-identical tokenizer/template/preprocessor checks
-/// (the static assets) but quietly accept prompts past its real
-/// limit and either fail late or produce invalid position state.
+/// - `text_config.max_position_embeddings` (or top-level
+///   `max_position_embeddings`) must match our hard-coded
+///   [`crate::options::MODEL_CONTEXT_TOKENS`]. finding 1: generate()'s
+///   admission gates trust this constant; a model exported with a smaller
+///   positional embedding range would pass byte-identical
+///   tokenizer/template/preprocessor checks (the static assets) but quietly
+///   accept prompts past its real limit and either fail late or produce invalid
+///   position state.
+/// - `use_image_special_tokens` must not be `false`. This crate's renderer
+///   always brackets an image block with `<|image_start|>` / `<|image_end|>`
+///   and [`ImagePlan`](crate::preproc::ImagePlan) always budgets those two
+///   tokens; a checkpoint whose processor contract omits them would be handed a
+///   prompt with two tokens it never saw in training, with every count still
+///   matching. The key is optional and **absent means `true`**, matching
+///   upstream's own default (`config.py:87`) and the MLX road's config parse —
+///   only an explicit `false` is refused.
 #[cfg(feature = "bundled")]
-fn validate_config_context_matches_bundled(path: &Path) -> Result<()> {
+fn validate_config_contract_matches_bundled(path: &Path) -> Result<()> {
   if !path.exists() {
     return Err(Error::InvalidRequest(
       "model directory missing config.json — use from_paths to bypass strict context-length drift checks (advanced: requires matching ONNX embedding table)",
@@ -1123,6 +1126,14 @@ fn validate_config_context_matches_bundled(path: &Path) -> Result<()> {
   if max_pos != crate::options::MODEL_CONTEXT_TOKENS as u64 {
     return Err(Error::InvalidRequest(
       "config.json max_position_embeddings differs from crate's MODEL_CONTEXT_TOKENS (128_000) — admission gates would accept requests past the loaded model's real position limit",
+    ));
+  }
+  // Absent ⇒ `true` (upstream's default), so only an explicit `false` — a
+  // checkpoint whose processor contract omits the image brackets this crate
+  // unconditionally renders and budgets — is refused.
+  if v.get("use_image_special_tokens") == Some(&serde_json::Value::Bool(false)) {
+    return Err(Error::InvalidRequest(
+      "config.json use_image_special_tokens is false — this crate always brackets an image block with <|image_start|>/<|image_end|> and budgets both tokens, so the rendered prompt would carry two tokens the checkpoint's processor contract omits",
     ));
   }
   Ok(())
@@ -1161,19 +1172,11 @@ fn validate_chat_template_matches_bundled(path: &Path) -> Result<()> {
 
 /// Whether two Jinja chat templates render identical prompts.
 ///
-/// This is a **drift detector**, not a checksum: what matters is whether the
-/// checkpoint expects a different prompt format than the one this crate renders
-/// with. Two normalizations are applied, both provably output-neutral, and
-/// nothing else — every emitting construct is still compared byte for byte, so
-/// a changed role envelope, image-block wrapping, or literal is still refused:
-///
-/// - **Jinja comments** (`{# … #}`) are removed. A comment cannot reach the
-///   rendered output by construction.
-/// - **Leading whitespace** is trimmed. The bundled template's first emitting
-///   construct is `{{- bos_token -}}`, whose `-` strips the whitespace before
-///   it, so leading whitespace cannot reach the output either. Trailing
-///   whitespace is NOT trimmed: nothing guarantees it is stripped, so a
-///   difference there is still drift.
+/// This is a **drift detector**, not a checksum, but it is deliberately only
+/// one step away from one: the sole normalization is the **leading**
+/// comment/whitespace header, after which the two bodies must be byte-equal.
+/// Every emitting construct is therefore still compared byte for byte, so a
+/// changed role envelope, image-block wrapping, or literal is refused.
 ///
 /// The motivating case is real: `LiquidAI/LFM2.5-VL-450M-MLX-8bit` ships the
 /// same template as the ONNX export with a two-line
@@ -1181,32 +1184,53 @@ fn validate_chat_template_matches_bundled(path: &Path) -> Result<()> {
 /// byte-equality check refuses that checkpoint over a comment — making the
 /// strict MLX constructor unusable against the released weights while catching
 /// nothing.
+///
+/// # Why only the leading header
+///
+/// Erasing every `{# … #}` span anywhere in the file is **not** sound without a
+/// Jinja lexer, because `{#` only opens a comment in template-text context. A
+/// template whose body reads `{{- "sys{# drift #}tem" -}}` renders
+/// `sys{# drift #}tem`, but a blind span-strip rewrites it to the bundled
+/// `{{- "system" -}}` and reports no drift — a checkpoint with a different
+/// prompt contract passing the strict constructor, which is exactly what this
+/// gate exists to prevent. At offset zero there is no such ambiguity: the lexer
+/// starts in text context, so a leading `{#` really is a comment, and the
+/// whitespace it leaves behind cannot reach the output because the bundled
+/// body's first emitting construct is `{{- bos_token -}}`, whose `-` strips it.
+///
+/// (The alternative — comparing parser tokens — would need minijinja's
+/// `unstable_machinery` feature, an explicitly unstable API this crate does not
+/// enable; the prefix rule needs no lexer at all.)
+///
+/// Trailing whitespace is NOT trimmed: nothing guarantees it is stripped, so a
+/// difference there is still drift. A comment anywhere past the header is drift
+/// too — fail-closed, and `from_paths` / the `_unchecked` constructors remain
+/// the named door for a checkpoint that legitimately carries one.
 #[cfg(feature = "bundled")]
 fn chat_templates_render_alike(supplied: &[u8], bundled: &[u8]) -> bool {
-  strip_jinja_comments(supplied).trim_ascii_start()
-    == strip_jinja_comments(bundled).trim_ascii_start()
+  strip_leading_comment_header(supplied) == strip_leading_comment_header(bundled)
 }
 
-/// Remove every `{# … #}` span from a Jinja template.
+/// Drop a template's leading run of Jinja comments and ASCII whitespace,
+/// returning the body that follows.
 ///
-/// An unterminated `{#` is left verbatim rather than swallowing the rest of the
-/// file: a template that cannot be tokenized is drift, and silently discarding
-/// its tail would hide that.
+/// Only complete `{# … #}` spans at the very start (separated by optional
+/// whitespace) are consumed; the scan stops at the first byte that opens
+/// neither. An unterminated `{#` is left verbatim rather than swallowing the
+/// rest of the file: a template that cannot be tokenized is drift, and silently
+/// discarding its tail would hide that.
 #[cfg(feature = "bundled")]
-fn strip_jinja_comments(template: &[u8]) -> Vec<u8> {
+fn strip_leading_comment_header(template: &[u8]) -> &[u8] {
   const OPEN: &[u8] = b"{#";
   const CLOSE: &[u8] = b"#}";
-  let mut out = Vec::with_capacity(template.len());
-  let mut rest = template;
-  while let Some(start) = find_subslice(rest, OPEN) {
-    let Some(end) = find_subslice(&rest[start + OPEN.len()..], CLOSE) else {
+  let mut rest = template.trim_ascii_start();
+  while let Some(body) = rest.strip_prefix(OPEN) {
+    let Some(end) = find_subslice(body, CLOSE) else {
       break; // unterminated comment — keep the remainder verbatim
     };
-    out.extend_from_slice(&rest[..start]);
-    rest = &rest[start + OPEN.len() + end + CLOSE.len()..];
+    rest = body[end + CLOSE.len()..].trim_ascii_start();
   }
-  out.extend_from_slice(rest);
-  out
+  rest
 }
 
 /// Index of the first occurrence of `needle` in `haystack`.
@@ -1220,6 +1244,15 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     .position(|window| window == needle)
 }
 
+/// Verify the supplied `tokenizer.json` byte-matches the bundled blob: a
+/// tokenizer with the same special-token IDs but a drifted normal vocabulary
+/// would pass the per-token contract check yet still encode normal text into
+/// different IDs that don't match the embedding table — silent global prompt
+/// corruption.
+///
+/// Called from `from_dir` (strict constructor) only; `from_paths` remains the
+/// explicit escape hatch for callers intentionally pairing custom tokenizers
+/// with custom ONNX.
 #[cfg(feature = "bundled")]
 fn validate_tokenizer_matches_bundled(path: &Path) -> Result<()> {
   let supplied = std::fs::read(path).map_err(Error::Io)?;
@@ -1579,7 +1612,7 @@ mod tests {
 
   #[test]
   #[cfg(feature = "bundled")]
-  fn validate_config_context_matches_bundled_accepts_correct_and_rejects_drift() {
+  fn validate_config_contract_matches_bundled_accepts_correct_and_rejects_drift() {
     // from_dir's strict drift check for
     // text_config.max_position_embeddings vs MODEL_CONTEXT_TOKENS.
     let dir = std::env::temp_dir().join(format!("lfm-test-config-drift-{}", std::process::id()));
@@ -1589,7 +1622,7 @@ mod tests {
     let missing = dir.join("config-missing.json");
     let _ = std::fs::remove_file(&missing);
     assert!(matches!(
-      validate_config_context_matches_bundled(&missing),
+      validate_config_contract_matches_bundled(&missing),
       Err(Error::InvalidRequest(_))
     ));
 
@@ -1601,7 +1634,7 @@ mod tests {
     )
     .unwrap();
     assert!(matches!(
-      validate_config_context_matches_bundled(&drift),
+      validate_config_contract_matches_bundled(&drift),
       Err(Error::InvalidRequest(_))
     ));
 
@@ -1612,25 +1645,69 @@ mod tests {
       r#"{"text_config":{"max_position_embeddings":128000}}"#,
     )
     .unwrap();
-    assert!(validate_config_context_matches_bundled(&ok_nested).is_ok());
+    assert!(validate_config_contract_matches_bundled(&ok_nested).is_ok());
 
     // Correct top-level layout → ok (older single-modality configs).
     let ok_flat = dir.join("config-ok-flat.json");
     std::fs::write(&ok_flat, r#"{"max_position_embeddings":128000}"#).unwrap();
-    assert!(validate_config_context_matches_bundled(&ok_flat).is_ok());
+    assert!(validate_config_contract_matches_bundled(&ok_flat).is_ok());
 
     // Bundled config.json → ok.
     let ok_bundled = dir.join("config-ok-bundled.json");
     std::fs::write(&ok_bundled, crate::bundled::CONFIG_JSON).unwrap();
-    assert!(validate_config_context_matches_bundled(&ok_bundled).is_ok());
+    assert!(validate_config_contract_matches_bundled(&ok_bundled).is_ok());
 
     // Invalid JSON → reject.
     let bad_json = dir.join("config-bad.json");
     std::fs::write(&bad_json, b"{not json").unwrap();
     assert!(matches!(
-      validate_config_context_matches_bundled(&bad_json),
+      validate_config_contract_matches_bundled(&bad_json),
       Err(Error::InvalidRequest(_))
     ));
+  }
+
+  /// The ONNX road's twin of the MLX `use_image_special_tokens` contract: an
+  /// otherwise-correct `config.json` that turns the image brackets OFF is
+  /// refused, because the renderer emits `<|image_start|>` / `<|image_end|>`
+  /// and `ImagePlan` budgets both unconditionally. An explicit `true`, and an
+  /// absent key (upstream's default is `true`), both pass.
+  #[test]
+  #[cfg(feature = "bundled")]
+  fn validate_config_contract_rejects_disabled_image_special_tokens() {
+    let dir = std::env::temp_dir().join(format!("lfm-test-config-brackets-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let write = |name: &str, body: &str| {
+      let p = dir.join(name);
+      std::fs::write(&p, body).unwrap();
+      p
+    };
+
+    let off = write(
+      "config-brackets-off.json",
+      r#"{"max_position_embeddings":128000,"use_image_special_tokens":false}"#,
+    );
+    assert!(
+      matches!(
+        validate_config_contract_matches_bundled(&off),
+        Err(Error::InvalidRequest(_))
+      ),
+      "use_image_special_tokens=false must be refused"
+    );
+
+    let on = write(
+      "config-brackets-on.json",
+      r#"{"max_position_embeddings":128000,"use_image_special_tokens":true}"#,
+    );
+    assert!(validate_config_contract_matches_bundled(&on).is_ok());
+
+    let absent = write(
+      "config-brackets-absent.json",
+      r#"{"max_position_embeddings":128000}"#,
+    );
+    assert!(
+      validate_config_contract_matches_bundled(&absent).is_ok(),
+      "an absent key means upstream's default (true) and must not be refused"
+    );
   }
 
   #[test]
@@ -1668,15 +1745,15 @@ mod tests {
     assert!(validate_chat_template_matches_bundled(&ok).is_ok());
   }
 
-  /// The template check is a drift detector, not a checksum: a template that
-  /// renders the same prompt must pass, and one that renders a different prompt
-  /// must not.
+  /// The template check normalizes exactly one thing — the leading
+  /// comment/whitespace header — and compares the rest byte for byte.
   ///
   /// The accepted case is the released `LiquidAI/LFM2.5-VL-450M-MLX-8bit`
   /// checkpoint, which ships the bundled template with a two-line Jinja comment
-  /// prepended for mlx_lm's tool detection. Comments cannot reach the rendered
-  /// output, and the leading whitespace they leave behind is swallowed by the
-  /// template's own `{{- bos_token -}}`.
+  /// prepended for mlx_lm's tool detection. A comment at offset zero is
+  /// unambiguously a comment (the lexer starts in text context) and the
+  /// whitespace it leaves behind is swallowed by the template's own
+  /// `{{- bos_token -}}`.
   #[test]
   #[cfg(feature = "bundled")]
   fn chat_template_comment_header_is_not_drift_but_content_is() {
@@ -1690,14 +1767,10 @@ mod tests {
       "a prepended Jinja comment cannot change the rendered prompt and must not be reported as drift"
     );
 
-    // A comment in the MIDDLE is equally output-neutral.
-    let mut inner = bundled.to_vec();
-    let insert_at = bundled.len() / 2;
-    inner.splice(
-      insert_at..insert_at,
-      b"{# mid-template note #}".iter().copied(),
-    );
-    assert!(chat_templates_render_alike(&inner, bundled));
+    // Several stacked header comments, with whitespace between and around them.
+    let mut stacked = b"\n  {# one #}\n{# two #}\t\n\n".to_vec();
+    stacked.extend_from_slice(bundled);
+    assert!(chat_templates_render_alike(&stacked, bundled));
 
     // Real content changes are still refused: a mutated literal…
     let mut mutated = bundled.to_vec();
@@ -1716,6 +1789,45 @@ mod tests {
     assert!(
       !chat_templates_render_alike(&unterminated, bundled),
       "an unterminated comment must not swallow the rest of the file"
+    );
+  }
+
+  /// The counterexample that rules out stripping `{# … #}` spans anywhere in
+  /// the file: `{#` opens a comment only in template-text context, so a span
+  /// that sits INSIDE a quoted string literal is rendered output, not a
+  /// comment.
+  ///
+  /// The drifted template below is the bundled one with `{# drift #}` inserted
+  /// into the assistant-turn literal, so it renders
+  /// `<|im_start|>assistant{# drift #}\n` where the bundled template renders
+  /// `<|im_start|>assistant\n` — a different prompt contract. It is also,
+  /// byte for byte, nothing but an inserted comment span (asserted below), so a
+  /// blind span-strip normalizes it straight back onto the bundled bytes and
+  /// reports no drift. Only the leading-header rule refuses it.
+  #[test]
+  #[cfg(feature = "bundled")]
+  fn chat_template_comment_inside_a_string_literal_is_drift() {
+    let bundled = crate::bundled::CHAT_TEMPLATE_JINJA;
+    const SPAN: &[u8] = b"{# drift #}";
+    // Insert inside the quoted literal of `{{- "<|im_start|>assistant\n" -}}`.
+    let needle = b"<|im_start|>assistant";
+    let at = find_subslice(bundled, needle).expect("bundled template renders an assistant turn")
+      + needle.len();
+
+    let mut drifted = bundled.to_vec();
+    drifted.splice(at..at, SPAN.iter().copied());
+    // The ONLY difference is an inserted comment span — i.e. exactly what a
+    // general span-strip erases, and exactly why it cannot be trusted.
+    let mut unspliced = drifted.clone();
+    unspliced.drain(at..at + SPAN.len());
+    assert_eq!(
+      unspliced, bundled,
+      "the counterexample must differ from the bundled template by the comment span alone"
+    );
+
+    assert!(
+      !chat_templates_render_alike(&drifted, bundled),
+      "a `{{# … #}}` inside a quoted string is rendered text, not a comment — it must be drift"
     );
   }
 }
