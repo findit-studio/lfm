@@ -135,7 +135,7 @@ impl Sampler for FreeSampler {
       *v = f32::NEG_INFINITY;
     }
     apply_repetition_penalty(logits, seen_tokens, self.opts.repetition_penalty());
-    // Issue #2 C-001 + two-part numeric
+    // Issue #2 C-001 + three-part numeric
     // safety check, restricted to the valid vocab range so the
     // intentional -Inf masking of the [vocab_size, logits.len())
     // tail (above) doesn't trip the guard.
@@ -147,12 +147,23 @@ impl Sampler for FreeSampler {
     //     model output (numerical overflow / malformed export) or
     //     repetition_penalty * NaN (validation rejects NaN penalty
     //     but defense-in-depth).
-    // (b) Every valid logit -Inf → reject. Penalty × extreme-
+    // (b) Single +Inf in the valid range → reject. `-Inf` is the
+    //     masking vocabulary this crate writes on purpose (the vocab
+    //     tail above, `apply_mask`'s llguidance allow-mask, a penalty
+    //     overflowing a large negative logit), but `+Inf` is never
+    //     written by us: it can only arrive from a broken forward.
+    //     Admitting one makes greedy pick its position unconditionally,
+    //     and under temperature it makes `softmax`'s maximum
+    //     non-finite — whose safe fallback spreads probability
+    //     UNIFORMLY over the whole row, including the `-Inf` entries a
+    //     constraint mask used to forbid a token, so `sample_min_p`
+    //     could return a schema-disallowed id.
+    // (c) Every valid logit -Inf → reject. Penalty × extreme-
     //     negative logit can overflow every candidate to -Inf, so
     //     sample_min_p's argmax fallback would pick id 0 (which a
     //     ConstrainedSampler mask might forbid).
     let valid = &logits[..cap];
-    if valid.iter().any(|&v| v.is_nan()) {
+    if valid.iter().any(|&v| v.is_nan() || v == f32::INFINITY) {
       return Err(Error::SamplerNonFinite);
     }
     if valid.iter().all(|&v| !v.is_finite()) {
@@ -618,6 +629,77 @@ mod tests {
       matches!(result, Err(Error::SamplerNonFinite)),
       "single-NaN logit must reject (issue #2 C-001 regression)"
     );
+  }
+
+  /// A lone `+Inf` in the valid vocab range must reject. The ORT decoder has
+  /// always refused a non-finite row at its session boundary; the MLX decoder
+  /// did not, so this is the sampler-side half of making the two backends
+  /// behave identically. Greedy would otherwise pick the `+Inf` position
+  /// unconditionally.
+  #[test]
+  fn free_sampler_errors_on_single_positive_inf_logit() {
+    let opts = RequestOptions::default()
+      .with_temperature(0.0)
+      .with_repetition_penalty(1.05);
+    let mut sampler = FreeSampler::new(opts, 42, 65_536);
+    let mut logits = vec![0.1f32, 0.5, 0.2, 1.0, f32::INFINITY, 0.3];
+    assert!(
+      matches!(
+        sampler.sample(&mut logits, &HashSet::new(), 0),
+        Err(Error::SamplerNonFinite)
+      ),
+      "a lone +Inf logit must reject rather than win greedy"
+    );
+  }
+
+  /// The constrained-decoding failure a `+Inf` causes, and the fix, in one
+  /// test.
+  ///
+  /// `apply_mask` writes `-Inf` on every id an llguidance allow-mask forbids.
+  /// With a `+Inf` also present, `softmax`'s maximum is non-finite, so its
+  /// safe fallback returns a UNIFORM distribution over the whole row — masked
+  /// ids included — and `sample_min_p` will happily draw one of them. The
+  /// sampler now rejects the row before reaching softmax at all.
+  #[test]
+  fn positive_inf_would_let_a_masked_token_be_drawn_and_is_rejected() {
+    // ids 0, 1, 3 forbidden by the constraint; id 2 carries the broken +Inf.
+    let masked = [
+      f32::NEG_INFINITY,
+      f32::NEG_INFINITY,
+      f32::INFINITY,
+      f32::NEG_INFINITY,
+    ];
+
+    // The hazard: softmax over this row is uniform across ALL four ids, so a
+    // draw can land on a forbidden one.
+    let probs = softmax(&masked);
+    assert!(
+      probs.iter().all(|p| (p - 0.25).abs() < 1e-6),
+      "softmax over a +Inf row spreads uniformly across masked entries: {probs:?}"
+    );
+    let mut rng = SmallRng::seed_from_u64(7);
+    let mut drew_masked = false;
+    for _ in 0..256 {
+      if sample_min_p(&probs, 0.0, &mut rng) != 2 {
+        drew_masked = true;
+        break;
+      }
+    }
+    assert!(
+      drew_masked,
+      "the uniform fallback must be able to draw a masked id — that is the bug being closed"
+    );
+
+    // The fix: the row never reaches softmax.
+    let opts = RequestOptions::default()
+      .with_temperature(0.8)
+      .with_repetition_penalty(1.0);
+    let mut sampler = FreeSampler::new(opts, 42, 4);
+    let mut logits = masked.to_vec();
+    assert!(matches!(
+      sampler.sample(&mut logits, &HashSet::new(), 0),
+      Err(Error::SamplerNonFinite)
+    ));
   }
 
   #[test]
