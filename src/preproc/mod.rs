@@ -592,6 +592,140 @@ mod tests {
     }
   }
 
+  /// Solid colour identifying the tile at grid position `(row, col)`,
+  /// zero-based. Every channel pair is distinct across an 8-tile grid, and the
+  /// mapping is invertible so the oracle can read a tile's identity back out
+  /// of the encoder input.
+  fn tile_color(row: u32, col: u32) -> Rgb<u8> {
+    Rgb([32 + 40 * row as u8, 32 + 40 * col as u8, 200])
+  }
+
+  /// Recover `(row, col)` from a colour produced by [`tile_color`].
+  fn decode_tile_color(rgb: [u8; 3]) -> (u32, u32) {
+    (
+      u32::from(rgb[0].saturating_sub(32)) / 40,
+      u32::from(rgb[1].saturating_sub(32)) / 40,
+    )
+  }
+
+  /// Read the first pixel of batch entry `entry` back out of `pixel_values`,
+  /// undoing the `(b / 255) * 2 - 1` normalization.
+  fn first_pixel(pre: &PreprocessedImage, entry: usize) -> [u8; 3] {
+    let base = entry * pre.patches_per_entry() * 768;
+    let mut out = [0u8; 3];
+    for (channel, slot) in out.iter_mut().enumerate() {
+      let v = pre.pixel_values()[base + channel];
+      *slot = (((v + 1.0) / 2.0) * 255.0).round().clamp(0.0, 255.0) as u8;
+    }
+    out
+  }
+
+  /// Extract the `<|img_row_R_col_C|>` markers from a rendered image block, in
+  /// emission order, as zero-based `(row, col)` pairs.
+  fn rendered_marker_sequence(rendered: &str) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    let mut rest = rendered;
+    while let Some(start) = rest.find("<|img_row_") {
+      rest = &rest[start + "<|img_row_".len()..];
+      let end = rest.find("|>").expect("marker terminator");
+      let (r, c) = rest[..end]
+        .split_once("_col_")
+        .expect("marker carries _col_");
+      out.push((
+        r.parse::<u32>().expect("row index") - 1,
+        c.parse::<u32>().expect("col index") - 1,
+      ));
+      rest = &rest[end + 2..];
+    }
+    out
+  }
+
+  /// ORACLE: the sub-image at the k-th position IS the tile the k-th marker
+  /// names.
+  ///
+  /// Every other check in this crate compares counts and dimensions, and a
+  /// transposed marker loop leaves all of those identical — a 2×4 grid and a
+  /// 4×2 grid produce the same eight tiles, the same token total, and the same
+  /// `spatial_shapes`. So this test paints each tile a distinct solid colour,
+  /// renders the prompt from the very same `TileGrid` the preprocessing used,
+  /// and asserts that the colour sitting in batch entry `k` decodes to the
+  /// grid position marker `k` claims. Only a correctly ordered renderer passes.
+  ///
+  /// Both orientations are exercised, because a transpose is self-inverse: a
+  /// renderer that swaps the loops passes a square grid and fails BOTH of
+  /// these. The source dimensions are exact multiples of the 512 px tile so
+  /// `flatten_to_patches` takes its identity path and each tile stays one
+  /// byte-exact colour.
+  #[test]
+  fn marker_order_pairs_each_tile_with_its_own_position() {
+    for (src_w, src_h, label) in [
+      (2048u32, 1024u32, "landscape 2 rows x 4 cols"),
+      (1024, 2048, "portrait 4 rows x 2 cols"),
+    ] {
+      let budget = ImageBudget::new();
+      let grid = tile_grid::pick_tile_grid(src_w, src_h, &budget)
+        .unwrap_or_else(|e| panic!("{label}: pick_tile_grid({src_w}x{src_h}): {e}"));
+      let (rows, cols) = (grid.rows(), grid.cols());
+      assert!(
+        rows > 1 && cols > 1 && rows != cols,
+        "{label}: the oracle needs a NON-SQUARE grid with both axes split, got {rows}x{cols}"
+      );
+      assert_eq!(
+        (cols * grid.tile_w(), rows * grid.tile_h()),
+        (src_w, src_h),
+        "{label}: source must already be the tiled target size so each tile stays byte-exact"
+      );
+
+      // Paint tile (r, c) its identifying colour.
+      let painted = DynamicImage::ImageRgb8(ImageBuffer::from_fn(src_w, src_h, |x, y| {
+        tile_color(y / grid.tile_h(), x / grid.tile_w())
+      }));
+      let pre = Preprocessor::new(budget)
+        .preprocess(&painted)
+        .unwrap_or_else(|e| panic!("{label}: preprocess: {e}"));
+
+      let rendered =
+        crate::chat_template::expand_image_placeholders("<image>", &[pre.to_placeholder_info()])
+          .unwrap_or_else(|e| panic!("{label}: render: {e}"));
+      let markers = rendered_marker_sequence(&rendered);
+      assert_eq!(
+        markers.len(),
+        (rows * cols) as usize,
+        "{label}: one marker per main tile"
+      );
+
+      for (position, &(marker_row, marker_col)) in markers.iter().enumerate() {
+        let observed = decode_tile_color(first_pixel(&pre, position));
+        assert_eq!(
+          observed,
+          (marker_row, marker_col),
+          "{label}: sub-image {position} carries tile {observed:?} but its marker says \
+           <|img_row_{}_col_{}|> — the marker sequence and the tile sequence disagree",
+          marker_row + 1,
+          marker_col + 1
+        );
+      }
+
+      // The thumbnail, when the budget attaches one, is the LAST sub-image and
+      // has no positional marker of its own.
+      let expected_entries = (rows * cols) as usize + usize::from(pre.thumbnail_size().is_some());
+      assert_eq!(
+        pre.batch_size(),
+        expected_entries,
+        "{label}: sub-image count"
+      );
+      if pre.thumbnail_size().is_some() {
+        assert!(
+          rendered
+            .rfind("<|img_row_")
+            .zip(rendered.find(crate::chat_template::IMAGE_THUMBNAIL))
+            .is_some_and(|(last_main, thumb)| last_main < thumb),
+          "{label}: the thumbnail marker must follow every main-tile marker"
+        );
+      }
+    }
+  }
+
   #[test]
   fn to_placeholder_info_round_trip() {
     let img = DynamicImage::ImageRgb8(ImageBuffer::from_pixel(1024, 1024, Rgb([128, 128, 128])));

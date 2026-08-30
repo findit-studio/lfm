@@ -36,6 +36,14 @@ fn test_image() -> PathBuf {
   PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test_image.jpg")
 }
 
+/// A 2048×1024 image painted as eight solid-colour 512 px tiles — the
+/// NON-SQUARE multi-tile geometry (2 rows × 4 cols) that a transposed marker
+/// loop renders wrongly while every count, grid dimension and token total stays
+/// identical. Square images cannot expose that class of defect at all.
+fn nonsquare_multi_tile_image() -> PathBuf {
+  PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/grid_rows2_cols4_color_tiles.png")
+}
+
 fn make_engine() -> Option<Engine> {
   let dir = model_dir()?;
   Some(Engine::from_dir(&dir, Options::default()).expect("Engine::from_dir"))
@@ -315,6 +323,34 @@ fn argmax(values: &[f32]) -> usize {
     .unwrap_or(0)
 }
 
+/// The `<|img_row_R_col_C|>` markers of a rendered image block, in emission
+/// order, as one-based `(row, col)` pairs.
+fn marker_sequence(rendered: &str) -> Vec<(usize, usize)> {
+  let mut out = Vec::new();
+  let mut rest = rendered;
+  while let Some(start) = rest.find("<|img_row_") {
+    rest = &rest[start + "<|img_row_".len()..];
+    let end = rest.find("|>").expect("marker terminator");
+    let (r, c) = rest[..end]
+      .split_once("_col_")
+      .expect("marker carries _col_");
+    out.push((
+      r.parse::<usize>().expect("row index"),
+      c.parse::<usize>().expect("col index"),
+    ));
+    rest = &rest[end + 2..];
+  }
+  out
+}
+
+/// Render one image plan's marker sequence, paired with the grid it came from.
+fn plan_markers(plan: &lfm::ImagePlan) -> (usize, usize, Vec<(usize, usize)>) {
+  let info = plan.placeholder();
+  let rendered =
+    lfm::expand_image_placeholders("<image>", &[*info]).expect("render one image block");
+  (info.rows(), info.cols(), marker_sequence(&rendered))
+}
+
 /// ORT/MLX parity on one real image: the same preprocessing plan, the same
 /// first greedy token, logit rows pointing the same way, and a
 /// schema-constrained JSON completion that parses on both roads.
@@ -491,4 +527,90 @@ fn t10_ort_mlx_parity() {
     .expect("MLX constrained JSON run");
   println!("ONNX JSON: {ort_json:#?}");
   println!("MLX  JSON: {mlx_json:#?}");
+
+  // ── 5. the NON-SQUARE multi-tile geometry ──────────────────────────────
+  //
+  // Everything above runs on a 2×1 grid, where a transposed marker loop is
+  // still wrong but only along one axis. A 2-row × 4-col grid is the case that
+  // no count-based check can see: transposing it keeps eight tiles, eight
+  // markers and the same `<image>` total, and simply pairs each tile with
+  // another tile's position. So this section asserts the pairing itself —
+  // the marker sequence must be the row-major enumeration of the planned grid,
+  // on BOTH roads — and then drives a real prefill through it, which is what
+  // makes the MLX road actually run `split_image` + its sub-image gates and the
+  // ONNX road actually patchify and splice.
+  let wide = nonsquare_multi_tile_image();
+  let wide_images = vec![ImageInput::Path(&wide)];
+
+  let ort_wide = ort
+    .plan_images(&wide_images)
+    .expect("ONNX plan (non-square)");
+  let mlx_wide = mlx
+    .plan_images(&wide_images)
+    .expect("MLX plan (non-square)");
+  println!("ONNX plan (non-square): {ort_wide:?}");
+  println!("MLX  plan (non-square): {mlx_wide:?}");
+  assert_eq!(
+    ort_wide, mlx_wide,
+    "the two backends must plan the same tiling for the non-square image"
+  );
+
+  let (rows, cols, ort_markers) = plan_markers(&ort_wide[0]);
+  let (mlx_rows, mlx_cols, mlx_markers) = plan_markers(&mlx_wide[0]);
+  assert_eq!((rows, cols), (mlx_rows, mlx_cols));
+  assert!(
+    rows > 1 && cols > 1 && rows != cols,
+    "the fixture must reach a NON-SQUARE grid with both axes split, got {rows}x{cols}"
+  );
+  let expected: Vec<(usize, usize)> = (1..=rows)
+    .flat_map(|r| (1..=cols).map(move |c| (r, c)))
+    .collect();
+  println!("non-square grid: {rows} rows x {cols} cols, markers {ort_markers:?}");
+  assert_eq!(
+    ort_markers, expected,
+    "ONNX road: the marker sequence must be row-major over the planned grid"
+  );
+  assert_eq!(
+    mlx_markers, expected,
+    "MLX road: the marker sequence must be row-major over the planned grid"
+  );
+
+  // A real prefill on both roads. On the MLX side this is what exercises
+  // `ratify_against_checkpoint` + `verify_sub_images` against the sub-images
+  // `split_image` really produced for a non-square grid; a plan/feature
+  // disagreement raises `ImagePlanMismatch` rather than reaching the logits.
+  let wide_messages = user_msg("What colours are in this image?");
+  let ort_wide_logits = ort
+    .next_token_logits(&wide_messages, &wide_images, &req)
+    .expect("ONNX next_token_logits (non-square)");
+  let mlx_wide_logits = mlx
+    .next_token_logits(&wide_messages, &wide_images, &req)
+    .expect("MLX next_token_logits (non-square)");
+  let wide_similarity = cosine_similarity(&ort_wide_logits, &mlx_wide_logits);
+  let wide_max_abs_diff = ort_wide_logits
+    .iter()
+    .zip(mlx_wide_logits.iter())
+    .map(|(a, b)| (a - b).abs())
+    .fold(0f32, f32::max);
+  println!(
+    "non-square prefill logits: image_tokens={} cosine={wide_similarity:.6} max_abs_diff={wide_max_abs_diff:.4}",
+    ort_wide[0].image_tokens()
+  );
+  assert!(
+    wide_similarity >= floor,
+    "non-square prefill logit rows diverge: cosine {wide_similarity:.6} < {floor} (max abs diff {wide_max_abs_diff:.4})"
+  );
+  let ort_wide_top = top_of(&ort_wide_logits, top_k);
+  let mlx_wide_top = top_of(&mlx_wide_logits, top_k);
+  let wide_shared = ort_wide_top
+    .iter()
+    .filter(|id| mlx_wide_top.contains(id))
+    .count();
+  println!(
+    "non-square top{top_k}: ONNX {ort_wide_top:?} MLX {mlx_wide_top:?} overlap {wide_shared}/{top_k}"
+  );
+  assert!(
+    wide_shared >= min_shared,
+    "the two backends must broadly agree on the non-square candidate set: only {wide_shared}/{top_k} shared (need {min_shared})"
+  );
 }

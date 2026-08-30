@@ -213,30 +213,48 @@ impl ImagePlaceholderInfo {
 fn build_image_block(out: &mut String, img: &ImagePlaceholderInfo) {
   out.push_str(IMAGE_START);
   if img.rows() > 1 || img.cols() > 1 {
-    // Upstream marker emission: `for row in range(num_rows): for col in
-    // range(num_cols)` where `num_rows = grid_width = ratio[0]` and
-    // `num_cols = grid_height = ratio[1]` (see
-    // transformers/models/lfm2_vl/processing_lfm2_vl.py:200-205 and
-    // image_processing_lfm2_vl_fast.py:397 unpacking
-    // `images, num_rows, num_cols = crop_image_to_patches(...)`).
+    // ROW-MAJOR: rows outer, cols inner. The marker sequence must be the
+    // tile sequence, because the two are paired positionally — the k-th
+    // `<|img_row_R_col_C|>` names the position of the k-th sub-image the
+    // preprocessing produced.
     //
-    // Our `TileGrid::cols` stores `grid_width` (width-direction tiles)
-    // and `TileGrid::rows` stores `grid_height` (height-direction
-    // tiles), so to match upstream's marker order we iterate the OUTER
-    // loop over `cols` (= upstream's num_rows = grid_width) and the
-    // INNER loop over `rows` (= upstream's num_cols = grid_height).
+    // Upstream, in `transformers/models/lfm2_vl`:
     //
-    // Without this swap, a 1920×1080 image would emit a 2×4 marker
-    // sequence while the model was trained against a 4×2 sequence —
-    // wrong position-token embeddings on every non-square multi-tile
-    // image, and `ImageTokenCountMismatch` would NOT detect it because
-    // the tile count is identical.
-    for outer in 0..img.cols() {
-      for inner in 0..img.rows() {
+    // - `image_processing_lfm2_vl.py:310` cuts the tiles with
+    //   `split_to_tiles(resized, num_tiles_height=grid_height,
+    //   num_tiles_width=grid_width)`, which reshapes to
+    //   `(B, nH, nW, C, h, w)` and flattens `(nH, nW)` — tiles ROW-MAJOR,
+    //   height-direction outer (`image_transforms.py:815-836`).
+    // - `image_processing_lfm2_vl.py:328` returns `(images, grid_width,
+    //   grid_height)`, and `:418` unpacks it as `images, num_cols,
+    //   num_rows = self.crop_image_to_patches(...)` — so `num_rows =
+    //   grid_height` and `num_cols = grid_width`, published at `:553-554`
+    //   as `image_rows` / `image_cols`.
+    // - `processing_lfm2_vl.py:180-181` reads those back as `rows` /
+    //   `cols`, and `:208-211` emits
+    //   `for row in range(rows): for col in range(cols):
+    //   f"<|img_row_{row + 1}_col_{col + 1}|>"` — ROWS OUTER, COLS INNER,
+    //   row index over `grid_height`, col index over `grid_width`.
+    //
+    // `TileGrid::rows` is `grid_height` and `TileGrid::cols` is
+    // `grid_width` (see `find_closest_aspect_ratio`), so this loop is
+    // upstream's loop verbatim. Both of this crate's feature producers
+    // emit the matching row-major order: the ONNX road's
+    // `flatten_to_patches` (`for r in 0..rows { for c in 0..cols }`) and
+    // the MLX road's `mlxrs` `tile_image` (`for gy in 0..grid_height {
+    // for gx in 0..grid_width }`), each appending the thumbnail last.
+    //
+    // A transposed loop is invisible to every count-based check — a 2×4
+    // grid and a 4×2 grid have the same tile count and the same token
+    // total — so it corrupts the position conditioning of every
+    // non-square multi-tile image silently. Squares are unaffected, which
+    // is why only non-square fixtures can defend this ordering.
+    for row in 0..img.rows() {
+      for col in 0..img.cols() {
         out.push_str("<|img_row_");
-        push_usize(out, outer + 1);
+        push_usize(out, row + 1);
         out.push_str("_col_");
-        push_usize(out, inner + 1);
+        push_usize(out, col + 1);
         out.push_str("|>");
         for _ in 0..img.tokens_per_main_tile() {
           out.push_str(IMAGE_TOKEN);
@@ -525,6 +543,91 @@ mod tests {
     assert!(out.contains("<|img_row_2_col_1|>"));
     assert!(out.contains("<|img_row_2_col_2|>"));
     assert!(out.contains("<|img_thumbnail|>"));
+  }
+
+  /// Pull the `<|img_row_R_col_C|>` markers out of a rendered block, in the
+  /// order they were emitted.
+  fn marker_sequence(rendered: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut rest = rendered;
+    while let Some(start) = rest.find("<|img_row_") {
+      rest = &rest[start + "<|img_row_".len()..];
+      let end = rest.find("|>").expect("marker must terminate");
+      let body = &rest[..end];
+      let (r, c) = body.split_once("_col_").expect("marker must carry _col_");
+      out.push((
+        r.parse::<usize>().expect("row index"),
+        c.parse::<usize>().expect("col index"),
+      ));
+      rest = &rest[end + 2..];
+    }
+    out
+  }
+
+  /// The marker sequence is ROW-MAJOR — rows outer, cols inner — for every
+  /// non-square grid, in both orientations.
+  ///
+  /// The transpose of this loop leaves the tile count, the `<image>` total and
+  /// every dimension check identical, so the ordering has to be asserted
+  /// directly. Upstream's loop is `processing_lfm2_vl.py:208-211` over
+  /// `image_rows` (= `grid_height`) then `image_cols` (= `grid_width`).
+  #[test]
+  fn multi_tile_markers_are_row_major() {
+    // rows = 2 (grid_height), cols = 4 (grid_width) — a 2048×1024 landscape.
+    let landscape = ImagePlaceholderInfo::new(2, 4, 1, None);
+    let rendered = expand_image_placeholders("<image>", &[landscape]).unwrap();
+    assert_eq!(
+      marker_sequence(&rendered),
+      vec![
+        (1, 1),
+        (1, 2),
+        (1, 3),
+        (1, 4),
+        (2, 1),
+        (2, 2),
+        (2, 3),
+        (2, 4)
+      ],
+      "a 2-row × 4-col grid must emit row 1 left-to-right, then row 2"
+    );
+
+    // Its transpose: rows = 4, cols = 2 — a 1024×2048 portrait.
+    let portrait = ImagePlaceholderInfo::new(4, 2, 1, None);
+    let rendered = expand_image_placeholders("<image>", &[portrait]).unwrap();
+    assert_eq!(
+      marker_sequence(&rendered),
+      vec![
+        (1, 1),
+        (1, 2),
+        (2, 1),
+        (2, 2),
+        (3, 1),
+        (3, 2),
+        (4, 1),
+        (4, 2)
+      ],
+      "a 4-row × 2-col grid must emit four rows of two columns"
+    );
+  }
+
+  /// The thumbnail marker is emitted AFTER every main-tile marker, matching
+  /// both feature producers, which append the thumbnail sub-image last.
+  #[test]
+  fn thumbnail_marker_follows_every_main_tile_marker() {
+    let info = ImagePlaceholderInfo::new(2, 3, 1, Some(2));
+    let rendered = expand_image_placeholders("<image>", &[info]).unwrap();
+    let thumb = rendered
+      .find(IMAGE_THUMBNAIL)
+      .expect("thumbnail marker present");
+    let last_main = rendered
+      .rfind("<|img_row_")
+      .expect("main-tile markers present");
+    assert!(
+      last_main < thumb,
+      "the thumbnail marker must follow all {} main-tile markers",
+      marker_sequence(&rendered).len()
+    );
+    assert_eq!(marker_sequence(&rendered).len(), 6);
   }
 
   #[test]

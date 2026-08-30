@@ -39,8 +39,11 @@ and this crate adheres to [Semantic Versioning](https://semver.org/).
   checks (but not the structural contract).
 - ORT/MLX parity integration test (`t10`), gated on `LFM_ONNX_MODEL_PATH` (or
   `LFM_MODEL_PATH`) **and** `LFM_MLX_MODEL_PATH`; it compares the preprocessing
-  plans, the prefill logit rows, and the schema-constrained JSON completion, and
-  prints why it skipped when either checkpoint is absent.
+  plans, the prefill logit rows, and the schema-constrained JSON completion,
+  repeats the plan comparison and a prefill on a NON-SQUARE multi-tile image
+  (2 rows × 4 cols) while asserting each road's marker sequence is the row-major
+  enumeration of its planned grid, and prints why it skipped when either
+  checkpoint is absent.
 
 ### Changed
 
@@ -78,6 +81,26 @@ and this crate adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Per-tile position markers are emitted row-major, matching the tiles.** The
+  shared image-block renderer iterated the grid columns-outer / rows-inner while
+  both feature producers return tiles row-major, so on every NON-SQUARE
+  multi-tile image each tile was conditioned under another tile's
+  `<|img_row_R_col_C|>` marker. Upstream is unambiguous:
+  `image_processing_lfm2_vl.py:310` cuts tiles with
+  `split_to_tiles(num_tiles_height=grid_height, num_tiles_width=grid_width)`
+  (row-major, height outer — `image_transforms.py:815-836`); `:328` returns
+  `(images, grid_width, grid_height)`, unpacked at `:418` as
+  `images, num_cols, num_rows`, published at `:553-554` as `image_rows` /
+  `image_cols`; and `processing_lfm2_vl.py:208-211` emits
+  `for row in range(rows): for col in range(cols)`. Square grids are unaffected,
+  which is why nothing caught it: the tile count, the `<image>` total, every
+  `spatial_shapes` entry and the ORT/MLX parity run were identical either way.
+  This was a defect on **both** roads — the renderer is shared, so the ONNX path
+  is fixed by the same change. Covered by a colour-coded oracle test that paints
+  tile `(r, c)` a distinct solid colour on a 2×4 and a 4×2 grid and asserts the
+  sub-image at each position decodes to the position its marker names, by
+  row-major expansion fixtures replacing the reversed ones, and by a non-square
+  multi-tile image added to the ORT/MLX parity run.
 - A non-finite decoder logit row is rejected before either sampler. Only `-inf`
   is a value this crate writes on purpose (vocab-tail masking, the llguidance
   allow-mask, repetition-penalty overflow); a NaN or `+inf` arriving from the
