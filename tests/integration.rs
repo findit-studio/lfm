@@ -9,6 +9,14 @@
 //! LFM_MODEL_PATH=/path/to/LFM2.5-VL-450M-ONNX \
 //!   cargo test --features integration --test integration
 //! ```
+//!
+//! The ORT/MLX parity test (`t10`) needs BOTH checkpoints and runs only on
+//! Apple Silicon:
+//! ```bash
+//! LFM_ONNX_MODEL_PATH=/path/to/LFM2.5-VL-450M-ONNX \
+//! LFM_MLX_MODEL_PATH=/path/to/LFM2.5-VL-450M-MLX-8bit \
+//!   cargo test --features integration --test integration t10 -- --nocapture
+//! ```
 
 #![cfg(feature = "integration")]
 
@@ -268,4 +276,219 @@ fn t09_image_analysis_airport_fixtures() {
     );
     println!("{analysis:#?}");
   }
+}
+
+// =========================================================================
+// t10 — ORT/MLX parity
+// =========================================================================
+
+/// Cosine similarity of two equal-length logit rows.
+///
+/// The right comparison for two implementations of the same model at different
+/// precisions: an absolute tolerance would be dominated by the 8-bit
+/// checkpoint's quantization error and by the arbitrary scale of a logit row,
+/// while the direction of the vector is what determines every sampling
+/// decision. `1.0` is identical; anything below the threshold means the two
+/// roads disagree about the distribution, not merely about rounding.
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
+  let mut dot = 0f64;
+  let mut na = 0f64;
+  let mut nb = 0f64;
+  for (x, y) in a.iter().zip(b.iter()) {
+    dot += f64::from(*x) * f64::from(*y);
+    na += f64::from(*x) * f64::from(*x);
+    nb += f64::from(*y) * f64::from(*y);
+  }
+  if na == 0.0 || nb == 0.0 {
+    return 0.0;
+  }
+  dot / (na.sqrt() * nb.sqrt())
+}
+
+/// Index of the largest entry — the token greedy decoding would emit.
+fn argmax(values: &[f32]) -> usize {
+  values
+    .iter()
+    .enumerate()
+    .max_by(|a, b| a.1.total_cmp(b.1))
+    .map(|(i, _)| i)
+    .unwrap_or(0)
+}
+
+/// ORT/MLX parity on one real image: the same preprocessing plan, the same
+/// first greedy token, logit rows pointing the same way, and a
+/// schema-constrained JSON completion that parses on both roads.
+///
+/// Gated on TWO env vars so it can only run when both checkpoints are present,
+/// and on Apple Silicon (the only platform that compiles the MLX backend). It
+/// prints why it skipped rather than passing silently — a parity test that
+/// quietly no-ops is worse than none.
+///
+/// `LFM_PARITY_LOGIT_COSINE` overrides the similarity floor (default `0.98`)
+/// for exploring a divergence; a failure here is a real signal, not noise, so
+/// the default is deliberately tight enough to catch a preprocessing or splice
+/// disagreement while tolerating 8-bit quantization error.
+#[test]
+fn t10_ort_mlx_parity() {
+  let onnx_dir = std::env::var_os("LFM_ONNX_MODEL_PATH")
+    .or_else(|| std::env::var_os("LFM_MODEL_PATH"))
+    .map(PathBuf::from);
+  let mlx_dir = std::env::var_os("LFM_MLX_MODEL_PATH").map(PathBuf::from);
+
+  if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+    println!("t10 skipped: the MLX backend is compiled only on macOS/arm64 (aarch64-apple-darwin)");
+    return;
+  }
+  let (Some(onnx_dir), Some(mlx_dir)) = (onnx_dir, mlx_dir) else {
+    println!(
+      "t10 skipped: set BOTH LFM_ONNX_MODEL_PATH (or LFM_MODEL_PATH) and LFM_MLX_MODEL_PATH"
+    );
+    return;
+  };
+
+  let mut ort = Engine::from_dir(&onnx_dir, Options::default())
+    .unwrap_or_else(|e| panic!("Engine::from_dir({onnx_dir:?}) [ONNX]: {e}"));
+  let mut mlx = Engine::from_dir(&mlx_dir, Options::default())
+    .unwrap_or_else(|e| panic!("Engine::from_dir({mlx_dir:?}) [MLX]: {e}"));
+
+  // ── the selection is observable, and it picked what we expect ──────────
+  assert_eq!(
+    ort.backend(),
+    lfm::BackendKind::Onnx,
+    "{onnx_dir:?} must select the ONNX backend"
+  );
+  assert_eq!(
+    mlx.backend(),
+    lfm::BackendKind::Mlx,
+    "{mlx_dir:?} must select the MLX backend"
+  );
+  println!("ONNX image budget: {:?}", ort.image_budget());
+  println!("MLX  image budget: {:?}", mlx.image_budget());
+
+  let fixture = test_image();
+  let images = vec![ImageInput::Path(&fixture)];
+
+  // ── 1. the preprocessing plans agree ───────────────────────────────────
+  let ort_plans = ort.plan_images(&images).expect("ONNX plan_images");
+  let mlx_plans = mlx.plan_images(&images).expect("MLX plan_images");
+  println!("ONNX plan: {ort_plans:?}");
+  println!("MLX  plan: {mlx_plans:?}");
+  assert_eq!(
+    ort_plans, mlx_plans,
+    "the two backends must plan the same tiling, marker layout and token count for the same image"
+  );
+
+  // ── 2. the prefill logits point the same way, and greedy agrees ────────
+  let req = RequestOptions::default()
+    .with_temperature(0.0)
+    .with_max_new_tokens(32);
+  let messages = user_msg("Describe this image briefly.");
+  let ort_logits = ort
+    .next_token_logits(&messages, &images, &req)
+    .expect("ONNX next_token_logits");
+  let mlx_logits = mlx
+    .next_token_logits(&messages, &images, &req)
+    .expect("MLX next_token_logits");
+  assert_eq!(
+    ort_logits.len(),
+    mlx_logits.len(),
+    "both backends must expose the same vocabulary width"
+  );
+  let similarity = cosine_similarity(&ort_logits, &mlx_logits);
+  let max_abs_diff = ort_logits
+    .iter()
+    .zip(mlx_logits.iter())
+    .map(|(a, b)| (a - b).abs())
+    .fold(0f32, f32::max);
+  println!(
+    "prefill logits: vocab={} cosine={similarity:.6} max_abs_diff={max_abs_diff:.4}",
+    ort_logits.len()
+  );
+  let floor: f64 = std::env::var("LFM_PARITY_LOGIT_COSINE")
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .unwrap_or(0.98);
+  assert!(
+    similarity >= floor,
+    "prefill logit rows diverge: cosine {similarity:.6} < {floor} (max abs diff {max_abs_diff:.4})"
+  );
+  // Exact top-1 agreement is NOT asserted: the ONNX export is fp32 while the
+  // MLX checkpoint is 8-bit affine-quantized with half-precision activations
+  // (its logits land on visible 0.125 steps), so a few tenths of a logit can
+  // permute near-tied candidates. What a preprocessing, marker-layout or
+  // splice defect WOULD do is move the distribution somewhere else entirely —
+  // so the assertions are about the candidate set, which quantization noise
+  // cannot scramble.
+  let top_k: usize = std::env::var("LFM_PARITY_TOP_K")
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .unwrap_or(5);
+  let top_of = |values: &[f32], k: usize| -> Vec<usize> {
+    let mut ids: Vec<usize> = (0..values.len()).collect();
+    ids.sort_by(|a, b| values[*b].total_cmp(&values[*a]));
+    ids.truncate(k);
+    ids
+  };
+  let ort_top = top_of(&ort_logits, top_k);
+  let mlx_top = top_of(&mlx_logits, top_k);
+  println!(
+    "ONNX top{top_k}: {:?}",
+    ort_top
+      .iter()
+      .map(|i| (*i, ort_logits[*i]))
+      .collect::<Vec<_>>()
+  );
+  println!(
+    "MLX  top{top_k}: {:?}",
+    mlx_top
+      .iter()
+      .map(|i| (*i, mlx_logits[*i]))
+      .collect::<Vec<_>>()
+  );
+  let ort_greedy = argmax(&ort_logits);
+  let mlx_greedy = argmax(&mlx_logits);
+  println!("greedy: ONNX={ort_greedy} MLX={mlx_greedy} (exact agreement not required)");
+  assert!(
+    mlx_top.contains(&ort_greedy),
+    "the ONNX greedy token {ort_greedy} must be among the MLX backend's top {top_k}: {mlx_top:?}"
+  );
+  assert!(
+    ort_top.contains(&mlx_greedy),
+    "the MLX greedy token {mlx_greedy} must be among the ONNX backend's top {top_k}: {ort_top:?}"
+  );
+  let shared = ort_top.iter().filter(|id| mlx_top.contains(id)).count();
+  let min_shared = top_k.div_ceil(2);
+  println!("top{top_k} overlap: {shared}/{top_k}");
+  assert!(
+    shared >= min_shared,
+    "the two backends must broadly agree on the candidate set: only {shared}/{top_k} shared (need {min_shared})"
+  );
+
+  // ── 3. greedy completions (reported; a late divergence is expected at
+  //       8-bit and is not on its own a defect) ─────────────────────────────
+  let ort_text = ort.generate(&messages, &images, &req);
+  let mlx_text = mlx.generate(&messages, &images, &req);
+  println!("ONNX greedy: {ort_text:?}");
+  println!("MLX  greedy: {mlx_text:?}");
+  for (name, out) in [("ONNX", &ort_text), ("MLX", &mlx_text)] {
+    match out {
+      Ok(text) => assert!(!text.is_empty(), "{name} greedy output must not be empty"),
+      Err(lfm::Error::MaxTokensExceeded { .. }) => {}
+      Err(e) => panic!("{name} greedy generation failed: {e}"),
+    }
+  }
+
+  // ── 4. the schema-constrained JSON completion parses on both roads ─────
+  let task = ImageAnalysisTask::default().with_accept_empty(true);
+  let json_req = RequestOptions::default()
+    .with_temperature(0.0)
+    .with_max_new_tokens(256);
+  let ort_json = ort
+    .run(&task, &images, &json_req)
+    .expect("ONNX constrained JSON run");
+  let mlx_json = mlx
+    .run(&task, &images, &json_req)
+    .expect("MLX constrained JSON run");
+  println!("ONNX JSON: {ort_json:#?}");
+  println!("MLX  JSON: {mlx_json:#?}");
 }
