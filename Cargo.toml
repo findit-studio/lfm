@@ -26,18 +26,6 @@ include      = [
 [dependencies]
 llmtask     = { version = "0.3", features = ["json", "regex"] }
 ort         = { version = "2.0.0-rc.13", optional = true }
-# `default-features = false` drops `progressbar` (training UI),
-# `onig` (C++ regex engine) and `esaxx_fast` (C++ suffix-array
-# Unigram trainer). lfm only uses `tokenizer.from_file` +
-# encode/decode at inference time; the trainer paths are dead
-# code for us. `fancy-regex` is the pure-Rust regex backend
-# replacement for `onig` and is what JSON-defined BPE tokenizers
-# need at runtime. Keeping `esaxx_fast` ON pulled the C++
-# `esaxx-rs` into the link, which on Windows MSVC was built with
-# `/MT` (static CRT) and clashed with `ort_sys` built with
-# `/MD` (dynamic CRT) — `LNK1319: 1 mismatches detected`. This
-# also matches the feature set `toktrie_hf_tokenizers` already
-# uses on `tokenizers` 0.21 transitively.
 tokenizers  = { version = "0.23", optional = true, default-features = false, features = ["fancy-regex"] }
 llguidance  = { version = "1.7", optional = true }
 toktrie     = { version = "1.7", optional = true }
@@ -49,20 +37,8 @@ thiserror   = "2"
 tracing     = "0.1"
 serde       = { version = "1", features = ["derive"] }
 serde_json  = { version = "1" }
-fast_image_resize = "6.0.0"
+fast_image_resize = "6"
 
-# ── MLX (mlxrs) inference backend — Apple Silicon only ──────────────────
-#
-# `mlxrs` binds the Metal-backed MLX C++ runtime through `mlx-c` FFI and only
-# builds on `aarch64-apple-darwin`, so it is declared under a target table — it
-# never enters the dependency graph on any other host. It is **non-optional**
-# there: lfm picks the best backend per platform automatically, with no
-# user-facing knob. On macOS/arm64 `Engine::from_dir` auto-routes to the MLX
-# backend when the directory is an MLX checkpoint (config.json +
-# model.safetensors, no ONNX graphs) and falls back to the ONNX path otherwise;
-# on every other platform only the ONNX path is compiled. The `lfm2-vl` feature
-# gives the LFM2.5-VL vision-language model + its NaFlex preprocessing. There is
-# intentionally NO `mlx` Cargo feature — MLX is auto-selected by platform.
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 mlxrs = { version = "0.2", default-features = false, features = ["lfm2-vl"] }
 
@@ -74,38 +50,11 @@ criterion = "0.8"
 
 [features]
 default     = ["inference", "bundled", "decoders"]
-# `inference` provides ORT, tokenizers, llguidance, minijinja. The Engine
-# additionally requires `decoders` for image preprocessing — see
-# src/lib.rs Engine gate. Use `inference` alone for the runtime types
-# (Sampler, Decoder, KvCache, etc.) without the public Engine.
 inference   = ["dep:ort", "dep:tokenizers", "dep:llguidance", "dep:toktrie", "dep:toktrie_hf_tokenizers", "dep:minijinja"]
-# `bundled` ships the tokenizer + small JSON configs as include_bytes!.
-# It implies both `inference` (for Engine machinery) AND `decoders`
-# (for the `Engine::from_onnx_dir` constructor); without this, a
-# `--features bundled` build would fail to expose Engine.
 bundled     = ["inference", "decoders"]
 decoders    = ["image/jpeg", "image/png"]
-# Widen which weight FORMATS the auto-selected MLX (`mlxrs`) backend accepts on
-# Apple Silicon. Off by default, the MLX path reads only `model.safetensors`
-# (and the crate builds everywhere exactly as before). With `npz`/`gguf` on, the
-# loader's format detector additionally probes a `*.npz`/`*.gguf`, and
-# `Engine::from_dir`'s MLX probe routes such a dir to MLX. Each enables the
-# matching `mlxrs` feature; `mlxrs` is a macOS-arm64-only target dependency, so
-# on every other target the `mlxrs/<fmt>` activation is a harmless no-op (the
-# npz/gguf detection code is itself `#[cfg(feature = ...)]`-gated, so it isn't
-# compiled). These are NOT a backend knob — MLX stays auto-selected by platform;
-# they only widen the accepted weight formats. (gguf is a weight load seam: its
-# embedded metadata is not mapped to a config — a `config.json` is still
-# required alongside it.)
 npz         = ["mlxrs/npz"]
 gguf        = ["mlxrs/gguf"]
-# NOTE: there is intentionally no `mlx` feature. The MLX (`mlxrs`) Metal backend
-# is selected automatically by platform — see the `mlxrs` target dependency
-# above and the `Engine::from_dir` auto-routing in `src/engine.rs`. On
-# macOS/arm64 it compiles unconditionally and the public constructor routes to
-# it when the directory is an MLX checkpoint; elsewhere only the ONNX path
-# exists. Removing the user-facing knob is deliberate (best-backend-by-platform,
-# no opt-out).
 serde       = ["smol_str/serde", "llmtask/serde"]
 cuda        = ["inference", "ort/cuda"]
 tensorrt    = ["inference", "ort/tensorrt"]
@@ -113,19 +62,6 @@ directml    = ["inference", "ort/directml"]
 rocm        = ["inference", "ort/rocm"]
 coreml      = ["inference", "ort/coreml"]
 integration = ["inference"]
-# ort 2.0.0-rc.13 made execution-provider prebuilt-binary selection
-# strict: if `download-binaries` is on (lfm's default) and the enabled
-# EP features don't exactly match one of ort's published binary
-# bundles, linking now hard-errors instead of silently falling back to
-# CPU. `cuda` + `tensorrt` + `directml` + `rocm` + `coreml` together
-# (e.g. under `--all-features`, a compile-coverage flag — no real
-# deployment enables every GPU backend at once) isn't a combination any
-# platform ships a bundle for, so this feature is NOT implied by any
-# single EP feature above: a real `--features cuda` (etc.) build stays
-# strict and still fails loudly if that EP truly isn't available,
-# matching upstream's intent. Only an explicit opt-in (which
-# `--all-features` picks up automatically, same as every feature here)
-# relaxes ort to its best-fit bundle instead of erroring.
 lax-feature-matching = ["inference", "ort/lax-feature-matching"]
 
 [[test]]
@@ -135,9 +71,6 @@ required-features = ["integration"]
 
 [[example]]
 name              = "smoke"
-# Engine + from_dir require all three: bundled (for tokenizer assets +
-# from_dir gate), inference (for the runtime), decoders (for image
-# decode). Round-27 fix: was incorrectly listed as `inference`-only.
 required-features = ["bundled", "inference", "decoders"]
 [[example]]
 name              = "scene_analysis"
