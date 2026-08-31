@@ -5,6 +5,28 @@ and this crate adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-08-31
+
+### Changed
+
+- **`llmtask` bumped `0.1` → `0.3`; lfm's own `ImageAnalysisTask` copy is
+  removed.** `llmtask` 0.3 absorbed the canonical `ImageAnalysisTask`
+  (prompt, JSON Schema, and parser) that `lfm` and `qwen3-vl` had each
+  carried as byte-for-byte-equivalent copies since `llmtask` 0.1.
+  `lfm::ImageAnalysis` and `lfm::ImageAnalysisTask` now re-export
+  `llmtask`'s types directly — the public import paths are unchanged, but
+  the underlying shape is **breaking**: `ImageAnalysis` moved from nine
+  fields to ten, `mood` was renamed to `emotion`, and a new required
+  `categories` field (broad content categories, coarser than `tags`) was
+  added. The parser also gained duplicate-top-level-key refusal
+  (`JsonParseError::DuplicateField`) and a dedicated
+  `JsonParseError::UnknownFields` variant, both now inherited for free.
+  This crate's local copy of the 28 parser-focused unit tests is removed
+  (that coverage now lives upstream in `llmtask`'s own test suite); the
+  engine-integration tests in `tests/integration.rs` that exercise
+  `ImageAnalysisTask` against real ONNX/MLX inference are unaffected and
+  stay here.
+
 ### Added
 
 - **MLX (`mlxrs`) Metal backend for Apple Silicon.** `Engine::from_dir` selects
@@ -235,5 +257,6 @@ The weights ship under the [LFM Open License v1.0](https://www.liquid.ai/lfm-lic
 — verify your use case complies with Liquid AI's terms separately from
 this crate's MIT OR Apache-2.0 license.
 
-[0.1.2]: https://github.com/findit-ai/lfm/releases/tag/v0.1.2
-[0.1.0]: https://github.com/findit-ai/lfm/releases/tag/v0.1.0
+[0.2.0]: https://github.com/findit-studio/lfm/releases/tag/v0.2.0
+[0.1.2]: https://github.com/findit-studio/lfm/releases/tag/v0.1.2
+[0.1.0]: https://github.com/findit-studio/lfm/releases/tag/v0.1.0

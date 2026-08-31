@@ -515,10 +515,20 @@ fn t10_ort_mlx_parity() {
   }
 
   // ── 4. the schema-constrained JSON completion parses on both roads ─────
+  //
+  // `max_new_tokens` here is 512, not the tighter 256 this budget used
+  // before `llmtask` 0.3: `ImageAnalysisTask`'s schema grew from nine
+  // required fields to ten (`mood` → `emotion`, plus a new `categories`
+  // field), and greedy MLX/ONNX generation legitimately diverges in
+  // length before converging on the same JSON shape (see the cosine-
+  // similarity commentary above) — 256 left no margin for that and
+  // intermittently hit `MaxTokensExceeded` before the object closed. 512
+  // matches the budget `t09_image_analysis_airport_fixtures` already
+  // proves sufficient for this exact task against real images.
   let task = ImageAnalysisTask::default().with_accept_empty(true);
   let json_req = RequestOptions::default()
     .with_temperature(0.0)
-    .with_max_new_tokens(256);
+    .with_max_new_tokens(512);
   let ort_json = ort
     .run(&task, &images, &json_req)
     .expect("ONNX constrained JSON run");
