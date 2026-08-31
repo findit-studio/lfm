@@ -25,7 +25,6 @@ mod engine;
 pub mod error;
 #[cfg(all(feature = "inference", feature = "decoders"))]
 pub(crate) mod generate;
-mod image_analysis;
 pub mod options;
 pub mod preproc;
 #[cfg(feature = "inference")]
@@ -166,6 +165,12 @@ pub enum ImageInput<'a> {
 }
 
 // ===== Task + image-analysis exports =====
-
-pub use image_analysis::{ImageAnalysis, ImageAnalysisTask};
+//
+// `ImageAnalysis` and `ImageAnalysisTask` moved to `llmtask` (0.3+) as the
+// canonical cross-engine implementation (prompt, JSON Schema, parser); lfm no
+// longer carries its own copy. Re-exported here so `lfm::ImageAnalysis` /
+// `lfm::ImageAnalysisTask` stay valid import paths for existing callers —
+// only the underlying field shape changed (`mood` → `emotion`, plus a new
+// required `categories` field; see CHANGELOG).
+pub use llmtask::{ImageAnalysis, image_analysis::ImageAnalysisTask};
 pub use task::{JsonParseError, Task};

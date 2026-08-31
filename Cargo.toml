@@ -1,12 +1,12 @@
 [package]
 name          = "lfm"
-version       = "0.1.2"
+version       = "0.2.0"
 edition       = "2024"
 rust-version  = "1.95"
 description   = "Rust ONNX inference for LiquidAI LFM2.5-VL (vision-language) models — implements the engine-agnostic llmtask::Task contract via llguidance for schema-constrained sampling"
 license       = "MIT OR Apache-2.0"
-repository    = "https://github.com/findit-ai/lfm"
-homepage      = "https://github.com/findit-ai/lfm"
+repository    = "https://github.com/findit-studio/lfm"
+homepage      = "https://github.com/findit-studio/lfm"
 documentation = "https://docs.rs/lfm"
 keywords      = ["vlm", "onnx", "vision-language", "lfm", "constrained-decoding"]
 categories    = ["api-bindings", "computer-vision", "multimedia::images"]
@@ -24,7 +24,7 @@ include      = [
 ]
 
 [dependencies]
-llmtask     = { version = "0.1", features = ["json", "regex"] }
+llmtask     = { version = "0.3", features = ["json", "regex"] }
 ort         = { version = "2.0.0-rc.13", optional = true }
 # `default-features = false` drops `progressbar` (training UI),
 # `onig` (C++ regex engine) and `esaxx_fast` (C++ suffix-array
