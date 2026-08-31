@@ -12,20 +12,15 @@ use std::collections::HashSet;
 
 use crate::{
   ChatContent, ChatMessage, ImageInput,
-  chat_template::{self, ContentItem, ImagePlaceholderInfo, Message, UserContent},
+  chat_template::{self, ContentItem, Message, UserContent},
   error::{Error, Result},
   options::RequestOptions,
-  preproc::Preprocessor,
+  preproc::{IMAGE_BLOCK_WRAPPER_TOKENS, ImagePlan, Preprocessor},
   runtime::{
-    decoder::Decoder,
-    embed_tokens::EmbedTokens,
+    backend::Backend,
     sampler::{SampleResult, Sampler},
-    vision::VisionEncoder,
   },
 };
-
-/// Embedding dimension for text and vision outputs (1024 for LFM2.5-VL).
-const EMBED_DIM: usize = 1024;
 
 /// All inputs for a single `generate` call.
 #[allow(dead_code)]
@@ -58,27 +53,91 @@ impl<'a> GenerateInputs<'a> {
   }
 }
 
-/// End-to-end VLM generation: preprocess → template → tokenize → embed
-/// → vision encode + splice → prefill → decode loop → detokenize.
+/// Everything [`prefill`] hands the decode loop.
+///
+/// The decode loop is the only part of generation that differs between
+/// `generate` (sample until EOS / schema-complete) and
+/// [`Engine::next_token_logits`](crate::Engine::next_token_logits) (return the
+/// prefill distribution and stop), so the whole front half — admission control,
+/// the authoritative image plans, prompt rendering, tokenization, the splice,
+/// and the prefill forward — lives here once instead of being duplicated.
+pub(crate) struct Prefilled<B: Backend> {
+  /// Last-position logits from the prefill forward, already checked finite.
+  pub(crate) logits: Vec<f32>,
+  /// The per-call KV / conv cache, advanced by the prefill.
+  pub(crate) cache: B::Cache,
+  /// Prompt token ids, used to seed the repetition-penalty `seen` set.
+  pub(crate) prompt_ids: Vec<u32>,
+}
+
+/// Reject a logits row carrying any non-finite value, BEFORE it reaches a
+/// sampler.
+///
+/// A raw decoder row has no legitimate `±inf` or NaN: the `-inf` entries the
+/// samplers reason about are masks THEY apply (the vocab tail, the llguidance
+/// allow-mask, repetition penalty overflow). A non-finite value arriving from
+/// the model is a broken forward, and every downstream decision it touches is
+/// wrong in a specific way:
+///
+/// - NaN biases argmax (`f32::total_cmp` orders NaN largest) and poisons
+///   softmax through `e^NaN`;
+/// - a lone `+inf` always wins greedy, and under temperature makes `softmax`'s
+///   maximum non-finite, which degrades to a uniform distribution over the
+///   WHOLE row — including entries an llguidance mask set to `-inf`, so a
+///   schema-disallowed token can win the draw.
+///
+/// Both backends already reject this at their own decoder boundary; running the
+/// check here too makes the guarantee a property of the generation loop rather
+/// than of each backend's diligence, so a future backend cannot regress it.
+fn reject_non_finite_logits(logits: &[f32]) -> Result<()> {
+  if logits.iter().any(|v| !v.is_finite()) {
+    return Err(Error::SessionNonFiniteOutput { stage: "decoder" });
+  }
+  Ok(())
+}
+
+/// Produce the ONE authoritative [`ImagePlan`] per image, from header
+/// dimensions only.
+///
+/// Header reads are ~50 bytes per image (PNG/JPEG), so this is dramatically
+/// cheaper than a full decode, and it is what lets the prompt — markers and
+/// all — be rendered before any pixel buffer is allocated. The plans are then
+/// the single source of truth for admission control, marker rendering, the
+/// `<image>`-position count check, and the backend's own splice.
+pub(crate) fn plan_images<B: Backend>(
+  preproc: &Preprocessor,
+  backend: &B,
+  images: &[ImageInput<'_>],
+) -> Result<Vec<ImagePlan>> {
+  images
+    .iter()
+    .enumerate()
+    .map(|(index, img)| {
+      let (width, height) = image_dimensions(img)?;
+      backend.plan_image(preproc, index, width, height)
+    })
+    .collect()
+}
+
+/// The front half of generation: admission control → image plans → template →
+/// tokenize → embed + vision splice → decoder prefill.
+///
+/// Shared by [`generate`] and
+/// [`Engine::next_token_logits`](crate::Engine::next_token_logits).
 ///
 /// # Vision contract
 /// Vision is called once per image — never batched across multiple images.
 /// Batching silently corrupts multi-tile outputs.
-#[allow(clippy::too_many_arguments)]
 #[allow(dead_code)]
-pub(crate) fn generate(
+pub(crate) fn prefill<B: Backend>(
   preproc: &Preprocessor,
-  vision: &mut VisionEncoder,
-  embed: &mut EmbedTokens,
-  decoder: &mut Decoder,
+  backend: &mut B,
   tokenizer: &tokenizers::Tokenizer,
-  sampler: &mut dyn Sampler,
-  inputs: GenerateInputs<'_>,
-) -> Result<String> {
+  inputs: &GenerateInputs<'_>,
+) -> Result<Prefilled<B>> {
   let messages = inputs.messages;
   let images = inputs.images;
   let opts = inputs.opts;
-  let eos_token_id = inputs.eos_token_id;
 
   // ------------------------------------------------------------------ //
   // Step 1: Cheap admission control — runs BEFORE any image decode.    //
@@ -154,27 +213,22 @@ pub(crate) fn generate(
   //        admission gates above.
   let template_messages = build_template_messages(messages)?;
 
-  // 1d. Pre-decode context-budget admission control + capture grids.
-  //     Read EACH image's dimensions from its header only (cheap —
-  //     ~50 bytes per image for PNG/JPEG, no full decode +
-  //     smart_resize + flatten_to_patches yet) and run pick_tile_grid
-  //     on those dimensions. Capture the per-image TileGrid so we can
-  //     reuse it for placeholder rendering AND skip a redundant
-  //     pick_tile_grid call inside the vision-encode loop.
+  // 1d. Pre-decode context-budget admission control + the authoritative
+  //     image plans. Read EACH image's dimensions from its header only
+  //     (cheap — ~50 bytes per image for PNG/JPEG, no full decode +
+  //     smart_resize + flatten_to_patches yet) and ask the BACKEND to plan
+  //     that image. The backend is the one that will execute the plan, so
+  //     the tiling that decides the marker layout is the same tiling that
+  //     produces the feature rows — on the MLX road that means the
+  //     checkpoint's own `config.json`, not lfm's ImageBudget.
   //
-  //     The exact image-token count is the sum across grids (no
+  //     The exact image-token count is the sum across plans (no
   //     upper-bound estimate, no false-positive rejection of small
   //     single-tile batches).
-  let grids: Vec<crate::preproc::TileGrid> = images
+  let plans = plan_images(preproc, &*backend, images)?;
+  let exact_image_tokens: usize = plans
     .iter()
-    .map(|img| {
-      let (w, h) = image_dimensions(img)?;
-      crate::preproc::tile_grid::pick_tile_grid(w, h, preproc.budget())
-    })
-    .collect::<Result<_>>()?;
-  let exact_image_tokens: usize = grids
-    .iter()
-    .map(|g| g.num_image_tokens())
+    .map(ImagePlan::image_tokens)
     .fold(0usize, |a, n| a.saturating_add(n));
   // Include the per-image structural wrapper tokens (IMAGE_START +
   // IMAGE_END always; row/col markers and an optional
@@ -182,9 +236,9 @@ pub(crate) fn generate(
   // budget edge cases (~1992 single-tile images at
   // min_image_tokens=64) would pass this check then fail only
   // after rendering + tokenizing the full prompt.
-  let exact_structural_tokens: usize = grids
+  let exact_structural_tokens: usize = plans
     .iter()
-    .map(structural_tokens_per_image)
+    .map(ImagePlan::structural_tokens)
     .fold(0usize, |a, n| a.saturating_add(n));
   let exact_total = exact_image_tokens.saturating_add(exact_structural_tokens);
   if exact_total.saturating_add(opts.max_new_tokens()) > crate::options::MODEL_CONTEXT_TOKENS {
@@ -195,19 +249,18 @@ pub(crate) fn generate(
     });
   }
 
-  // 1e. Render the chat template + expand <image> placeholders using
-  //     per-grid info (cheap — minijinja + string ops, no images
-  //     decoded yet). Deriving ImagePlaceholderInfo directly from
-  //     TileGrid lets us render the full prompt BEFORE any image
-  //     patchify. Per-image pixel buffers (~30 MB each at default
-  //     budget worst case) are then allocated + freed inside the
-  //     vision-encode loop one at a time, instead of all-at-once
-  //     before tokenization. Peak memory drops from O(N × 30 MB)
-  //     to O(1 × 30 MB).
+  // 1e. Render the chat template + expand <image> placeholders from the
+  //     SAME plans admission control just used (cheap — minijinja + string
+  //     ops, no images decoded yet). Rendering from the plan lets us build
+  //     the full prompt BEFORE any image patchify. Per-image pixel buffers
+  //     (~30 MB each at default budget worst case) are then allocated +
+  //     freed inside the vision-encode loop one at a time, instead of
+  //     all-at-once before tokenization. Peak memory drops from
+  //     O(N × 30 MB) to O(1 × 30 MB).
   let prompt_with_placeholders =
     chat_template::apply_chat_template(&template_messages, None, true)?;
-  let placeholder_infos: Vec<ImagePlaceholderInfo> =
-    grids.iter().map(|g| g.to_placeholder_info()).collect();
+  let placeholder_infos: Vec<crate::chat_template::ImagePlaceholderInfo> =
+    plans.iter().map(|p| *p.placeholder()).collect();
   let prompt =
     chat_template::expand_image_placeholders(&prompt_with_placeholders, &placeholder_infos)?;
 
@@ -237,15 +290,10 @@ pub(crate) fn generate(
   }
 
   // ------------------------------------------------------------------ //
-  // Step 5: Embed tokens → flat [seq_len × 1024].                      //
+  // Step 5: Locate <image>-token positions in the tokenized sequence.   //
   // ------------------------------------------------------------------ //
-  let mut text_embeds: Vec<f32> = embed.run(&token_ids)?;
-  debug_assert_eq!(text_embeds.len(), seq_len * EMBED_DIM);
-
-  // ------------------------------------------------------------------ //
-  // Step 5: Vision encode per image + splice into text embedding stream.//
-  // ------------------------------------------------------------------ //
-  // Locate image-token positions in the tokenized sequence.
+  // Embedding + vision encode + splice happen inside the backend
+  // (prepare_prompt_embeds); the loop only computes the splice targets.
   let img_token_id =
     tokenizer
       .token_to_id(chat_template::IMAGE_TOKEN)
@@ -261,8 +309,8 @@ pub(crate) fn generate(
     .collect();
 
   // Sanity: total <image> token count in the rendered prompt must match
-  // the sum of per-image token counts from grids. The pre-decode pass
-  // already used these grids to render placeholders, so any drift here
+  // the sum of per-image token counts from the plans. The pre-decode pass
+  // already used these plans to render placeholders, so any drift here
   // would indicate a chat-template / placeholder bug.
   let total_vision_tokens = exact_image_tokens;
   if image_positions.len() != total_vision_tokens {
@@ -272,73 +320,45 @@ pub(crate) fn generate(
     });
   }
 
-  // For each image: preprocess (decode + smart_resize + flatten_to_patches)
-  // → vision encode → splice → DROP pixel buffer at iteration end.
-  // Round-13 fix: instead of pre-allocating a Vec<PreprocessedImage> for
-  // all images and holding ~30 MB per image alive until the splice loop
-  // runs, the per-image PreprocessedImage is local to each iteration and
-  // freed when the loop body exits. Peak memory: O(1 image's pixel buffer)
-  // instead of O(N).
-  let mut pos_cursor: usize = 0;
-  for (img, grid) in images.iter().zip(grids.iter()) {
-    // Decode + preprocess just this image. The decoded DynamicImage and
-    // the resulting PreprocessedImage both go out of scope at the end
-    // of this iteration, freeing their pixel buffers.
-    let decoded = match img {
-      #[cfg(not(target_arch = "wasm32"))]
-      ImageInput::Path(p) => crate::preproc::decode_with_orientation(p)?,
-      ImageInput::Bytes(b) => crate::preproc::decode_bytes_with_orientation(b)?,
-    };
-    let preprocessed_img = preproc.preprocess(&decoded)?;
-    drop(decoded); // free the source RGB buffer before vision.run
-
-    // Release-time defense-in-depth: the prompt was rendered using
-    // `grid` (computed from header dimensions, EXIF-corrected by
-    // image_dimensions). preprocessed_img's grid comes from the
-    // actually-decoded image. With the EXIF fix in image_dimensions,
-    // these must agree; if they don't, markers and features would
-    // bind to wrong spatial positions even when total token counts
-    // happen to match (e.g., a 4×2 layout vs 2×4 layout both have
-    // 8 main tiles + same thumbnail tokens).
-    let expected_info = grid.to_placeholder_info();
-    let actual_info = preprocessed_img.to_placeholder_info();
-    if expected_info != actual_info {
-      return Err(Error::ImageGridLayoutMismatch {
-        expected_rows: expected_info.rows(),
-        expected_cols: expected_info.cols(),
-        actual_rows: actual_info.rows(),
-        actual_cols: actual_info.cols(),
-      });
-    }
-    let n_img_tokens = grid.num_image_tokens();
-    let vision_embeds: Vec<f32> = vision.run(&preprocessed_img)?;
-    drop(preprocessed_img); // free pixel_values before splicing
-
-    // Vision encoder returns [num_image_tokens × 1024] flat.
-    if vision_embeds.len() != n_img_tokens * EMBED_DIM {
-      return Err(Error::SessionShapeMismatch {
-        input: "image_features",
-        expected: "num_image_tokens * 1024",
-        got: vec![vision_embeds.len() as i64],
-      });
-    }
-
-    // Splice vision embedding for each image-token position.
-    for k in 0..n_img_tokens {
-      let tok_pos = image_positions[pos_cursor + k];
-      let dst_start = tok_pos * EMBED_DIM;
-      let src_start = k * EMBED_DIM;
-      text_embeds[dst_start..dst_start + EMBED_DIM]
-        .copy_from_slice(&vision_embeds[src_start..src_start + EMBED_DIM]);
-    }
-    pos_cursor += n_img_tokens;
-  }
+  // Build the full prompt inputs_embeds: embed the token ids, encode each
+  // image, and splice the per-image vision embeds in at image_positions.
+  // The backend owns the buffer (host Vec<f32> for ORT; an on-device
+  // tensor for the MLX backend) — the loop never touches it directly. The
+  // plans handed over are the ones the markers above were rendered from,
+  // and the backend checks its real preprocessing against them.
+  let prompt_embeds =
+    backend.prepare_prompt_embeds(preproc, &token_ids, images, &plans, &image_positions)?;
 
   // ------------------------------------------------------------------ //
   // Step 6: Decoder prefill (entire prompt in one step).                //
   // ------------------------------------------------------------------ //
-  let mut cache = decoder.new_cache()?;
-  let mut logits = decoder.step(&mut cache, &text_embeds, seq_len)?;
+  let mut cache = backend.make_cache()?;
+  let logits = backend.decoder_step(&mut cache, &prompt_embeds, seq_len)?;
+  reject_non_finite_logits(&logits)?;
+
+  Ok(Prefilled {
+    logits,
+    cache,
+    prompt_ids: encoding.get_ids().to_vec(),
+  })
+}
+
+/// End-to-end VLM generation: [`prefill`] → decode loop → detokenize.
+#[allow(dead_code)]
+pub(crate) fn generate(
+  preproc: &Preprocessor,
+  backend: &mut impl Backend,
+  tokenizer: &tokenizers::Tokenizer,
+  sampler: &mut dyn Sampler,
+  inputs: GenerateInputs<'_>,
+) -> Result<String> {
+  let opts = inputs.opts;
+  let eos_token_id = inputs.eos_token_id;
+  let Prefilled {
+    mut logits,
+    mut cache,
+    prompt_ids,
+  } = prefill(preproc, backend, tokenizer, &inputs)?;
 
   // ------------------------------------------------------------------ //
   // Step 7: Decode loop.                                                //
@@ -355,7 +375,7 @@ pub(crate) fn generate(
   let mut output_ids: Vec<u32> = Vec::with_capacity(preallocated);
   // Seed seen_tokens with prompt token ids so repetition penalty applies
   // to vocabulary already in context (matches HF reference behavior).
-  let mut seen_tokens: HashSet<u32> = encoding.get_ids().iter().copied().collect();
+  let mut seen_tokens: HashSet<u32> = prompt_ids.into_iter().collect();
 
   let mut terminated_normally = false;
   for step in 0..opts.max_new_tokens() {
@@ -384,8 +404,9 @@ pub(crate) fn generate(
         }
         output_ids.push(id);
         seen_tokens.insert(id);
-        let new_embed = embed.run(&[id as i64])?;
-        logits = decoder.step(&mut cache, &new_embed, 1)?;
+        let new_embed = backend.embed_one(id as i64)?;
+        logits = backend.decoder_step(&mut cache, &new_embed, 1)?;
+        reject_non_finite_logits(&logits)?;
       }
     }
   }
@@ -445,7 +466,7 @@ fn check_decoded_alloc_cap(raw_w: u32, raw_h: u32, max_alloc: u64) -> Result<()>
 }
 
 #[allow(dead_code)]
-fn image_dimensions(input: &ImageInput<'_>) -> Result<(u32, u32)> {
+pub(crate) fn image_dimensions(input: &ImageInput<'_>) -> Result<(u32, u32)> {
   use image::{ImageDecoder, ImageReader, metadata::Orientation};
   // Apply the same source-dim limits the full-decode path uses.
   // Without this, a 100000×100000 header
@@ -635,31 +656,6 @@ fn check_request_shape_cap(messages: &[ChatMessage]) -> Result<()> {
     }
   }
   Ok(())
-}
-
-/// Per-image structural tokens that `build_image_block` always
-/// emits regardless of grid: `<|image_start|>` + `<|image_end|>`.
-/// Used by both the cheap floor (step 1cx) and the exact-grid
-/// check (step 1d).
-pub(crate) const IMAGE_BLOCK_WRAPPER_TOKENS: usize = 2;
-
-/// Total structural (non-`<image>`) tokens the chat template emits
-/// per image, given the resolved grid.
-///
-/// Always: `<|image_start|>` + `<|image_end|>` (= 2). Multi-tile
-/// (rows>1 or cols>1): adds rows*cols `<|img_row_R_col_C|>`
-/// markers, plus 1 `<|img_thumbnail|>` if a thumbnail is rendered.
-#[allow(dead_code)]
-fn structural_tokens_per_image(g: &crate::preproc::TileGrid) -> usize {
-  let info = g.to_placeholder_info();
-  let mut n = IMAGE_BLOCK_WRAPPER_TOKENS;
-  if info.rows() > 1 || info.cols() > 1 {
-    n = n.saturating_add(info.rows().saturating_mul(info.cols()));
-    if info.thumbnail_tokens().is_some() {
-      n = n.saturating_add(1);
-    }
-  }
-  n
 }
 
 /// Cheap admission floor for multi-image requests. Each image
@@ -1344,27 +1340,86 @@ mod tests {
     assert!(check_image_count_lower_bound(0, 64, 512).is_ok());
   }
 
+  /// The plan derived from a `TileGrid` carries the structural-token count the
+  /// chat template will actually emit for that grid: the block wrapper alone
+  /// for a single tile, and wrapper + one `<|img_row_R_col_C|>` per tile
+  /// (+ `<|img_thumbnail|>`) for a multi-tile layout. Admission control reads
+  /// this number, so a drift here would let an over-budget prompt through.
   #[test]
-  fn structural_tokens_per_image_single_tile() {
-    // Single-tile (1x1): build_image_block emits IMAGE_START + N
-    // <image> tokens + IMAGE_END. Structural overhead = 2 wrapper.
-    let g = crate::preproc::TileGrid::new(1, 1, 512, 512, None);
-    assert_eq!(structural_tokens_per_image(&g), 2);
-  }
-
-  #[test]
-  fn structural_tokens_per_image_multi_tile_with_thumbnail() {
+  fn tile_grid_plan_structural_tokens() {
+    let plan_of = |g: crate::preproc::TileGrid| {
+      crate::preproc::ImagePlan::from_placeholder(g.to_placeholder_info())
+    };
+    // Single-tile (1x1): build_image_block emits IMAGE_START + N <image>
+    // tokens + IMAGE_END. Structural overhead = the 2 wrapper tokens.
+    assert_eq!(
+      plan_of(crate::preproc::TileGrid::new(1, 1, 512, 512, None)).structural_tokens(),
+      2
+    );
     // 2x3 multi-tile with thumbnail: 2 wrapper + 6 row/col markers
     // + 1 <|img_thumbnail|> = 9 structural tokens.
-    let g = crate::preproc::TileGrid::new(2, 3, 512, 512, Some((512, 512)));
-    assert_eq!(structural_tokens_per_image(&g), 2 + 6 + 1);
+    assert_eq!(
+      plan_of(crate::preproc::TileGrid::new(
+        2,
+        3,
+        512,
+        512,
+        Some((512, 512))
+      ))
+      .structural_tokens(),
+      2 + 6 + 1
+    );
+    // 2x3 multi-tile, no thumbnail: 2 + 6 = 8.
+    assert_eq!(
+      plan_of(crate::preproc::TileGrid::new(2, 3, 512, 512, None)).structural_tokens(),
+      2 + 6
+    );
   }
 
+  /// The pre-sampler gate rejects every non-finite logit row — NaN, `+inf` and
+  /// `-inf` alike — and passes a finite one through untouched.
+  ///
+  /// The `+inf` case is the one that used to slip past every sampler check: a
+  /// lone `+inf` always wins greedy, and under temperature it makes softmax's
+  /// maximum non-finite, which falls back to a uniform distribution spread over
+  /// the WHOLE row — including the `-inf` entries an llguidance mask uses to
+  /// forbid a token.
   #[test]
-  fn structural_tokens_per_image_multi_tile_no_thumbnail() {
-    // 2x3 multi-tile, no thumbnail: 2 + 6 = 8.
-    let g = crate::preproc::TileGrid::new(2, 3, 512, 512, None);
-    assert_eq!(structural_tokens_per_image(&g), 2 + 6);
+  fn reject_non_finite_logits_rejects_nan_and_infinities() {
+    for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+      let row = vec![0.5_f32, 1.5, bad, -2.0];
+      assert!(
+        matches!(
+          reject_non_finite_logits(&row),
+          Err(Error::SessionNonFiniteOutput { stage: "decoder" })
+        ),
+        "a {bad} logit must be rejected before any sampler runs"
+      );
+    }
+    assert!(reject_non_finite_logits(&[0.5_f32, 1.5, -2.0]).is_ok());
+    // An empty row has nothing non-finite in it; the shape checks that would
+    // reject it live at the backend boundary, not here.
+    assert!(reject_non_finite_logits(&[]).is_ok());
+  }
+
+  /// A `+inf` in a row whose other entries are the `-inf` an llguidance
+  /// allow-mask writes is the concrete constrained-decoding failure: without
+  /// the gate, `softmax`'s non-finite-maximum fallback spreads probability
+  /// uniformly over every entry, so `sample_min_p` can return a MASKED token id
+  /// and the schema guarantee is broken. The gate rejects the row first.
+  #[test]
+  fn reject_non_finite_logits_guards_a_constrained_mask_row() {
+    // ids 0, 1, 3 masked off by a constraint; id 2 carries the broken +inf.
+    let masked = vec![
+      f32::NEG_INFINITY,
+      f32::NEG_INFINITY,
+      f32::INFINITY,
+      f32::NEG_INFINITY,
+    ];
+    assert!(matches!(
+      reject_non_finite_logits(&masked),
+      Err(Error::SessionNonFiniteOutput { stage: "decoder" })
+    ));
   }
 
   #[test]

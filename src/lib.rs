@@ -49,7 +49,7 @@ pub use error::{Error, Result};
 #[cfg(feature = "inference")]
 #[cfg_attr(docsrs, doc(cfg(feature = "inference")))]
 pub use options::GraphOptimizationLevel;
-pub use options::{ImageBudget, Options, RequestOptions, ThreadOptions};
+pub use options::{BackendKind, ImageBudget, Options, RequestOptions, ThreadOptions};
 #[cfg(feature = "decoders")]
 #[cfg_attr(docsrs, doc(cfg(feature = "decoders")))]
 pub use preproc::decode_bytes_with_orientation;
@@ -59,7 +59,9 @@ pub use preproc::decode_bytes_with_orientation;
   doc(cfg(all(feature = "decoders", not(target_arch = "wasm32"))))
 )]
 pub use preproc::decode_with_orientation;
-pub use preproc::{PreprocessedImage, Preprocessor, TileGrid};
+pub use preproc::{
+  IMAGE_BLOCK_WRAPPER_TOKENS, ImagePlan, PreprocessedImage, Preprocessor, TileGrid,
+};
 
 // ===== Public chat types (Engine / Task 13 API) =====
 

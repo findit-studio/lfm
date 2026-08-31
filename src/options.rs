@@ -563,6 +563,57 @@ impl Default for ThreadOptions {
 }
 
 // =========================================================================
+// BackendKind
+// =========================================================================
+
+/// Which inference backend an [`Engine`](crate::Engine) runs on.
+///
+/// The set is closed and framework-owned: `lfm` compiles the ONNX Runtime
+/// (`ort`) backend on every target and, on macOS/arm64 **only**, the MLX
+/// (`mlxrs`) Metal backend. It is `#[non_exhaustive]` so adding a third
+/// backend later is not a SemVer break.
+///
+/// The type is used in both directions:
+///
+/// - as a **request** — [`Options::with_backend`] pins which backend
+///   [`Engine::from_dir`](crate::Engine::from_dir) must select, instead of
+///   letting the checkpoint layout decide. A pin that cannot be honoured
+///   (the directory holds the other format, or the platform has no such
+///   backend) is [`Error::BackendUnavailable`](crate::Error::BackendUnavailable),
+///   never a silent substitution;
+/// - as an **answer** — [`Engine::backend`](crate::Engine::backend) reports
+///   which backend the constructed engine actually runs on, so auto-selection
+///   is observable rather than opaque.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[non_exhaustive]
+pub enum BackendKind {
+  /// The ONNX Runtime (`ort`) backend. Reads the `onnx/*.onnx` graphs;
+  /// available on every target `lfm` builds for.
+  Onnx,
+  /// The MLX (`mlxrs`) Metal backend. Reads an MLX checkpoint (`config.json`
+  /// plus a safetensors / gguf / npz weight set); compiled only on
+  /// macOS/arm64.
+  Mlx,
+}
+
+impl BackendKind {
+  /// The backend's lower-case name, as it appears in diagnostics.
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Onnx => "onnx",
+      Self::Mlx => "mlx",
+    }
+  }
+}
+
+impl core::fmt::Display for BackendKind {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str(self.as_str())
+  }
+}
+
+// =========================================================================
 // Options (top-level)
 // =========================================================================
 
@@ -573,19 +624,31 @@ pub struct Options {
   request: RequestOptions,
   image_budget: ImageBudget,
   thread: ThreadOptions,
+  /// Explicit backend pin. `None` (the default) lets
+  /// [`Engine::from_dir`](crate::Engine::from_dir) choose from the checkpoint
+  /// layout; `Some(kind)` demands that backend and fails loudly when it cannot
+  /// be served.
+  ///
+  /// `#[serde(default)]` so an `Options` document written before this field
+  /// existed still deserializes — an absent pin IS the auto-select default, so
+  /// filling it in is exactly right rather than a papered-over omission.
+  #[cfg_attr(feature = "serde", serde(default))]
+  backend: Option<BackendKind>,
   #[cfg(feature = "inference")]
   optimization_level: GraphOptLevelMirror,
 }
 
 impl Options {
   /// Defaults: `RequestOptions::deterministic()`, `ImageBudget::new()`,
-  /// `ThreadOptions::default()`, `GraphOptimizationLevel::Level1`
+  /// `ThreadOptions::default()`, no backend pin (auto-select),
+  /// `GraphOptimizationLevel::Level1`
   /// (matches siglip2/egemma — higher levels can subtly alter numerics).
   pub const fn new() -> Self {
     Self {
       request: RequestOptions::deterministic(),
       image_budget: ImageBudget::new(),
       thread: ThreadOptions::new(),
+      backend: None,
       #[cfg(feature = "inference")]
       optimization_level: GraphOptLevelMirror::Level1,
     }
@@ -602,6 +665,12 @@ impl Options {
   /// Returns a reference to the ORT thread configuration.
   pub const fn thread(&self) -> &ThreadOptions {
     &self.thread
+  }
+
+  /// The explicit backend pin, or `None` when the backend is auto-selected
+  /// from the checkpoint layout (the default).
+  pub const fn backend(&self) -> Option<BackendKind> {
+    self.backend
   }
 
   /// Returns the ORT graph optimization level.
@@ -627,6 +696,27 @@ impl Options {
     self
   }
 
+  /// Returns a copy that pins the backend
+  /// [`Engine::from_dir`](crate::Engine::from_dir) must select.
+  ///
+  /// A pin that cannot be served — the directory holds only the other
+  /// format's checkpoint, or the platform does not compile the requested
+  /// backend — is
+  /// [`Error::BackendUnavailable`](crate::Error::BackendUnavailable). A pin is
+  /// also how a directory that carries BOTH an ONNX graph set and an MLX
+  /// weight set is resolved deliberately instead of by the default
+  /// ONNX-graph-wins rule.
+  pub const fn with_backend(mut self, kind: BackendKind) -> Self {
+    self.backend = Some(kind);
+    self
+  }
+
+  /// Returns a copy with the backend pin cleared (back to auto-selection).
+  pub const fn with_auto_backend(mut self) -> Self {
+    self.backend = None;
+    self
+  }
+
   /// Returns a copy with the given ORT graph optimization level.
   #[cfg(feature = "inference")]
   #[cfg_attr(docsrs, doc(cfg(feature = "inference")))]
@@ -648,6 +738,12 @@ impl Options {
   /// Sets the thread sub-config in place.
   pub fn set_thread(&mut self, t: ThreadOptions) -> &mut Self {
     self.thread = t;
+    self
+  }
+
+  /// Sets (or, with `None`, clears) the backend pin in place.
+  pub fn set_backend(&mut self, kind: Option<BackendKind>) -> &mut Self {
+    self.backend = kind;
     self
   }
 
@@ -734,6 +830,34 @@ impl From<GraphOptLevelMirror> for GraphOptimizationLevel {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// An `Options` document written before the backend pin existed still
+  /// deserializes: an absent `backend` key means auto-select, which is the
+  /// default the field carries anyway.
+  #[test]
+  #[cfg(feature = "serde")]
+  fn options_deserialize_without_backend_key() {
+    let json = serde_json::to_value(Options::new()).expect("serialize Options");
+    let mut map = json.as_object().expect("object").clone();
+    assert!(
+      map.remove("backend").is_some(),
+      "the field must be present when serialized"
+    );
+    let restored: Options =
+      serde_json::from_value(serde_json::Value::Object(map)).expect("deserialize without backend");
+    assert_eq!(restored.backend(), None);
+    assert_eq!(restored, Options::new());
+  }
+
+  /// A pin round-trips through serde as the backend's own name.
+  #[test]
+  #[cfg(feature = "serde")]
+  fn backend_pin_round_trips() {
+    let opts = Options::new().with_backend(BackendKind::Mlx);
+    let json = serde_json::to_string(&opts).expect("serialize");
+    let back: Options = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back.backend(), Some(BackendKind::Mlx));
+  }
 
   // ===== RequestOptions =====
 

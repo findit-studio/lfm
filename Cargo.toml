@@ -51,6 +51,21 @@ serde       = { version = "1", features = ["derive"] }
 serde_json  = { version = "1" }
 fast_image_resize = "6.0.0"
 
+# ── MLX (mlxrs) inference backend — Apple Silicon only ──────────────────
+#
+# `mlxrs` binds the Metal-backed MLX C++ runtime through `mlx-c` FFI and only
+# builds on `aarch64-apple-darwin`, so it is declared under a target table — it
+# never enters the dependency graph on any other host. It is **non-optional**
+# there: lfm picks the best backend per platform automatically, with no
+# user-facing knob. On macOS/arm64 `Engine::from_dir` auto-routes to the MLX
+# backend when the directory is an MLX checkpoint (config.json +
+# model.safetensors, no ONNX graphs) and falls back to the ONNX path otherwise;
+# on every other platform only the ONNX path is compiled. The `lfm2-vl` feature
+# gives the LFM2.5-VL vision-language model + its NaFlex preprocessing. There is
+# intentionally NO `mlx` Cargo feature — MLX is auto-selected by platform.
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+mlxrs = { version = "0.2", default-features = false, features = ["lfm2-vl"] }
+
 [dev-dependencies]
 serde_json = "1"
 
@@ -70,6 +85,27 @@ inference   = ["dep:ort", "dep:tokenizers", "dep:llguidance", "dep:toktrie", "de
 # `--features bundled` build would fail to expose Engine.
 bundled     = ["inference", "decoders"]
 decoders    = ["image/jpeg", "image/png"]
+# Widen which weight FORMATS the auto-selected MLX (`mlxrs`) backend accepts on
+# Apple Silicon. Off by default, the MLX path reads only `model.safetensors`
+# (and the crate builds everywhere exactly as before). With `npz`/`gguf` on, the
+# loader's format detector additionally probes a `*.npz`/`*.gguf`, and
+# `Engine::from_dir`'s MLX probe routes such a dir to MLX. Each enables the
+# matching `mlxrs` feature; `mlxrs` is a macOS-arm64-only target dependency, so
+# on every other target the `mlxrs/<fmt>` activation is a harmless no-op (the
+# npz/gguf detection code is itself `#[cfg(feature = ...)]`-gated, so it isn't
+# compiled). These are NOT a backend knob — MLX stays auto-selected by platform;
+# they only widen the accepted weight formats. (gguf is a weight load seam: its
+# embedded metadata is not mapped to a config — a `config.json` is still
+# required alongside it.)
+npz         = ["mlxrs/npz"]
+gguf        = ["mlxrs/gguf"]
+# NOTE: there is intentionally no `mlx` feature. The MLX (`mlxrs`) Metal backend
+# is selected automatically by platform — see the `mlxrs` target dependency
+# above and the `Engine::from_dir` auto-routing in `src/engine.rs`. On
+# macOS/arm64 it compiles unconditionally and the public constructor routes to
+# it when the directory is an MLX checkpoint; elsewhere only the ONNX path
+# exists. Removing the user-facing knob is deliberate (best-backend-by-platform,
+# no opt-out).
 serde       = ["smol_str/serde", "llmtask/serde"]
 cuda        = ["inference", "ort/cuda"]
 tensorrt    = ["inference", "ort/tensorrt"]

@@ -3,6 +3,129 @@
 All notable changes follow the format from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this crate adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **MLX (`mlxrs`) Metal backend for Apple Silicon.** `Engine::from_dir` selects
+  it when the directory is an MLX checkpoint (`config.json` plus a safetensors /
+  sharded-index / `*.npz` / `*.gguf` weight set) and no complete ONNX graph set
+  is present. Explicit-format constructors: `Engine::from_mlx_dir`,
+  `from_mlx_safetensors`, and — under the matching feature — `from_mlx_npz` /
+  `from_mlx_gguf`. New `npz` / `gguf` features widen which weight formats the
+  backend accepts.
+- **One authoritative image plan.** `ImagePlan` (in `lfm::preproc`) is produced
+  once per image by the backend that will execute it, and is what the prompt's
+  `<image>` / `<|img_row_R_col_C|>` / `<|img_thumbnail|>` markers, the
+  context-budget admission gates, the backend's preprocessing, and the
+  vision-feature splice all read. The backend re-derives its layout from the
+  pixels it really decoded and raises `Error::ImagePlanMismatch` on any
+  disagreement, so a marker layout can no longer diverge from the feature block
+  silently. `Engine::plan_images` exposes the plans.
+- **Observable backend selection.** `BackendKind`, `Options::with_backend` /
+  `with_auto_backend` / `set_backend` / `backend` to pin a backend, and
+  `Engine::backend` to report the one in use. `Engine::image_budget` reports the
+  effective budget, which on the MLX road may be the checkpoint's own.
+- `Engine::next_token_logits` — run admission, planning, prompt rendering and the
+  decoder prefill, and return the (guaranteed finite) next-token logit row
+  without sampling.
+- Named checkpoint-layout errors: `Error::CheckpointLayoutAmbiguous`,
+  `Error::CheckpointFormatDisabled`, `Error::CheckpointIncomplete`,
+  `Error::BackendUnavailable`, `Error::MlxTilingMismatch`,
+  `Error::ImagePlanMismatch`.
+- `Engine::from_mlx_dir_unchecked` / `from_mlx_safetensors_unchecked` /
+  `from_mlx_npz_unchecked` / `from_mlx_gguf_unchecked` — the named door for a
+  custom MLX checkpoint, skipping the bundled tokenizer / chat-template identity
+  checks and the declared preprocessing contract (but not the structural
+  contract).
+- ORT/MLX parity integration test (`t10`), gated on `LFM_ONNX_MODEL_PATH` (or
+  `LFM_MODEL_PATH`) **and** `LFM_MLX_MODEL_PATH`; it compares the preprocessing
+  plans, the prefill logit rows, and the schema-constrained JSON completion,
+  repeats the plan comparison and a prefill on a NON-SQUARE multi-tile image
+  (2 rows × 4 cols) while asserting each road's marker sequence is the row-major
+  enumeration of its planned grid, and prints why it skipped when either
+  checkpoint is absent.
+
+### Changed
+
+- The MLX road now runs the same strict checkpoint validations as the ONNX road
+  before an auto-routed constructor returns: tokenizer identity, chat-template
+  identity, the model's real context limit, and the preprocessing geometry. A
+  checkpoint whose tiling parameters disagree with a non-default `ImageBudget`
+  is refused by name; a default `ImageBudget` adopts the checkpoint's own tiling
+  instead.
+- Both roads refuse a checkpoint whose `config.json` sets
+  `use_image_special_tokens: false` — by name on the MLX road
+  (`Error::MlxTilingMismatch`), as a strict-constructor drift error on the ONNX
+  road. This crate always brackets an image block with `<|image_start|>` /
+  `<|image_end|>` and always budgets both tokens, so such a checkpoint would be
+  prompted with two tokens its processor contract omits while every token count
+  still matched. An absent key means `true` (upstream's default) and is
+  accepted.
+- The MLX execute-time gate now re-derives the tile layout from the dimensions
+  it actually decoded and ratifies it against the plan the prompt's markers were
+  rendered from, before any feature is spliced. A path-backed image is opened
+  once for header planning and again for decoding; a file replaced in between
+  (1920×1080 → 1080×1920) yields a transposed grid whose sub-image count and
+  per-sub-image token counts are identical, so the previous count-only gate
+  admitted it and spliced row-major features under markers for the old layout.
+- `chat_template.jinja` drift detection normalizes exactly one thing before an
+  otherwise byte-exact comparison: the template's **leading** run of Jinja
+  comments and whitespace. The released `LiquidAI/LFM2.5-VL-450M-MLX-8bit` ships
+  the bundled template with a `{# … #}` header prepended for mlx_lm, which
+  byte-equality refused for no behavioural reason; at offset zero a `{#`
+  unambiguously opens a comment and the whitespace it leaves is swallowed by the
+  template's own `{{- bos_token -}}`. Comments elsewhere are NOT normalized —
+  `{#` opens a comment only in template-text context, so erasing every span
+  would rewrite `{{- "sys{# drift #}tem" -}}` into the bundled
+  `{{- "system" -}}` and pass a checkpoint that renders a different prompt.
+
+### Fixed
+
+- **Per-tile position markers are emitted row-major, matching the tiles.** The
+  shared image-block renderer iterated the grid columns-outer / rows-inner while
+  both feature producers return tiles row-major, so on every NON-SQUARE
+  multi-tile image each tile was conditioned under another tile's
+  `<|img_row_R_col_C|>` marker. Upstream is unambiguous:
+  `image_processing_lfm2_vl.py:310` cuts tiles with
+  `split_to_tiles(num_tiles_height=grid_height, num_tiles_width=grid_width)`
+  (row-major, height outer — `image_transforms.py:815-836`); `:328` returns
+  `(images, grid_width, grid_height)`, unpacked at `:418` as
+  `images, num_cols, num_rows`, published at `:553-554` as `image_rows` /
+  `image_cols`; and `processing_lfm2_vl.py:208-211` emits
+  `for row in range(rows): for col in range(cols)`. Square grids are unaffected,
+  which is why nothing caught it: the tile count, the `<image>` total, every
+  `spatial_shapes` entry and the ORT/MLX parity run were identical either way.
+  This was a defect on **both** roads — the renderer is shared, so the ONNX path
+  is fixed by the same change. Covered by a colour-coded oracle test that paints
+  tile `(r, c)` a distinct solid colour on a 2×4 and a 4×2 grid and asserts the
+  sub-image at each position decodes to the position its marker names, by
+  row-major expansion fixtures replacing the reversed ones, and by a non-square
+  multi-tile image added to the ORT/MLX parity run.
+- **Strict MLX constructors validate the preprocessing contract.** They checked
+  `tokenizer.json` and `chat_template.jinja` only, while `mlxrs` hardcodes
+  `image_mean = image_std = 0.5`, rescale `1/255` and bilinear resampling
+  (`Lfm2Vl::processor_config` never reads them from the checkpoint). A revision
+  shipping different normalization, a different rescale factor, or a
+  non-bilinear `resample` therefore loaded cleanly and fed systematically wrong
+  pixels to the vision tower with every count, grid and dimension check green —
+  the version-skew class the ONNX strict constructor already refused.
+  `Engine::from_mlx_dir`, `from_mlx_safetensors`, `from_mlx_npz` and
+  `from_mlx_gguf` now all validate it (a missing `preprocessor_config.json` also
+  fails closed); the `_unchecked` doors remain the only escape.
+- A non-finite decoder logit row is rejected before either sampler. Only `-inf`
+  is a value this crate writes on purpose (vocab-tail masking, the llguidance
+  allow-mask, repetition-penalty overflow); a NaN or `+inf` arriving from the
+  model is a broken forward. A lone `+inf` used to be admitted on the MLX road:
+  greedy would pick it unconditionally, and the temperature path's softmax
+  degraded to a uniform draw across the whole row — including the `-inf` entries
+  a constraint mask had used to forbid a token, so a schema-disallowed token
+  could win.
+- A checkpoint whose only MLX weight file is in a format the build did not
+  enable, a half-present ONNX graph set beside MLX weights, and an MLX
+  checkpoint on a non-Apple-Silicon host are now reported as such instead of
+  falling through to the ONNX path and failing on an unrelated missing graph.
+
 ## [0.1.2] — 2026-08-31
 
 ### Fixed

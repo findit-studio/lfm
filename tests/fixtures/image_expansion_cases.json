@@ -18,32 +18,39 @@
     "expected": "Q: <|image_start|><|img_row_1_col_1|><image><image><|img_row_1_col_2|><image><image><|img_row_2_col_1|><image><image><|img_row_2_col_2|><image><image><|image_end|>"
   },
   {
-    "name": "multi_tile_3x1_horizontal",
+    "name": "multi_tile_rows1_cols3_landscape",
     "info": {"rows": 1, "cols": 3, "tokens_per_main_tile": 1, "thumbnail_tokens": null},
-    "_comment": "rows=grid_height=1, cols=grid_width=3 → upstream emits row in 0..grid_width, col in 0..grid_height → _row_1_col_1, _row_2_col_1, _row_3_col_1",
+    "_comment": "rows = grid_height = 1, cols = grid_width = 3. Upstream processing_lfm2_vl.py:208-211 iterates rows OUTER, cols INNER, so the single row runs left to right: _row_1_col_1, _row_1_col_2, _row_1_col_3.",
     "prompt": "wide<image>",
-    "expected": "wide<|image_start|><|img_row_1_col_1|><image><|img_row_2_col_1|><image><|img_row_3_col_1|><image><|image_end|>"
+    "expected": "wide<|image_start|><|img_row_1_col_1|><image><|img_row_1_col_2|><image><|img_row_1_col_3|><image><|image_end|>"
   },
   {
-    "name": "multi_tile_1x3_vertical",
+    "name": "multi_tile_rows3_cols1_portrait",
     "info": {"rows": 3, "cols": 1, "tokens_per_main_tile": 1, "thumbnail_tokens": null},
-    "_comment": "rows=grid_height=3, cols=grid_width=1 → upstream emits _row_1_col_1, _row_1_col_2, _row_1_col_3",
+    "_comment": "rows = grid_height = 3, cols = grid_width = 1. Three rows of one column each: _row_1_col_1, _row_2_col_1, _row_3_col_1.",
     "prompt": "<image>tall",
-    "expected": "<|image_start|><|img_row_1_col_1|><image><|img_row_1_col_2|><image><|img_row_1_col_3|><image><|image_end|>tall"
+    "expected": "<|image_start|><|img_row_1_col_1|><image><|img_row_2_col_1|><image><|img_row_3_col_1|><image><|image_end|>tall"
   },
   {
-    "name": "multi_tile_4x2_widescreen",
+    "name": "multi_tile_rows2_cols4_widescreen",
     "info": {"rows": 2, "cols": 4, "tokens_per_main_tile": 1, "thumbnail_tokens": null},
-    "_comment": "1920x1080-style: rows=grid_height=2, cols=grid_width=4 → upstream emits 4 outer × 2 inner = 8 markers ordered _row_1_col_1, _row_1_col_2, _row_2_col_1, _row_2_col_2, _row_3_col_1, _row_3_col_2, _row_4_col_1, _row_4_col_2",
+    "_comment": "2048x1024-style: rows = grid_height = 2, cols = grid_width = 4. Row-major over 2 rows of 4 columns — row 1 left to right, then row 2. Transposing this loop keeps the tile count at 8 and the token total identical, which is exactly why it needs a fixture.",
+    "prompt": "<image>",
+    "expected": "<|image_start|><|img_row_1_col_1|><image><|img_row_1_col_2|><image><|img_row_1_col_3|><image><|img_row_1_col_4|><image><|img_row_2_col_1|><image><|img_row_2_col_2|><image><|img_row_2_col_3|><image><|img_row_2_col_4|><image><|image_end|>"
+  },
+  {
+    "name": "multi_tile_rows4_cols2_portrait",
+    "info": {"rows": 4, "cols": 2, "tokens_per_main_tile": 1, "thumbnail_tokens": null},
+    "_comment": "1024x2048-style: rows = grid_height = 4, cols = grid_width = 2. The transpose of the widescreen case — same 8 tiles, a different marker sequence.",
     "prompt": "<image>",
     "expected": "<|image_start|><|img_row_1_col_1|><image><|img_row_1_col_2|><image><|img_row_2_col_1|><image><|img_row_2_col_2|><image><|img_row_3_col_1|><image><|img_row_3_col_2|><image><|img_row_4_col_1|><image><|img_row_4_col_2|><image><|image_end|>"
   },
   {
-    "name": "multi_tile_2x4_portrait",
-    "info": {"rows": 4, "cols": 2, "tokens_per_main_tile": 1, "thumbnail_tokens": null},
-    "_comment": "1080x1920-style: rows=grid_height=4, cols=grid_width=2 → upstream emits 2 outer × 4 inner = 8 markers ordered _row_1_col_1, _row_1_col_2, _row_1_col_3, _row_1_col_4, _row_2_col_1, _row_2_col_2, _row_2_col_3, _row_2_col_4",
+    "name": "multi_tile_rows2_cols3_with_thumbnail",
+    "info": {"rows": 2, "cols": 3, "tokens_per_main_tile": 1, "thumbnail_tokens": 2},
+    "_comment": "Non-square grid WITH a thumbnail: the six main-tile markers stay row-major and the thumbnail marker is appended after all of them, matching both feature producers (which push the thumbnail sub-image last).",
     "prompt": "<image>",
-    "expected": "<|image_start|><|img_row_1_col_1|><image><|img_row_1_col_2|><image><|img_row_1_col_3|><image><|img_row_1_col_4|><image><|img_row_2_col_1|><image><|img_row_2_col_2|><image><|img_row_2_col_3|><image><|img_row_2_col_4|><image><|image_end|>"
+    "expected": "<|image_start|><|img_row_1_col_1|><image><|img_row_1_col_2|><image><|img_row_1_col_3|><image><|img_row_2_col_1|><image><|img_row_2_col_2|><image><|img_row_2_col_3|><image><|img_thumbnail|><image><image><|image_end|>"
   },
   {
     "name": "single_tile_1_token",
