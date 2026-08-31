@@ -796,6 +796,20 @@ impl From<GraphOptimizationLevel> for GraphOptLevelMirror {
       GraphOptimizationLevel::Level2 => Self::Level2,
       GraphOptimizationLevel::Level3 => Self::Level3,
       GraphOptimizationLevel::All => Self::All,
+      // `ort`'s `GraphOptimizationLevel` is `#[non_exhaustive]` (since
+      // ort 2.0.0-rc.13): a match on it must handle variants a future
+      // ort release could add. There is no honest silent fallback here
+      // — mapping an unknown level to e.g. `Level3` would misreport the
+      // optimization level this crate's numerics/bit-stability docs
+      // promise (see `Options::optimization_level` / the deterministic
+      // preset notes). Panic loudly instead of guessing; this can only
+      // fire once `ort` ships a 6th variant, at which point
+      // `GraphOptLevelMirror` needs a matching new variant added.
+      other => unreachable!(
+        "ort::GraphOptimizationLevel gained a variant ({other:?}) that GraphOptLevelMirror \
+         does not mirror yet — ort is #[non_exhaustive] here; add the matching variant to \
+         GraphOptLevelMirror"
+      ),
     }
   }
 }

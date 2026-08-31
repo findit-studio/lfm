@@ -126,6 +126,56 @@ and this crate adheres to [Semantic Versioning](https://semver.org/).
   checkpoint on a non-Apple-Silicon host are now reported as such instead of
   falling through to the ONNX path and failing on an unrelated missing graph.
 
+## [0.1.2] — 2026-08-31
+
+### Fixed
+
+- Fixed a build break on a fresh `Cargo.lock`: `ort` has never cut a
+  stable `2.0.0`, so — per Cargo's pre-release version-requirement rules
+  — the bare `ort = "2.0.0-rc.12"` floor already admitted the newer
+  `2.0.0-rc.13` (a requirement naming a pre-release matches later
+  pre-releases of the same `[major, minor, patch]`, same as an ordinary
+  caret floor; only a requirement that names no pre-release at all is
+  restricted to stable releases). `rc.13` relocated the
+  execution-provider types and marked `GraphOptimizationLevel`
+  `#[non_exhaustive]`, so any resolve landing on `rc.13` — which every
+  resolve did, since this crate does not commit a lockfile — failed to
+  compile. The floor is now written against `2.0.0-rc.13` (same bare/caret
+  form, so it keeps floating to future `rc.N` releases and the eventual
+  stable `2.0.0` the way the old line did), and the code follows ort's
+  rc.13 migration:
+  - `ort::execution_providers::{CUDA,TensorRT,DirectML,ROCm,CoreML}ExecutionProvider`
+    → `ort::ep::{CUDA,TensorRT,DirectML,ROCm,CoreML}`. rc.13 removed the
+    deprecated compatibility aliases entirely (present but
+    `#[deprecated]` through rc.12) and made each `ep` submodule
+    compile-time gated on its own `ort/<name>` Cargo feature (previously
+    the structs compiled unconditionally and only linking was
+    feature-gated).
+  - The `GraphOptimizationLevel` → internal `GraphOptLevelMirror`
+    conversion gained a defensive wildcard arm to satisfy
+    `#[non_exhaustive]`'s forward-compatibility requirement. The 5 known
+    variants (`Disable`/`Level1`/`Level2`/`Level3`/`All`) are unchanged;
+    the wildcard panics with a clear message rather than silently
+    mis-mapping a level this crate's bit-stability documentation makes
+    promises about, and can only fire once `ort` ships a 6th variant.
+
+  `ort` 2.0.0-rc.13 also bundles ONNX Runtime 1.28 (up from 1.24 at
+  rc.12) and, for `--features cuda` users, now ships CUDA 13 binaries
+  only (upstream dropped CUDA 12 support).
+
+### Added
+
+- Opt-in `lax-feature-matching` feature (`ort/lax-feature-matching`), not
+  implied by `cuda`/`tensorrt`/`directml`/`rocm`/`coreml`. `ort`
+  2.0.0-rc.13 now hard-errors at link time when the enabled
+  execution-provider features don't match one of its published
+  prebuilt-binary bundles exactly (previously this silently fell back to
+  CPU). No platform ships a bundle covering all five GPU backends at
+  once, so `--all-features` (a compile-coverage flag — no real
+  deployment enables every backend together) needs this feature to link.
+  A real single-backend build (e.g. `--features cuda` alone) is
+  unaffected and stays strict, matching upstream's intent.
+
 ## [0.1.0] — 2026-05-03
 
 ### Added
@@ -185,4 +235,5 @@ The weights ship under the [LFM Open License v1.0](https://www.liquid.ai/lfm-lic
 — verify your use case complies with Liquid AI's terms separately from
 this crate's MIT OR Apache-2.0 license.
 
+[0.1.2]: https://github.com/findit-ai/lfm/releases/tag/v0.1.2
 [0.1.0]: https://github.com/findit-ai/lfm/releases/tag/v0.1.0

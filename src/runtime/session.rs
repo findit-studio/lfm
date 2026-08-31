@@ -54,26 +54,26 @@ pub(crate) fn build_session(graph: &Path, opts: &Options) -> Result<Session> {
   // Multiple GPU features compiled in together stack in declaration
   // order — the first whose runtime is available wins.
   #[allow(unused_mut)]
-  let mut eps: Vec<ort::execution_providers::ExecutionProviderDispatch> = Vec::new();
+  let mut eps: Vec<ort::ep::ExecutionProviderDispatch> = Vec::new();
   #[cfg(feature = "cuda")]
   {
-    eps.push(ort::execution_providers::CUDAExecutionProvider::default().build());
+    eps.push(ort::ep::CUDA::default().build());
   }
   #[cfg(feature = "tensorrt")]
   {
-    eps.push(ort::execution_providers::TensorRTExecutionProvider::default().build());
+    eps.push(ort::ep::TensorRT::default().build());
   }
   #[cfg(feature = "directml")]
   {
-    eps.push(ort::execution_providers::DirectMLExecutionProvider::default().build());
+    eps.push(ort::ep::DirectML::default().build());
   }
   #[cfg(feature = "rocm")]
   {
-    eps.push(ort::execution_providers::ROCmExecutionProvider::default().build());
+    eps.push(ort::ep::ROCm::default().build());
   }
   #[cfg(feature = "coreml")]
   {
-    eps.push(ort::execution_providers::CoreMLExecutionProvider::default().build());
+    eps.push(ort::ep::CoreML::default().build());
   }
   if !eps.is_empty() {
     builder = builder

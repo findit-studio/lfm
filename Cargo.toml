@@ -1,6 +1,6 @@
 [package]
 name          = "lfm"
-version       = "0.1.1"
+version       = "0.1.2"
 edition       = "2024"
 rust-version  = "1.95"
 description   = "Rust ONNX inference for LiquidAI LFM2.5-VL (vision-language) models — implements the engine-agnostic llmtask::Task contract via llguidance for schema-constrained sampling"
@@ -25,7 +25,7 @@ include      = [
 
 [dependencies]
 llmtask     = { version = "0.1", features = ["json", "regex"] }
-ort         = { version = "2.0.0-rc.12", optional = true }
+ort         = { version = "2.0.0-rc.13", optional = true }
 # `default-features = false` drops `progressbar` (training UI),
 # `onig` (C++ regex engine) and `esaxx_fast` (C++ suffix-array
 # Unigram trainer). lfm only uses `tokenizer.from_file` +
@@ -113,6 +113,20 @@ directml    = ["inference", "ort/directml"]
 rocm        = ["inference", "ort/rocm"]
 coreml      = ["inference", "ort/coreml"]
 integration = ["inference"]
+# ort 2.0.0-rc.13 made execution-provider prebuilt-binary selection
+# strict: if `download-binaries` is on (lfm's default) and the enabled
+# EP features don't exactly match one of ort's published binary
+# bundles, linking now hard-errors instead of silently falling back to
+# CPU. `cuda` + `tensorrt` + `directml` + `rocm` + `coreml` together
+# (e.g. under `--all-features`, a compile-coverage flag — no real
+# deployment enables every GPU backend at once) isn't a combination any
+# platform ships a bundle for, so this feature is NOT implied by any
+# single EP feature above: a real `--features cuda` (etc.) build stays
+# strict and still fails loudly if that EP truly isn't available,
+# matching upstream's intent. Only an explicit opt-in (which
+# `--all-features` picks up automatically, same as every feature here)
+# relaxes ort to its best-fit bundle instead of erroring.
+lax-feature-matching = ["inference", "ort/lax-feature-matching"]
 
 [[test]]
 name              = "integration"

@@ -220,7 +220,7 @@ fn t08_repetition_penalty_reduces_repeats() {
   {
     Ok(text) => {
       if text.is_empty() {
-        panic!("empty output")
+        panic!("empty output");
       }
     }
     Err(lfm::Error::MaxTokensExceeded {
