@@ -1,4 +1,8 @@
-//! ORT-backed runtime modules. Gated on `feature = "inference"`.
+//! Runtime modules. The whole tree is gated on `feature = "inference"`; the
+//! ORT-specific submodules (`decoder`, `embed_tokens`, `session`, `vision`,
+//! and the `Ort` arm of `backend`) are additionally gated on `ort_backend` —
+//! `ort` is mandatory everywhere except aarch64-macos, where it is optional
+//! behind the `ort` feature (MLX is the native road there).
 
 // The Backend seam drives the per-image vision encode + splice, which
 // decodes images via the `decoders`-gated helpers; gate it on the same
@@ -12,7 +16,12 @@ pub(crate) mod backend;
 // gate rather than inside the macOS-only `mlx_backend`.
 #[cfg(feature = "decoders")]
 pub(crate) mod checkpoint;
+// The ORT-backed component wrappers. `ort` is mandatory everywhere except
+// aarch64-macos, where it is optional behind the `ort` feature — see the
+// `ort_backend` cfg emitted by build.rs and the target tables in Cargo.toml.
+#[cfg(ort_backend)]
 pub(crate) mod decoder;
+#[cfg(ort_backend)]
 pub(crate) mod embed_tokens;
 // The MLX (mlxrs) backend is the Apple-Silicon-only on-device alternative to
 // the ORT path. It is compiled only on macOS/arm64 (where the `mlxrs` target
@@ -21,5 +30,7 @@ pub(crate) mod embed_tokens;
 #[cfg(all(feature = "decoders", target_os = "macos", target_arch = "aarch64"))]
 pub(crate) mod mlx_backend;
 pub(crate) mod sampler;
+#[cfg(ort_backend)]
 pub(crate) mod session;
+#[cfg(ort_backend)]
 pub(crate) mod vision;

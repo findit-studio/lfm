@@ -67,9 +67,20 @@ and this crate adheres to [Semantic Versioning](https://semver.org/).
   (2 rows × 4 cols) while asserting each road's marker sequence is the row-major
   enumeration of its planned grid, and prints why it skipped when either
   checkpoint is absent.
+- `ort` Cargo feature, aarch64-macos only: opts the ONNX (`ort`) backend back
+  in there (off by `default` — MLX is the native road on Apple Silicon). Needed
+  to run `Engine::from_paths` / `from_onnx_dir` / the ONNX arm of `from_dir`,
+  or the `t10` parity test, on Apple Silicon. On every other target `ort` is
+  unaffected by this feature — it stays the mandatory dependency it always was.
 
 ### Changed
 
+- **`ort` is now optional on aarch64-macos**, gated behind the new `ort`
+  feature; it remains a mandatory dependency on every other target, unchanged
+  from before. `BackendKind::Onnx` on Apple Silicon without the feature is a
+  named `Error::BackendUnavailable` (mirroring the existing MLX-off-Apple-Silicon
+  error) rather than a build failure or a silent fallback — `Options::backend()`
+  / `Engine::backend()` still report which backend actually ran.
 - The MLX road now runs the same strict checkpoint validations as the ONNX road
   before an auto-routed constructor returns: tokenizer identity, chat-template
   identity, the model's real context limit, and the preprocessing geometry. A

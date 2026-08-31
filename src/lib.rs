@@ -1,4 +1,7 @@
-//! Rust ONNX inference for LiquidAI LFM2.5-VL (vision-language) models.
+//! Rust ONNX/MLX inference for LiquidAI LFM2.5-VL (vision-language) models.
+//! ONNX (`ort`) is the mandatory backend on every target except aarch64-macos,
+//! where MLX (`mlxrs`) is the always-compiled native road and `ort` becomes
+//! opt-in behind the `ort` feature (see `Cargo.toml`).
 //!
 //! See `docs/superpowers/specs/2026-05-03-lfm-vlm-wrapper-design.md`
 //! for the full design rationale.
@@ -45,8 +48,14 @@ pub use chat_template::{
 #[cfg_attr(docsrs, doc(cfg(all(feature = "inference", feature = "decoders"))))]
 pub use engine::{Engine, EnginePaths};
 pub use error::{Error, Result};
-#[cfg(feature = "inference")]
-#[cfg_attr(docsrs, doc(cfg(feature = "inference")))]
+#[cfg(all(feature = "inference", ort_backend))]
+#[cfg_attr(
+  docsrs,
+  doc(cfg(any(
+    not(all(target_arch = "aarch64", target_os = "macos")),
+    feature = "ort"
+  )))
+)]
 pub use options::GraphOptimizationLevel;
 pub use options::{BackendKind, ImageBudget, Options, RequestOptions, ThreadOptions};
 #[cfg(feature = "decoders")]

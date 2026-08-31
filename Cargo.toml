@@ -3,7 +3,7 @@ name          = "lfm"
 version       = "0.2.0"
 edition       = "2024"
 rust-version  = "1.95"
-description   = "Rust ONNX inference for LiquidAI LFM2.5-VL (vision-language) models — implements the engine-agnostic llmtask::Task contract via llguidance for schema-constrained sampling"
+description   = "Rust ONNX/MLX inference for LiquidAI LFM2.5-VL (vision-language) models — implements the engine-agnostic llmtask::Task contract via llguidance for schema-constrained sampling"
 license       = "MIT OR Apache-2.0"
 repository    = "https://github.com/findit-studio/lfm"
 homepage      = "https://github.com/findit-studio/lfm"
@@ -25,7 +25,7 @@ include      = [
 
 [dependencies]
 llmtask     = { version = "0.3", features = ["json", "regex"] }
-ort         = { version = "2.0.0-rc.13", optional = true }
+# ort moved to the target tables below (mandatory everywhere except aarch64-macos).
 tokenizers  = { version = "0.23", optional = true, default-features = false, features = ["fancy-regex"] }
 llguidance  = { version = "1.7", optional = true }
 toktrie     = { version = "1.7", optional = true }
@@ -39,6 +39,14 @@ serde       = { version = "1", features = ["derive"] }
 serde_json  = { version = "1" }
 fast_image_resize = "6"
 
+# ort: mandatory except aarch64-macos, where MLX (below) is the native road
+# and ort is opt-in via the `ort` feature (off by default).
+[target.'cfg(not(all(target_arch = "aarch64", target_os = "macos")))'.dependencies]
+ort = { version = "2.0.0-rc.13" }
+
+[target.'cfg(all(target_arch = "aarch64", target_os = "macos"))'.dependencies]
+ort = { version = "2.0.0-rc.13", optional = true }
+
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 mlxrs = { version = "0.2", default-features = false, features = ["lfm2-vl"] }
 
@@ -50,19 +58,25 @@ criterion = "0.8"
 
 [features]
 default     = ["inference", "bundled", "decoders"]
-inference   = ["dep:ort", "dep:tokenizers", "dep:llguidance", "dep:toktrie", "dep:toktrie_hf_tokenizers", "dep:minijinja"]
+inference   = ["dep:tokenizers", "dep:llguidance", "dep:toktrie", "dep:toktrie_hf_tokenizers", "dep:minijinja"]
+# Opt-in ORT backend on aarch64-macos (MLX is native there and is what
+# `default` gets); a no-op everywhere else, where ort is already mandatory.
+ort         = ["dep:ort"]
 bundled     = ["inference", "decoders"]
 decoders    = ["image/jpeg", "image/png"]
 npz         = ["mlxrs/npz"]
 gguf        = ["mlxrs/gguf"]
 serde       = ["smol_str/serde", "llmtask/serde"]
-cuda        = ["inference", "ort/cuda"]
-tensorrt    = ["inference", "ort/tensorrt"]
-directml    = ["inference", "ort/directml"]
-rocm        = ["inference", "ort/rocm"]
-coreml      = ["inference", "ort/coreml"]
+# Each also lists `ort` explicitly: `ort/<ep>` alone activates the optional
+# dependency on aarch64-macos but not lfm's own `ort` feature, which gates
+# the code that uses it.
+cuda        = ["inference", "ort", "ort/cuda"]
+tensorrt    = ["inference", "ort", "ort/tensorrt"]
+directml    = ["inference", "ort", "ort/directml"]
+rocm        = ["inference", "ort", "ort/rocm"]
+coreml      = ["inference", "ort", "ort/coreml"]
 integration = ["inference"]
-lax-feature-matching = ["inference", "ort/lax-feature-matching"]
+lax-feature-matching = ["inference", "ort", "ort/lax-feature-matching"]
 
 [[test]]
 name              = "integration"
@@ -106,4 +120,4 @@ rustdoc-args = ["--cfg", "docsrs"]
 [lints.rust]
 rust_2018_idioms     = "warn"
 single_use_lifetimes = "warn"
-unexpected_cfgs      = { level = "warn", check-cfg = ['cfg(docsrs)', 'cfg(tarpaulin)'] }
+unexpected_cfgs      = { level = "warn", check-cfg = ['cfg(docsrs)', 'cfg(tarpaulin)', 'cfg(ort_backend)'] }

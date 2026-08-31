@@ -21,14 +21,20 @@ use crate::{
   error::Result,
   options::BackendKind,
   preproc::{ImagePlan, Preprocessor},
-  runtime::{
-    decoder::{Decoder, KvCache},
-    embed_tokens::EmbedTokens,
-    vision::VisionEncoder,
-  },
+};
+
+// The ORT-backed component wrappers — `ort` is mandatory everywhere except
+// aarch64-macos, where it is optional behind the `ort` feature; see the
+// `ort_backend` cfg (build.rs) and the target tables in Cargo.toml.
+#[cfg(ort_backend)]
+use crate::runtime::{
+  decoder::{Decoder, KvCache},
+  embed_tokens::EmbedTokens,
+  vision::VisionEncoder,
 };
 
 /// Embedding dimension for text and vision outputs (1024 for LFM2.5-VL).
+#[cfg(ort_backend)]
 const EMBED_DIM: usize = 1024;
 
 /// Drives the model-weight stage of generation: text embedding, vision
@@ -116,8 +122,10 @@ pub(crate) trait Backend {
 
 /// Host-side embedding buffer used by [`OrtBackend`]: a flat
 /// `[positions × 1024]` `f32` slab in the ONNX `inputs_embeds` layout.
+#[cfg(ort_backend)]
 pub(crate) struct OrtEmbeds(Vec<f32>);
 
+#[cfg(ort_backend)]
 impl OrtEmbeds {
   /// Borrow the flat buffer for the decoder's `inputs_embeds` input.
   pub(crate) fn as_slice(&self) -> &[f32] {
@@ -128,12 +136,18 @@ impl OrtEmbeds {
 /// ONNX/`ort`-backed [`Backend`]. Owns the three ONNX component sessions
 /// (vision encoder, embed-tokens, decoder); embeds are host `Vec<f32>`
 /// and the cache is the ONNX [`KvCache`].
+///
+/// `ort` is mandatory on every target except aarch64-macos, where it is
+/// optional behind the `ort` feature (see `Cargo.toml`) — hence the
+/// `ort_backend` gate on this whole type.
+#[cfg(ort_backend)]
 pub(crate) struct OrtBackend {
   vision: VisionEncoder,
   embed: EmbedTokens,
   decoder: Decoder,
 }
 
+#[cfg(ort_backend)]
 impl OrtBackend {
   /// Construct from the three ONNX component sessions.
   pub(crate) fn new(vision: VisionEncoder, embed: EmbedTokens, decoder: Decoder) -> Self {
@@ -145,6 +159,7 @@ impl OrtBackend {
   }
 }
 
+#[cfg(ort_backend)]
 impl Backend for OrtBackend {
   type Embeds = OrtEmbeds;
   type Cache = KvCache;
@@ -273,10 +288,14 @@ impl Backend for OrtBackend {
 
 /// The backend [`Engine`](crate::Engine) drives generation through.
 ///
-/// The ORT variant is always present; on Apple Silicon a second on-device
-/// [`MlxBackend`](crate::runtime::mlx_backend::MlxBackend) arm is compiled in
-/// and auto-selected by checkpoint shape (see
-/// [`Engine::from_dir`](crate::Engine)). The enum implements [`Backend`] by
+/// The ORT variant is compiled whenever `ort_backend` holds — mandatory on
+/// every target except aarch64-macos, opt-in there behind the `ort` feature
+/// (see `Cargo.toml`). On Apple Silicon a second on-device
+/// [`MlxBackend`](crate::runtime::mlx_backend::MlxBackend) arm is ALWAYS
+/// compiled in and auto-selected by checkpoint shape (see
+/// [`Engine::from_dir`](crate::Engine)); at least one of the two arms is
+/// always present (Ort everywhere it isn't aarch64-macos; Mlx everywhere it
+/// is), so the enum is never empty. The enum implements [`Backend`] by
 /// delegating to the active variant, so [`generate`](crate::generate::generate)
 /// stays generic over [`Backend`]. The associated [`Backend::Embeds`] /
 /// [`Backend::Cache`] types are themselves enums ([`EngineEmbeds`] /
@@ -286,14 +305,16 @@ impl Backend for OrtBackend {
 ///
 /// An [`Engine`](crate::Engine) holds exactly one `BackendImpl` (never an array
 /// or a hot-path collection of them), so the inter-variant size difference is
-/// not a layout concern — hence the `large_enum_variant` allow. The larger MLX
-/// model is still boxed to keep the moved-around enum small.
+/// not a layout concern — hence the `large_enum_variant` allow when both
+/// variants are compiled in. The larger MLX model is still boxed to keep the
+/// moved-around enum small.
 #[cfg_attr(
-  all(target_os = "macos", target_arch = "aarch64"),
+  all(target_os = "macos", target_arch = "aarch64", ort_backend),
   allow(clippy::large_enum_variant)
 )]
 pub(crate) enum BackendImpl {
   /// ONNX/`ort` backend.
+  #[cfg(ort_backend)]
   Ort(OrtBackend),
   /// MLX (`mlxrs`) Metal backend — Apple Silicon only. Boxed because the loaded
   /// [`Lfm2Vl`](mlxrs::vlm::models::lfm2_vl::Lfm2Vl) model is much larger than
@@ -307,6 +328,7 @@ pub(crate) enum BackendImpl {
 /// associated embeds type is an enum.
 pub(crate) enum EngineEmbeds {
   /// Host `Vec<f32>` embeds for the ORT backend.
+  #[cfg(ort_backend)]
   Ort(OrtEmbeds),
   /// On-device mlx [`Array`](mlxrs::Array) embeds for the MLX backend.
   #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -317,6 +339,7 @@ pub(crate) enum EngineEmbeds {
 /// associated cache type is an enum.
 pub(crate) enum EngineCache {
   /// ONNX [`KvCache`] for the ORT backend.
+  #[cfg(ort_backend)]
   Ort(KvCache),
   /// The LFM2 heterogeneous per-layer KV/conv cache for the MLX backend.
   #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -329,6 +352,7 @@ impl Backend for BackendImpl {
 
   fn kind(&self) -> BackendKind {
     match self {
+      #[cfg(ort_backend)]
       Self::Ort(b) => b.kind(),
       #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
       Self::Mlx(b) => b.kind(),
@@ -337,6 +361,7 @@ impl Backend for BackendImpl {
 
   fn make_cache(&self) -> Result<Self::Cache> {
     match self {
+      #[cfg(ort_backend)]
       Self::Ort(b) => Ok(EngineCache::Ort(b.make_cache()?)),
       #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
       Self::Mlx(b) => Ok(EngineCache::Mlx(b.make_cache()?)),
@@ -351,6 +376,7 @@ impl Backend for BackendImpl {
     height: u32,
   ) -> Result<ImagePlan> {
     match self {
+      #[cfg(ort_backend)]
       Self::Ort(b) => b.plan_image(preproc, index, width, height),
       #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
       Self::Mlx(b) => b.plan_image(preproc, index, width, height),
@@ -366,6 +392,7 @@ impl Backend for BackendImpl {
     image_positions: &[usize],
   ) -> Result<Self::Embeds> {
     match self {
+      #[cfg(ort_backend)]
       Self::Ort(b) => Ok(EngineEmbeds::Ort(b.prepare_prompt_embeds(
         preproc,
         input_ids,
@@ -386,6 +413,7 @@ impl Backend for BackendImpl {
 
   fn embed_one(&mut self, token_id: i64) -> Result<Self::Embeds> {
     match self {
+      #[cfg(ort_backend)]
       Self::Ort(b) => Ok(EngineEmbeds::Ort(b.embed_one(token_id)?)),
       #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
       Self::Mlx(b) => Ok(EngineEmbeds::Mlx(b.embed_one(token_id)?)),
@@ -399,6 +427,7 @@ impl Backend for BackendImpl {
     seq_len: usize,
   ) -> Result<Vec<f32>> {
     match (self, cache, embeds) {
+      #[cfg(ort_backend)]
       (Self::Ort(b), EngineCache::Ort(cache), EngineEmbeds::Ort(embeds)) => {
         b.decoder_step(cache, embeds, seq_len)
       }
@@ -409,8 +438,11 @@ impl Backend for BackendImpl {
       // A cross-variant (backend, cache, embeds) mix is unreachable: the engine
       // builds the cache + embeds from the SAME backend variant it dispatches
       // on, so the tuple is always all-Ort or all-Mlx. The wildcard keeps the
-      // match exhaustive across the platform-gated variant set.
-      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      // match exhaustive when BOTH arms are compiled in (macOS/arm64 with the
+      // `ort` feature on); everywhere else exactly one arm exists and is
+      // exhaustive by itself, so the wildcard is compiled out (an always-taken
+      // single arm plus this wildcard would be an unreachable-pattern error).
+      #[cfg(all(target_os = "macos", target_arch = "aarch64", ort_backend))]
       _ => Err(crate::error::Error::InvalidRequest(
         "backend / cache / embeds variant mismatch (internal invariant violation)",
       )),

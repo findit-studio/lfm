@@ -33,7 +33,7 @@ pub enum Error {
   Io(#[from] std::io::Error),
 
   /// `ort` session-build or session-run failure.
-  #[cfg(feature = "inference")]
+  #[cfg(all(feature = "inference", ort_backend))]
   #[error(transparent)]
   Ort(#[from] ort::Error),
 
@@ -44,7 +44,7 @@ pub enum Error {
 
   // ===== Session validation =====
   /// ONNX session input/output dtype or presence mismatch.
-  #[cfg(feature = "inference")]
+  #[cfg(all(feature = "inference", ort_backend))]
   #[error("session contract mismatch on {input}: expected {expected}, got {got:?}")]
   SessionContractMismatch {
     /// Outlet name (input/output).
@@ -56,7 +56,7 @@ pub enum Error {
   },
 
   /// ONNX session shape mismatch.
-  #[cfg(feature = "inference")]
+  #[cfg(all(feature = "inference", ort_backend))]
   #[error("session shape mismatch on {input}: expected {expected}, got {got:?}")]
   SessionShapeMismatch {
     /// Outlet name (input/output).
@@ -68,7 +68,7 @@ pub enum Error {
   },
 
   /// Decoder cache layer count or sparse-index mismatch.
-  #[cfg(feature = "inference")]
+  #[cfg(all(feature = "inference", ort_backend))]
   #[error(
     "decoder cache mismatch: expected {expected_conv} conv + {expected_attn} attn, \
      got {got_conv} conv + {got_attn} attn"
