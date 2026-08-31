@@ -11,6 +11,10 @@
 //! LFM_ONNX_PATH=/path/with/onnx-files-only \
 //!   cargo run --example smoke --features bundled,decoders -- /path/to/image.jpg "Describe this."
 //! ```
+//! On aarch64-macos, the `LFM_ONNX_PATH` door additionally needs `--features
+//! ort` (`ort` is optional there — MLX is the native road); `LFM_MODEL_PATH`
+//! needs no such feature since `Engine::from_dir` reports a named error if it
+//! resolves to an ONNX checkpoint without `ort` compiled in.
 
 #[cfg(feature = "inference")]
 fn main() -> lfm::Result<()> {
@@ -20,16 +24,17 @@ fn main() -> lfm::Result<()> {
 
   let mut engine = if let Ok(onnx_dir) = std::env::var("LFM_ONNX_PATH") {
     // Bundled tokenizer + configs path: supply only the ONNX directory.
-    #[cfg(feature = "bundled")]
+    #[cfg(all(feature = "bundled", ort_backend))]
     {
       lfm::Engine::from_onnx_dir(onnx_dir, lfm::Options::default())?
     }
-    #[cfg(not(feature = "bundled"))]
+    #[cfg(not(all(feature = "bundled", ort_backend)))]
     {
       let _ = onnx_dir;
       panic!(
-        "LFM_ONNX_PATH set but the `bundled` feature is not enabled; \
-              rebuild with --features bundled or use LFM_MODEL_PATH instead"
+        "LFM_ONNX_PATH set but `from_onnx_dir` is not compiled in; rebuild with \
+              --features bundled (and, on aarch64-macos, --features ort) or use \
+              LFM_MODEL_PATH instead"
       );
     }
   } else {

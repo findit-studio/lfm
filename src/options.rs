@@ -1,7 +1,13 @@
 //! Configuration types: `RequestOptions`, `ImageBudget`, `ThreadOptions`, `Options`.
 
-#[cfg(feature = "inference")]
-#[cfg_attr(docsrs, doc(cfg(feature = "inference")))]
+#[cfg(all(feature = "inference", ort_backend))]
+#[cfg_attr(
+  docsrs,
+  doc(cfg(any(
+    not(all(target_arch = "aarch64", target_os = "macos")),
+    feature = "ort"
+  )))
+)]
 pub use ort::session::builder::GraphOptimizationLevel;
 
 #[cfg(feature = "serde")]
@@ -569,9 +575,11 @@ impl Default for ThreadOptions {
 /// Which inference backend an [`Engine`](crate::Engine) runs on.
 ///
 /// The set is closed and framework-owned: `lfm` compiles the ONNX Runtime
-/// (`ort`) backend on every target and, on macOS/arm64 **only**, the MLX
-/// (`mlxrs`) Metal backend. It is `#[non_exhaustive]` so adding a third
-/// backend later is not a SemVer break.
+/// (`ort`) backend unconditionally on every target except macOS/arm64, where
+/// MLX (`mlxrs`) is the native road instead and `ort` becomes opt-in behind
+/// the `ort` feature (see `Cargo.toml`). The MLX (`mlxrs`) Metal backend
+/// itself is compiled **only** on macOS/arm64. It is `#[non_exhaustive]` so
+/// adding a third backend later is not a SemVer break.
 ///
 /// The type is used in both directions:
 ///
@@ -634,7 +642,7 @@ pub struct Options {
   /// filling it in is exactly right rather than a papered-over omission.
   #[cfg_attr(feature = "serde", serde(default))]
   backend: Option<BackendKind>,
-  #[cfg(feature = "inference")]
+  #[cfg(all(feature = "inference", ort_backend))]
   optimization_level: GraphOptLevelMirror,
 }
 
@@ -649,7 +657,7 @@ impl Options {
       image_budget: ImageBudget::new(),
       thread: ThreadOptions::new(),
       backend: None,
-      #[cfg(feature = "inference")]
+      #[cfg(all(feature = "inference", ort_backend))]
       optimization_level: GraphOptLevelMirror::Level1,
     }
   }
@@ -674,8 +682,14 @@ impl Options {
   }
 
   /// Returns the ORT graph optimization level.
-  #[cfg(feature = "inference")]
-  #[cfg_attr(docsrs, doc(cfg(feature = "inference")))]
+  #[cfg(all(feature = "inference", ort_backend))]
+  #[cfg_attr(
+    docsrs,
+    doc(cfg(any(
+      not(all(target_arch = "aarch64", target_os = "macos")),
+      feature = "ort"
+    )))
+  )]
   pub fn optimization_level(&self) -> GraphOptimizationLevel {
     self.optimization_level.into()
   }
@@ -718,8 +732,14 @@ impl Options {
   }
 
   /// Returns a copy with the given ORT graph optimization level.
-  #[cfg(feature = "inference")]
-  #[cfg_attr(docsrs, doc(cfg(feature = "inference")))]
+  #[cfg(all(feature = "inference", ort_backend))]
+  #[cfg_attr(
+    docsrs,
+    doc(cfg(any(
+      not(all(target_arch = "aarch64", target_os = "macos")),
+      feature = "ort"
+    )))
+  )]
   pub fn with_optimization_level(mut self, lvl: GraphOptimizationLevel) -> Self {
     self.optimization_level = lvl.into();
     self
@@ -748,8 +768,14 @@ impl Options {
   }
 
   /// Sets the ORT graph optimization level in place.
-  #[cfg(feature = "inference")]
-  #[cfg_attr(docsrs, doc(cfg(feature = "inference")))]
+  #[cfg(all(feature = "inference", ort_backend))]
+  #[cfg_attr(
+    docsrs,
+    doc(cfg(any(
+      not(all(target_arch = "aarch64", target_os = "macos")),
+      feature = "ort"
+    )))
+  )]
   pub fn set_optimization_level(&mut self, lvl: GraphOptimizationLevel) -> &mut Self {
     self.optimization_level = lvl.into();
     self
@@ -769,8 +795,14 @@ impl Default for Options {
 /// Serde-friendly mirror of [`GraphOptimizationLevel`] (which doesn't
 /// derive `Serialize`/`Deserialize` directly). Mirrors the siglip2/egemma
 /// pattern.
-#[cfg(feature = "inference")]
-#[cfg_attr(docsrs, doc(cfg(feature = "inference")))]
+#[cfg(all(feature = "inference", ort_backend))]
+#[cfg_attr(
+  docsrs,
+  doc(cfg(any(
+    not(all(target_arch = "aarch64", target_os = "macos")),
+    feature = "ort"
+  )))
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
@@ -787,7 +819,7 @@ enum GraphOptLevelMirror {
   All,
 }
 
-#[cfg(feature = "inference")]
+#[cfg(all(feature = "inference", ort_backend))]
 impl From<GraphOptimizationLevel> for GraphOptLevelMirror {
   fn from(v: GraphOptimizationLevel) -> Self {
     match v {
@@ -814,7 +846,7 @@ impl From<GraphOptimizationLevel> for GraphOptLevelMirror {
   }
 }
 
-#[cfg(feature = "inference")]
+#[cfg(all(feature = "inference", ort_backend))]
 impl From<GraphOptLevelMirror> for GraphOptimizationLevel {
   fn from(v: GraphOptLevelMirror) -> Self {
     match v {

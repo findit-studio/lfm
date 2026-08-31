@@ -48,13 +48,18 @@ use crate::{
   options::{BackendKind, ImageBudget, Options, RequestOptions},
   preproc::{ImagePlan, Preprocessor},
   runtime::{
-    backend::{Backend, BackendImpl, OrtBackend},
+    backend::{Backend, BackendImpl},
     checkpoint::{self, CheckpointLayout},
-    decoder::Decoder,
-    embed_tokens::EmbedTokens,
     sampler::{ConstrainedSampler, FreeSampler},
-    vision::VisionEncoder,
   },
+};
+
+// The ORT-backed component wrappers — `ort` is mandatory everywhere except
+// aarch64-macos, where it is optional behind the `ort` feature; see the
+// `ort_backend` cfg (build.rs) and the target tables in Cargo.toml.
+#[cfg(ort_backend)]
+use crate::runtime::{
+  backend::OrtBackend, decoder::Decoder, embed_tokens::EmbedTokens, vision::VisionEncoder,
 };
 
 use llguidance::{Constraint, ParserFactory, api::TopLevelGrammar};
@@ -153,13 +158,23 @@ impl Engine {
         requested: BackendKind::Mlx,
         reason: "the MLX backend is compiled only on macOS/arm64 (aarch64-apple-darwin)",
       }),
+      #[cfg(ort_backend)]
       _ => Self::from_onnx_checkpoint_dir(&dir, opts),
+      // `select_backend` has already refused an ONNX selection on aarch64-macos
+      // without the `ort` feature (via `require_backend_compiled`), so this arm
+      // is unreachable there; it keeps the match exhaustive across the
+      // platform-gated variant set, mirroring the Mlx arm above.
+      #[cfg(not(ort_backend))]
+      _ => Err(Error::BackendUnavailable {
+        requested: BackendKind::Onnx,
+        reason: "the ONNX (`ort`) backend is not compiled in on aarch64-apple-darwin without the `ort` feature — MLX is the native road here",
+      }),
     }
   }
 
   /// The ONNX half of [`Engine::from_dir`]: the strict drift validations
   /// against the bundled assets, then the three graphs.
-  #[cfg(feature = "bundled")]
+  #[cfg(all(feature = "bundled", ort_backend))]
   fn from_onnx_checkpoint_dir(dir: &Path, opts: Options) -> Result<Self> {
     // validate preprocessor_config.json
     // matches our hardcoded algorithm constants. A model directory
@@ -236,8 +251,17 @@ impl Engine {
   /// The tokenizer written to the temp directory (`$TMPDIR/lfm-bundled-<PID>/`)
   /// is never explicitly deleted; the OS cleans it up on next boot (standard
   /// behaviour for `std::env::temp_dir()`).
-  #[cfg(feature = "bundled")]
-  #[cfg_attr(docsrs, doc(cfg(feature = "bundled")))]
+  #[cfg(all(feature = "bundled", ort_backend))]
+  #[cfg_attr(
+    docsrs,
+    doc(cfg(all(
+      feature = "bundled",
+      any(
+        not(all(target_arch = "aarch64", target_os = "macos")),
+        feature = "ort"
+      )
+    )))
+  )]
   pub fn from_onnx_dir<P: AsRef<Path>>(onnx_dir: P, opts: Options) -> Result<Self> {
     let onnx = onnx_dir.as_ref();
     let tmp_tokenizer = write_bundled_tokenizer()?;
@@ -257,6 +281,18 @@ impl Engine {
   /// Always builds the ONNX/`ort` backend. The MLX (`mlxrs`) backend is reached
   /// only through the platform auto-routing in [`from_dir`](Self::from_dir) /
   /// [`from_mlx_dir`](Self::from_mlx_dir) — there is no user-facing backend knob.
+  ///
+  /// Requires `ort` to be compiled in: unconditional on every target except
+  /// aarch64-macos, where it needs the `ort` feature (MLX is the native road
+  /// there — see `Cargo.toml`).
+  #[cfg(ort_backend)]
+  #[cfg_attr(
+    docsrs,
+    doc(cfg(any(
+      not(all(target_arch = "aarch64", target_os = "macos")),
+      feature = "ort"
+    )))
+  )]
   pub fn from_paths(paths: EnginePaths, opts: Options) -> Result<Self> {
     // Validate budget BEFORE any expensive work. validate_image_tokenizer_contract
     // performs an O(max_tiles²) nested scan; without this guard, an invalid
@@ -789,18 +825,28 @@ fn select_backend(dir: &Path, pinned: Option<BackendKind>) -> Result<BackendKind
   }
 }
 
-/// Refuse a backend this target does not compile.
+/// Refuse a backend this build does not compile.
 ///
 /// `mlxrs` is a macOS/arm64-only target dependency, so an MLX checkpoint opened
 /// on any other host has no backend to run on. Naming that beats reporting a
 /// missing `onnx/vision_encoder.onnx`, which is what a directory of MLX files
-/// used to produce.
+/// used to produce. Symmetrically, `ort` is optional on aarch64-macos (behind
+/// the `ort` feature — MLX is the native road there), so an ONNX checkpoint
+/// opened there without that feature is named too, rather than failing deep
+/// inside a constructor that does not exist.
 fn require_backend_compiled(kind: BackendKind) -> Result<BackendKind> {
   #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
   if matches!(kind, BackendKind::Mlx) {
     return Err(Error::BackendUnavailable {
       requested: BackendKind::Mlx,
       reason: "the MLX backend is compiled only on macOS/arm64 (aarch64-apple-darwin)",
+    });
+  }
+  #[cfg(not(ort_backend))]
+  if matches!(kind, BackendKind::Onnx) {
+    return Err(Error::BackendUnavailable {
+      requested: BackendKind::Onnx,
+      reason: "the ONNX (`ort`) backend is not compiled in on aarch64-apple-darwin without the `ort` feature — MLX is the native road here",
     });
   }
   Ok(kind)
@@ -1108,7 +1154,11 @@ fn check_preprocessing_pixel_contract(cfg: &serde_json::Value) -> Result<()> {
 /// Used only by `from_dir` (where the model directory has the config alongside
 /// the ONNX files). `from_onnx_dir` uses bundled assets and our own constants
 /// by construction, so no drift is possible.
-#[cfg_attr(not(feature = "bundled"), allow(dead_code))]
+// Its only non-test caller, `from_onnx_checkpoint_dir`, is additionally
+// gated on `ort_backend` (the ONNX road needs `ort` compiled in); the
+// function body itself needs neither `ort` nor `bundled`-gated symbols, so
+// it stays present everywhere and is merely allowed dead when unused.
+#[cfg_attr(not(all(feature = "bundled", ort_backend)), allow(dead_code))]
 fn validate_preprocessor_config(path: &Path) -> Result<()> {
   let cfg = read_preprocessor_config(path)?;
   check_preprocessing_pixel_contract(&cfg)?;
@@ -1193,7 +1243,14 @@ fn validate_mlx_preprocessing_contract(path: &Path) -> Result<()> {
 ///   matching. The key is optional and **absent means `true`**, matching
 ///   upstream's own default (`config.py:87`) and the MLX road's config parse —
 ///   only an explicit `false` is refused.
-#[cfg(feature = "bundled")]
+// Its only non-test caller, `from_onnx_checkpoint_dir`, is additionally
+// gated on `ort_backend`; the body needs neither `ort` nor a `bundled`-gated
+// symbol (it compares against the plain `MODEL_CONTEXT_TOKENS` constant), so
+// — matching `validate_preprocessor_config` above — it stays present
+// everywhere and is merely allowed dead when unused, rather than a hard
+// presence gate that would also force every test call site to track
+// `ort_backend`.
+#[cfg_attr(not(all(feature = "bundled", ort_backend)), allow(dead_code))]
 fn validate_config_contract_matches_bundled(path: &Path) -> Result<()> {
   if !path.exists() {
     return Err(Error::InvalidRequest(
@@ -1377,7 +1434,9 @@ fn validate_tokenizer_matches_bundled(path: &Path) -> Result<()> {
 /// - **Content verification on reuse**: if the target file already
 ///   exists, verify its bytes match the bundled blob before reusing.
 ///   Mismatch → rewrite (same atomic dance).
-#[cfg(feature = "bundled")]
+// Only `from_onnx_dir` (ONNX-only; the MLX road has no bundled-tokenizer
+// door) calls this outside tests, so it needs `ort_backend` too.
+#[cfg(all(feature = "bundled", ort_backend))]
 fn write_bundled_tokenizer() -> Result<PathBuf> {
   use std::sync::Mutex;
   // hardening still had a TOCTOU
@@ -1464,7 +1523,9 @@ fn write_bundled_tokenizer() -> Result<PathBuf> {
 
 /// Simple content hash producing a 16-char hex string. Not crypto;
 /// just enough entropy to namespace bundled bytes by content.
-#[cfg(feature = "bundled")]
+///
+/// Only called from `write_bundled_tokenizer`, so it carries the same gate.
+#[cfg(all(feature = "bundled", ort_backend))]
 fn simple_hash_hex(bytes: &[u8]) -> String {
   // FNV-1a 64-bit
   let mut h: u64 = 0xcbf29ce484222325;
@@ -1647,10 +1708,12 @@ mod tests {
     // would loop ~∞ in the nested R×C scan and hang Engine
     // construction (a startup-DoS path).
     //
-    // Exercise via the bundled tokenizer (always available under the
-    // `bundled` feature, which gates this whole test file via the
-    // `inference + decoders` mod gate that engine.rs lives under).
-    #[cfg(feature = "bundled")]
+    // Exercise via the bundled tokenizer (available under `bundled` +
+    // `ort_backend` — `write_bundled_tokenizer` is the ONNX-only bundled
+    // tokenizer writer; on aarch64-macos without the `ort` feature this
+    // block is skipped and the cap behavior goes untested here, covered
+    // instead by the MLX-road strict-constructor tests).
+    #[cfg(all(feature = "bundled", ort_backend))]
     {
       let path = write_bundled_tokenizer().expect("write bundled tokenizer");
       let tokenizer = Tokenizer::from_file(&path).expect("load tokenizer");
