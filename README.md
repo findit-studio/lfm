@@ -3,12 +3,12 @@
 </div>
 <div align="center">
 
-Rust ONNX inference for [LiquidAI LFM2.5-VL][lfm-card] — a 450M-parameter vision-language model with schema-constrained sampling via [llguidance]. Implements the engine-agnostic [`llmtask::Task`] contract, so any `Task` written against `llmtask` runs through `lfm` unchanged.
+Rust ONNX/MLX inference for [LiquidAI LFM2.5-VL][lfm-card] — a 450M-parameter vision-language model with schema-constrained sampling via [llguidance]. Implements the engine-agnostic [`llmtask::Task`] contract, so any `Task` written against `llmtask` runs through `lfm` unchanged.
 
 [<img alt="github" src="https://img.shields.io/badge/github-findit--studio/lfm-8da0cb?style=for-the-badge&logo=Github" height="22">][Github-url]
 <img alt="LoC" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fgist.githubusercontent.com%2Fal8n%2F327b2a8aef9003246e45c6e47fe63937%2Fraw%2Flfm" height="22">
 [<img alt="Build" src="https://img.shields.io/github/actions/workflow/status/findit-studio/lfm/ci.yml?logo=Github-Actions&style=for-the-badge" height="22">][CI-url]
-[<img alt="codecov" src="https://img.shields.io/codecov/c/gh/findit-studio/lfm?style=for-the-badge&token=REPLACE_WITH_CODECOV_TOKEN&logo=codecov" height="22">][codecov-url]
+[<img alt="codecov" src="https://img.shields.io/codecov/c/gh/findit-studio/lfm?style=for-the-badge&logo=codecov" height="22">][codecov-url]
 
 [<img alt="docs.rs" src="https://img.shields.io/badge/docs.rs-lfm-66c2a5?style=for-the-badge&labelColor=555555&logo=data:image/svg+xml;base64,PHN2ZyByb2xlPSJpbWciIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyIgdmlld0JveD0iMCAwIDUxMiA1MTIiPjxwYXRoIGZpbGw9IiNmNWY1ZjUiIGQ9Ik00ODguNiAyNTAuMkwzOTIgMjE0VjEwNS41YzAtMTUtOS4zLTI4LjQtMjMuNC0zMy43bC0xMDAtMzcuNWMtOC4xLTMuMS0xNy4xLTMuMS0yNS4zIDBsLTEwMCAzNy41Yy0xNC4xIDUuMy0yMy40IDE4LjctMjMuNCAzMy43VjIxNGwtOTYuNiAzNi4yQzkuMyAyNTUuNSAwIDI2OC45IDAgMjgzLjlWMzk0YzAgMTMuNiA3LjcgMjYuMSAxOS45IDMyLjJsMTAwIDUwYzEwLjEgNS4xIDIyLjEgNS4xIDMyLjIgMGwxMDMuOS01MiAxMDMuOSA1MmMxMC4xIDUuMSAyMi4xIDUuMSAzMi4yIDBsMTAwLTUwYzEyLjItNi4xIDE5LjktMTguNiAxOS45LTMyLjJWMjgzLjljMC0xNS05LjMtMjguNC0yMy40LTMzLjd6TTM1OCAyMTQuOGwtODUgMzEuOXYtNjguMmw4NS0zN3Y3My4zek0xNTQgMTA0LjFsMTAyLTM4LjIgMTAyIDM4LjJ2LjZsLTEwMiA0MS40LTEwMi00MS40di0uNnptODQgMjkxLjFsLTg1IDQyLjV2LTc5LjFsODUtMzguOHY3NS40em0wLTExMmwtMTAyIDQxLjQtMTAyLTQxLjR2LS42bDEwMi0zOC4yIDEwMiAzOC4ydi42em0yNDAgMTEybC04NSA0Mi41di03OS4xbDg1LTM4Ljh2NzUuNHptMC0xMTJsLTEwMiA0MS40LTEwMi00MS40di0uNmwxMDItMzguMiAxMDIgMzguMnYuNnoiPjwvcGF0aD48L3N2Zz4K" height="20">][doc-url]
 [<img alt="crates.io" src="https://img.shields.io/crates/v/lfm?style=for-the-badge&logo=data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iaXNvLTg4NTktMSI/Pg0KPCEtLSBHZW5lcmF0b3I6IEFkb2JlIElsbHVzdHJhdG9yIDE5LjAuMCwgU1ZHIEV4cG9ydCBQbHVnLUluIC4gU1ZHIFZlcnNpb246IDYuMDAgQnVpbGQgMCkgIC0tPg0KPHN2ZyB2ZXJzaW9uPSIxLjEiIGlkPSJMYXllcl8xIiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHhtbG5zOnhsaW5rPSJodHRwOi8vd3d3LnczLm9yZy8xOTk5L3hsaW5rIiB4PSIwcHgiIHk9IjBweCINCgkgdmlld0JveD0iMCAwIDUxMiA1MTIiIHhtbDpzcGFjZT0icHJlc2VydmUiPg0KPGc+DQoJPGc+DQoJCTxwYXRoIGQ9Ik0yNTYsMEwzMS41MjgsMTEyLjIzNnYyODcuNTI4TDI1Niw1MTJsMjI0LjQ3Mi0xMTIuMjM2VjExMi4yMzZMMjU2LDB6IE0yMzQuMjc3LDQ1Mi41NjRMNzQuOTc0LDM3Mi45MTNWMTYwLjgxDQoJCQlsMTU5LjMwMyw3OS42NTFWNDUyLjU2NHogTTEwMS44MjYsMTI1LjY2MkwyNTYsNDguNTc2bDE1NC4xNzQsNzcuMDg3TDI1NiwyMDIuNzQ5TDEwMS44MjYsMTI1LjY2MnogTTQzNy4wMjYsMzcyLjkxMw0KCQkJbC0xNTkuMzAzLDc5LjY1MVYyNDAuNDYxbDE1OS4zMDMtNzkuNjUxVjM3Mi45MTN6IiBmaWxsPSIjRkZGIi8+DQoJPC9nPg0KPC9nPg0KPGc+DQo8L2c+DQo8Zz4NCjwvZz4NCjxnPg0KPC9nPg0KPGc+DQo8L2c+DQo8Zz4NCjwvZz4NCjxnPg0KPC9nPg0KPGc+DQo8L2c+DQo8Zz4NCjwvZz4NCjxnPg0KPC9nPg0KPGc+DQo8L2c+DQo8Zz4NCjwvZz4NCjxnPg0KPC9nPg0KPGc+DQo8L2c+DQo8L3N2Zz4NCg==" height="22">][crates-url]
@@ -19,33 +19,33 @@ Rust ONNX inference for [LiquidAI LFM2.5-VL][lfm-card] — a 450M-parameter visi
 
 ## Overview
 
-`lfm` is the [LiquidAI LFM2.5-VL][lfm-card] inference engine on Rust + ONNX Runtime + llguidance:
+`lfm` is the [LiquidAI LFM2.5-VL][lfm-card] inference engine on Rust + ONNX Runtime / MLX + llguidance:
 
-- **[`Engine`]** — sync, single-threaded; built on `ort` 2.0. `Engine::run<T: Task<Value = serde_json::Value>>` accepts any [`llmtask::Task`] whose grammar is JSON Schema, Lark, or Regex. Schema-constrained sampling is enforced by [llguidance] token-mask filtering. `Engine::generate` is the unconstrained path for free-form text.
-- **[`ImageAnalysisTask`]** — built-in image-analysis preset that produces the canonical [`llmtask::ImageAnalysis`] output type, sharing the schema and parser with [`qwen`].
+- **[`Engine`]** — sync, single-threaded; built on `ort` 2.0, with an MLX (Metal) backend auto-selected on Apple Silicon. `Engine::run<T: Task<Value = serde_json::Value>>` accepts any [`llmtask::Task`] whose grammar is JSON Schema, Lark, or Regex. Schema-constrained sampling is enforced by [llguidance] token-mask filtering. `Engine::generate` is the unconstrained path for free-form text.
+- **[`ImageAnalysisTask`]** — built-in image-analysis preset that produces the canonical [`llmtask::ImageAnalysis`] output type, sharing the schema and parser with [`qwen3-vl`].
 - **Bundled assets** — the `bundled` feature ships LFM2.5-VL's tokenizer, chat template, and preprocessor configs as `include_bytes!`. `Engine::from_onnx_dir` then accepts a directory containing only the three ONNX graphs; no separate tokenizer download required.
 - **Wasm-friendly preprocessing** — `preproc::Preprocessor`, `TileGrid`, and EXIF-aware decode helpers compile under `--no-default-features --features decoders` (no `ort`, no `tokenizers`).
 
-[`Engine`]: https://docs.rs/lfm/latest/lfm/engine/struct.Engine.html
-[`ImageAnalysisTask`]: https://docs.rs/lfm/latest/lfm/image_analysis/struct.ImageAnalysisTask.html
+[`Engine`]: https://docs.rs/lfm/latest/lfm/struct.Engine.html
+[`ImageAnalysisTask`]: https://docs.rs/lfm/latest/lfm/struct.ImageAnalysisTask.html
 [`llmtask::Task`]: https://docs.rs/llmtask/latest/llmtask/task/trait.Task.html
 [`llmtask::ImageAnalysis`]: https://docs.rs/llmtask/latest/llmtask/image_analysis/struct.ImageAnalysis.html
-[`qwen`]: https://docs.rs/qwen
+[`qwen3-vl`]: https://docs.rs/qwen3-vl
 [llguidance]: https://github.com/microsoft/llguidance
 
 ## Why an `llmtask`-driven engine?
 
-A bespoke `lfm::Task` would force every prompt + schema + parser to be rewritten against the next inference engine. Implementing [`llmtask::Task`] instead means the same `Task` code targets `lfm` (llguidance), [`qwen`] (mistralrs), or any future `llmtask`-compatible backend without modification — only the hardware backend selection differs.
+A bespoke `lfm::Task` would force every prompt + schema + parser to be rewritten against the next inference engine. Implementing [`llmtask::Task`] instead means the same `Task` code targets `lfm` (llguidance), [`qwen3-vl`] (mistralrs), or any future `llmtask`-compatible backend without modification — only the hardware backend selection differs.
 
 ```text
                                 ┌──────────────────────────┐
-   YourTask: impl Task   ──▶    │   llmtask::Task contract │   ──▶  lfm / qwen / …
+   YourTask: impl Task   ──▶    │   llmtask::Task contract │   ──▶  lfm / qwen3-vl / …
                                 │     prompt + Grammar     │
                                 │     parse → Output       │
                                 └──────────────────────────┘
 ```
 
-Because lfm's backend is llguidance, all three [`llmtask::Grammar`] variants (JSON Schema, Lark, Regex) are accepted — engines that only speak JSON Schema (e.g. `qwen`) reject the others via `UnsupportedGrammar`, and the caller can route to lfm.
+Because lfm's backend is llguidance, all three [`llmtask::Grammar`] variants (JSON Schema, Lark, Regex) are accepted — engines that only speak JSON Schema (e.g. `qwen3-vl`) reject the others via `UnsupportedGrammar`, and the caller can route to lfm.
 
 [`llmtask::Grammar`]: https://docs.rs/llmtask/latest/llmtask/grammar/enum.Grammar.html
 
@@ -140,7 +140,7 @@ fn main() -> lfm::Result<()> {
 
 ```toml
 [dependencies]
-lfm = "0.1"
+lfm = "0.2"
 ```
 
 Download the ONNX artifacts from [`LiquidAI/LFM2.5-VL-450M-ONNX`][lfm-card] and set `LFM_MODEL_PATH` to the directory containing them:
