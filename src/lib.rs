@@ -51,13 +51,33 @@ pub use error::{Error, Result};
 #[cfg(all(feature = "inference", ort_backend))]
 #[cfg_attr(
   docsrs,
-  doc(cfg(any(
-    not(all(target_arch = "aarch64", target_os = "macos")),
-    feature = "ort"
+  doc(cfg(all(
+    not(target_arch = "wasm32"),
+    any(
+      not(all(target_arch = "aarch64", target_os = "macos")),
+      feature = "ort"
+    )
   )))
 )]
 pub use options::GraphOptimizationLevel;
-pub use options::{BackendKind, ImageBudget, Options, RequestOptions, ThreadOptions};
+#[cfg(all(feature = "inference", target_os = "macos", target_arch = "aarch64"))]
+#[cfg_attr(docsrs, doc(cfg(all(target_os = "macos", target_arch = "aarch64"))))]
+pub use options::MlxOptions;
+#[cfg(all(feature = "inference", ort_backend))]
+#[cfg_attr(
+  docsrs,
+  doc(cfg(all(
+    not(target_arch = "wasm32"),
+    any(
+      not(all(target_arch = "aarch64", target_os = "macos")),
+      feature = "ort"
+    )
+  )))
+)]
+pub use options::OrtOptions;
+pub use options::{
+  AutoOptions, BackendKind, BackendOptions, ImageBudget, Options, RequestOptions, ThreadOptions,
+};
 #[cfg(feature = "decoders")]
 #[cfg_attr(docsrs, doc(cfg(feature = "decoders")))]
 pub use preproc::decode_bytes_with_orientation;

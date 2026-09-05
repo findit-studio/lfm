@@ -39,8 +39,15 @@ fn main() {
   let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
   let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
   let aarch64_macos = target_os == "macos" && target_arch == "aarch64";
+  // `ort-sys` publishes no prebuilt binaries for wasm32, so Cargo.toml's
+  // mandatory `ort` row excludes it and neither target table names it — the
+  // `ort` feature cannot conjure the dependency there either. This predicate
+  // must therefore mirror the manifest's target rows exactly, or `ort_backend`
+  // would gate code in on a target that has no `ort` crate to compile it
+  // against.
+  let wasm = target_arch == "wasm32";
   let ort_feature = env::var("CARGO_FEATURE_ORT").is_ok();
-  if !aarch64_macos || ort_feature {
+  if !wasm && (!aarch64_macos || ort_feature) {
     use_feature("ort_backend");
   }
 }

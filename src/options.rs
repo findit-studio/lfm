@@ -1,11 +1,57 @@
-//! Configuration types: `RequestOptions`, `ImageBudget`, `ThreadOptions`, `Options`.
+//! Configuration types: the [`Options`] document and the tiers it is built from.
+//!
+//! # The document is layered, and every layer defaults
+//!
+//! [`Options`] is one flat document with two tiers. The **top tier** holds
+//! what every backend shares — the sampler ([`RequestOptions`]) and the image
+//! preprocessing budget ([`ImageBudget`]). The **engine tier** is a single
+//! flattened field, [`BackendOptions`]: an internally tagged enum whose
+//! `backend` key both names the road and selects that road's own knob struct
+//! ([`AutoOptions`], `OrtOptions`, `MlxOptions`). Both tiers carry serde
+//! defaults, so a partial table such as `{ "backend": "mlx" }` fills the rest
+//! from each tier's own `new()` instead of being refused by the first missing
+//! field's name.
+//!
+//! ```text
+//! { "request": { .. }, "image_budget": { .. },   <- top tier: shared knobs
+//!   "backend": "onnx",                           <- the tag: picks the road
+//!   "thread": { .. }, "optimization_level": ".." }  <- that road's own knobs
+//! ```
+//!
+//! # What the shape refuses, and how it says so
+//!
+//! - **A road this build does not compile** is refused by the variant roster
+//!   itself — ``unknown variant `mlx`, expected `auto` or `onnx` ``. The
+//!   engine tiers are `cfg`-gated on their backend's presence (see
+//!   `Cargo.toml`'s target tables and the `ort_backend` cfg), so the roster in
+//!   that message *is* the list of roads this build can run.
+//! - **A misspelled engine knob** is refused by the variant struct's
+//!   `deny_unknown_fields` — ``unknown field `optimisation_level`, expected
+//!   `thread` or `optimization_level` ``.
+//! - **A misspelled *shared* knob** is refused by the same rule, because an
+//!   unmatched top-tier key falls through the flatten into the variant struct.
+//!   The refusal therefore names the *engine* tier's fields, not the top
+//!   tier's: `{ "backend": "mlx", "reqeust": {} }` reports ``unknown field
+//!   `reqeust`, there are no fields``. The key is refused, which is the point;
+//!   the field list in the message belongs to the tier that caught it.
+//! - **An engine knob under the wrong road** — `optimization_level` beside
+//!   `backend = "mlx"` — is refused the same way, rather than accepted and
+//!   ignored.
+//!
+//! Serde's flatten cannot supply a missing tag, so `backend` is a **required**
+//! key of the document: name the road, or name `"auto"` to leave the choice to
+//! the checkpoint layout. An absent `backend` is ``missing field `backend` ``.
+//! The consumer formats are JSON, YAML and TOML.
 
 #[cfg(all(feature = "inference", ort_backend))]
 #[cfg_attr(
   docsrs,
-  doc(cfg(any(
-    not(all(target_arch = "aarch64", target_os = "macos")),
-    feature = "ort"
+  doc(cfg(all(
+    not(target_arch = "wasm32"),
+    any(
+      not(all(target_arch = "aarch64", target_os = "macos")),
+      feature = "ort"
+    )
   )))
 )]
 pub use ort::session::builder::GraphOptimizationLevel;
@@ -28,6 +74,7 @@ use crate::error::{Error, Result};
 /// `RequestOptions::deterministic()` (greedy + retained repetition_penalty).
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 pub struct RequestOptions {
   temperature: f32,
   min_p: f32,
@@ -258,6 +305,7 @@ impl Default for RequestOptions {
 // single-tile — a real algorithmic-parity break.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 pub struct ImageBudget {
   min_image_tokens: usize,
   max_image_tokens: usize,
@@ -505,11 +553,34 @@ impl Default for ImageBudget {
 // =========================================================================
 
 /// ORT thread configuration. Mirrors siglip2/egemma `ThreadOptions`.
+///
+/// `deny_unknown_fields` because this is a **nested** table of the [`Options`]
+/// document and both its fields are `Option`: without it,
+/// `{ "backend": "onnx", "thread": { "intra_thread": 1 } }` would deserialize
+/// happily with both counts left at `None`, silently handing back ORT's
+/// defaults for a misspelled determinism control. Nesting is why the enclosing
+/// tier's own `deny_unknown_fields` cannot catch this — it does not recurse.
+///
+/// The counts are `u16` rather than `usize` so that an out-of-range request is
+/// refused by serde's own integer range check, at the field, in every format —
+/// not by a ceiling constant this crate would have to invent and enforce. See
+/// the fields for why that is the honest bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 pub struct ThreadOptions {
-  intra_threads: Option<usize>,
-  inter_threads: Option<usize>,
+  /// Both counts are `u16` so that "a value ORT can actually take" is a
+  /// property of the type rather than of a validation hook someone can forget
+  /// to call. `ort` forwards a thread count to the C API's signed `int`, so a
+  /// `usize` above `i32::MAX` wraps silently and a merely large one asks for a
+  /// per-session pool big enough to exhaust the process — and an `Engine`
+  /// builds three sessions. `u16` makes both unrepresentable: every value
+  /// converts to `i32`/`usize` losslessly and infallibly, so the session seam
+  /// needs no cast and no `try_from`. The 65 535 ceiling costs no documented
+  /// constant to justify — it is already far beyond any pool a session should
+  /// ask for, on any machine this crate runs on.
+  intra_threads: Option<u16>,
+  inter_threads: Option<u16>,
 }
 
 impl ThreadOptions {
@@ -531,32 +602,62 @@ impl ThreadOptions {
   }
 
   /// Returns the intra-op thread count (None = ort default).
-  pub const fn intra_threads(&self) -> Option<usize> {
+  pub const fn intra_threads(&self) -> Option<u16> {
     self.intra_threads
   }
-  /// Returns the inter-op thread count (None = ort default).
-  pub const fn inter_threads(&self) -> Option<usize> {
+  /// Returns the inter-op thread count (None = ort default). See
+  /// [`Self::with_inter_threads`] for what a count above 1 implies.
+  pub const fn inter_threads(&self) -> Option<u16> {
     self.inter_threads
   }
 
+  /// Whether this table asks for ort's **parallel** execution mode.
+  ///
+  /// ort's inter-op thread pool exists only in parallel execution mode: in the
+  /// default sequential mode `SetInterOpNumThreads` is accepted and ignored, so
+  /// a session built without this would take an `inter_threads` setting and
+  /// silently run single-graph-threaded anyway. Asking for more than one
+  /// inter-op thread is therefore also asking for parallel execution, and
+  /// `build_session` reads exactly this predicate.
+  ///
+  /// `None` and `Some(1)` are false: they keep the sequential mode, so
+  /// [`Self::deterministic`] (intra 1 / inter 1) and every other existing
+  /// recipe build byte-identically to before.
+  pub const fn requires_parallel_execution(&self) -> bool {
+    match self.inter_threads {
+      Some(n) => n > 1,
+      None => false,
+    }
+  }
+
   /// Returns a copy with the given intra-op thread count.
-  pub const fn with_intra_threads(mut self, v: usize) -> Self {
+  pub const fn with_intra_threads(mut self, v: u16) -> Self {
     self.intra_threads = Some(v);
     self
   }
   /// Returns a copy with the given inter-op thread count.
-  pub const fn with_inter_threads(mut self, v: usize) -> Self {
+  ///
+  /// **This knob also selects an execution mode.** `inter_threads > 1` turns on
+  /// ort's parallel execution mode, because that is the only mode in which an
+  /// inter-op thread pool exists; `1` or unset keeps the sequential mode, where
+  /// the knob has no meaning and ort ignores it. Parallel execution trades
+  /// higher memory use for concurrency across independent graph branches, and
+  /// it is not bit-stable — pair [`Self::deterministic`] with
+  /// [`RequestOptions::deterministic`] when reproducibility matters.
+  pub const fn with_inter_threads(mut self, v: u16) -> Self {
     self.inter_threads = Some(v);
     self
   }
 
   /// Sets the intra-op thread count in place.
-  pub fn set_intra_threads(&mut self, v: usize) -> &mut Self {
+  pub fn set_intra_threads(&mut self, v: u16) -> &mut Self {
     self.intra_threads = Some(v);
     self
   }
-  /// Sets the inter-op thread count in place.
-  pub fn set_inter_threads(&mut self, v: usize) -> &mut Self {
+  /// Sets the inter-op thread count in place. See
+  /// [`Self::with_inter_threads`] for the execution mode a count above 1
+  /// implies.
+  pub fn set_inter_threads(&mut self, v: u16) -> &mut Self {
     self.inter_threads = Some(v);
     self
   }
@@ -583,17 +684,24 @@ impl Default for ThreadOptions {
 ///
 /// The type is used in both directions:
 ///
-/// - as a **request** — [`Options::with_backend`] pins which backend
-///   [`Engine::from_dir`](crate::Engine::from_dir) must select, instead of
+/// - as a **request** — [`Options::backend_kind`] reports the pin the
+///   document's engine tier carries, and that pin is what
+///   [`Engine::from_dir`](crate::Engine::from_dir) must select instead of
 ///   letting the checkpoint layout decide. A pin that cannot be honoured
 ///   (the directory holds the other format, or the platform has no such
-///   backend) is [`Error::BackendUnavailable`](crate::Error::BackendUnavailable),
-///   never a silent substitution;
+///   backend) is [`Error::BackendUnavailable`],
+///   never a silent substitution. Which pins are even spellable is the
+///   [`BackendOptions`] roster's business: a backend this build did not
+///   compile has no variant to name it with;
 /// - as an **answer** — [`Engine::backend`](crate::Engine::backend) reports
 ///   which backend the constructed engine actually runs on, so auto-selection
 ///   is observable rather than opaque.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+// One vocabulary: the wire form is the same lower-case name `as_str` reports
+// and the same one `BackendOptions` uses as its tag, so a backend is spelled
+// identically in a document, in a diagnostic, and in `Engine::backend`.
+#[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
 #[non_exhaustive]
 pub enum BackendKind {
   /// The ONNX Runtime (`ort`) backend. Reads the `onnx/*.onnx` graphs;
@@ -622,43 +730,337 @@ impl core::fmt::Display for BackendKind {
 }
 
 // =========================================================================
-// Options (top-level)
+// Backend tiers: the per-engine knob structs
 // =========================================================================
 
-/// Top-level engine configuration.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// The knobs the auto-selected road carries: none.
+///
+/// `backend = "auto"` names no engine, so there is no engine-specific knob to
+/// set — [`Engine::from_dir`](crate::Engine::from_dir) reads the checkpoint
+/// layout and decides.
+///
+/// This is a zero-field **struct** rather than a bare unit variant on purpose.
+/// Serde's internally tagged representation lets a unit variant absorb every
+/// remaining key without complaint, so `{ "backend": "auto", "intra_threads":
+/// 1 }` would deserialize happily and drop the misplaced key on the floor. A
+/// struct carrying `deny_unknown_fields` refuses it by name instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct Options {
-  request: RequestOptions,
-  image_budget: ImageBudget,
+#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
+pub struct AutoOptions {}
+
+impl AutoOptions {
+  /// The only value this type has.
+  pub const fn new() -> Self {
+    Self {}
+  }
+}
+
+impl Default for AutoOptions {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+/// The ONNX Runtime road's own knobs.
+///
+/// Compiled with the ORT backend itself: `ort` is a mandatory dependency on
+/// every target except aarch64-macos, where MLX is the native road and `ort`
+/// is opt-in behind the `ort` feature (see `Cargo.toml`'s target tables and
+/// the `ort_backend` cfg `build.rs` emits). On a build without it, `onnx` is
+/// not in [`BackendOptions`]'s roster and a document naming it is refused.
+///
+/// Both knobs are ORT's alone — the MLX road runs on Metal and has no CPU
+/// thread budget or graph-optimization pass — which is why they live in this
+/// tier rather than beside the sampler and the image budget. Setting them
+/// therefore means naming the ONNX road: under `backend = "auto"` the ORT
+/// session is built from [`OrtOptions::new`].
+#[cfg(all(feature = "inference", ort_backend))]
+#[cfg_attr(
+  docsrs,
+  doc(cfg(all(
+    not(target_arch = "wasm32"),
+    any(
+      not(all(target_arch = "aarch64", target_os = "macos")),
+      feature = "ort"
+    )
+  )))
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
+pub struct OrtOptions {
   thread: ThreadOptions,
-  /// Explicit backend pin. `None` (the default) lets
-  /// [`Engine::from_dir`](crate::Engine::from_dir) choose from the checkpoint
-  /// layout; `Some(kind)` demands that backend and fails loudly when it cannot
-  /// be served.
-  ///
-  /// `#[serde(default)]` so an `Options` document written before this field
-  /// existed still deserializes — an absent pin IS the auto-select default, so
-  /// filling it in is exactly right rather than a papered-over omission.
-  #[cfg_attr(feature = "serde", serde(default))]
-  backend: Option<BackendKind>,
-  #[cfg(all(feature = "inference", ort_backend))]
   optimization_level: GraphOptLevelMirror,
 }
 
+#[cfg(all(feature = "inference", ort_backend))]
+impl OrtOptions {
+  /// Defaults: [`ThreadOptions::new`] (ort picks its own thread counts) and
+  /// `GraphOptimizationLevel::Level1` — matching siglip2/egemma, because
+  /// higher levels can subtly alter numerics.
+  pub const fn new() -> Self {
+    Self {
+      thread: ThreadOptions::new(),
+      optimization_level: GraphOptLevelMirror::Level1,
+    }
+  }
+
+  /// Indexing-safe single-threaded ORT: [`ThreadOptions::deterministic`] at
+  /// the same `Level1` optimization. Pair with
+  /// [`RequestOptions::deterministic`] for end-to-end bit-stability (a
+  /// CPU-only execution provider is the third requirement).
+  pub const fn deterministic() -> Self {
+    Self {
+      thread: ThreadOptions::deterministic(),
+      optimization_level: GraphOptLevelMirror::Level1,
+    }
+  }
+
+  /// Returns a reference to the ORT thread configuration.
+  pub const fn thread(&self) -> &ThreadOptions {
+    &self.thread
+  }
+
+  /// Returns the ORT graph optimization level.
+  pub fn optimization_level(&self) -> GraphOptimizationLevel {
+    self.optimization_level.into()
+  }
+
+  /// Returns a copy with the given thread configuration.
+  pub const fn with_thread(mut self, t: ThreadOptions) -> Self {
+    self.thread = t;
+    self
+  }
+
+  /// Returns a copy with the given ORT graph optimization level.
+  pub fn with_optimization_level(mut self, lvl: GraphOptimizationLevel) -> Self {
+    self.optimization_level = lvl.into();
+    self
+  }
+
+  /// Sets the thread configuration in place.
+  pub fn set_thread(&mut self, t: ThreadOptions) -> &mut Self {
+    self.thread = t;
+    self
+  }
+
+  /// Sets the ORT graph optimization level in place.
+  pub fn set_optimization_level(&mut self, lvl: GraphOptimizationLevel) -> &mut Self {
+    self.optimization_level = lvl.into();
+    self
+  }
+}
+
+#[cfg(all(feature = "inference", ort_backend))]
+impl Default for OrtOptions {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+/// The MLX (Metal) road's own knobs: none yet.
+///
+/// Compiled only on macOS/arm64, where the `mlxrs` target dependency exists;
+/// elsewhere `mlx` is not in [`BackendOptions`]'s roster and a document naming
+/// it is refused by that roster.
+///
+/// The MLX backend takes its model dimensions, tiling and quantization scheme
+/// from the checkpoint's own `config.json`, so it has no knob to expose today.
+/// The tier is here anyway: it is the seat a future MLX knob lands in without
+/// reshaping the document, and — being a struct with `deny_unknown_fields`
+/// rather than a unit variant — it is what refuses an ORT knob (or a
+/// misspelled shared one) written beside `backend = "mlx"`.
+#[cfg(all(feature = "inference", target_os = "macos", target_arch = "aarch64"))]
+#[cfg_attr(docsrs, doc(cfg(all(target_os = "macos", target_arch = "aarch64"))))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
+pub struct MlxOptions {}
+
+#[cfg(all(feature = "inference", target_os = "macos", target_arch = "aarch64"))]
+impl MlxOptions {
+  /// The only value this type has.
+  pub const fn new() -> Self {
+    Self {}
+  }
+}
+
+#[cfg(all(feature = "inference", target_os = "macos", target_arch = "aarch64"))]
+impl Default for MlxOptions {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+// =========================================================================
+// BackendOptions — the engine tier of the document
+// =========================================================================
+
+/// Which road runs, together with that road's own knobs — the engine tier of
+/// the [`Options`] document, flattened into it.
+///
+/// Serialized as an **internally tagged** enum under the key `backend`, so one
+/// key both names the road and selects the knob struct that road owns:
+///
+/// ```text
+/// backend = "auto"                     # AutoOptions   — no engine knobs
+/// backend = "onnx"                     # OrtOptions    — thread, optimization_level
+/// backend = "mlx"                      # MlxOptions    — none yet
+/// ```
+///
+/// The variants are `cfg`-gated on their backend's presence, so the roster
+/// serde reports in `unknown variant ...` is exactly the set of roads this
+/// build can run. `#[non_exhaustive]` because that set is platform- and
+/// feature-dependent (and because a third backend later must not be a SemVer
+/// break): match with a wildcard arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(tag = "backend", rename_all = "lowercase"))]
+#[non_exhaustive]
+pub enum BackendOptions {
+  /// Let [`Engine::from_dir`](crate::Engine::from_dir) choose from the
+  /// checkpoint layout. The default.
+  Auto(AutoOptions),
+  /// Pin the ONNX Runtime road and carry its knobs.
+  #[cfg(all(feature = "inference", ort_backend))]
+  #[cfg_attr(
+    docsrs,
+    doc(cfg(all(
+      not(target_arch = "wasm32"),
+      any(
+        not(all(target_arch = "aarch64", target_os = "macos")),
+        feature = "ort"
+      )
+    )))
+  )]
+  Onnx(OrtOptions),
+  /// Pin the MLX (Metal) road and carry its knobs.
+  #[cfg(all(feature = "inference", target_os = "macos", target_arch = "aarch64"))]
+  #[cfg_attr(docsrs, doc(cfg(all(target_os = "macos", target_arch = "aarch64"))))]
+  Mlx(MlxOptions),
+}
+
+impl BackendOptions {
+  /// Auto-selection: the checkpoint layout decides. The default.
+  pub const fn auto() -> Self {
+    Self::Auto(AutoOptions::new())
+  }
+
+  /// Pin the ONNX Runtime road with the given knobs.
+  #[cfg(all(feature = "inference", ort_backend))]
+  #[cfg_attr(
+    docsrs,
+    doc(cfg(all(
+      not(target_arch = "wasm32"),
+      any(
+        not(all(target_arch = "aarch64", target_os = "macos")),
+        feature = "ort"
+      )
+    )))
+  )]
+  pub const fn onnx(opts: OrtOptions) -> Self {
+    Self::Onnx(opts)
+  }
+
+  /// Pin the MLX (Metal) road with the given knobs.
+  #[cfg(all(feature = "inference", target_os = "macos", target_arch = "aarch64"))]
+  #[cfg_attr(docsrs, doc(cfg(all(target_os = "macos", target_arch = "aarch64"))))]
+  pub const fn mlx(opts: MlxOptions) -> Self {
+    Self::Mlx(opts)
+  }
+
+  /// The pinned backend, or `None` when the road is left to the checkpoint
+  /// layout.
+  ///
+  /// A pin that cannot be served — the directory holds only the other
+  /// format's checkpoint — is
+  /// [`Error::BackendUnavailable`], never a
+  /// silent substitution. A pin on a road this build does not compile cannot
+  /// be spelled at all: the variant is not there.
+  pub const fn kind(&self) -> Option<BackendKind> {
+    match self {
+      Self::Auto(_) => None,
+      #[cfg(all(feature = "inference", ort_backend))]
+      Self::Onnx(_) => Some(BackendKind::Onnx),
+      #[cfg(all(feature = "inference", target_os = "macos", target_arch = "aarch64"))]
+      Self::Mlx(_) => Some(BackendKind::Mlx),
+    }
+  }
+
+  /// The ORT knobs this tier carries, or `None` when it does not name the
+  /// ONNX road.
+  #[cfg(all(feature = "inference", ort_backend))]
+  #[cfg_attr(
+    docsrs,
+    doc(cfg(all(
+      not(target_arch = "wasm32"),
+      any(
+        not(all(target_arch = "aarch64", target_os = "macos")),
+        feature = "ort"
+      )
+    )))
+  )]
+  pub const fn ort_options(&self) -> Option<&OrtOptions> {
+    match self {
+      Self::Onnx(o) => Some(o),
+      _ => None,
+    }
+  }
+
+  /// The MLX knobs this tier carries, or `None` when it does not name the MLX
+  /// road.
+  #[cfg(all(feature = "inference", target_os = "macos", target_arch = "aarch64"))]
+  #[cfg_attr(docsrs, doc(cfg(all(target_os = "macos", target_arch = "aarch64"))))]
+  pub const fn mlx_options(&self) -> Option<&MlxOptions> {
+    match self {
+      Self::Mlx(m) => Some(m),
+      _ => None,
+    }
+  }
+}
+
+impl Default for BackendOptions {
+  fn default() -> Self {
+    Self::auto()
+  }
+}
+
+// =========================================================================
+// Options (top-level)
+// =========================================================================
+
+/// Top-level engine configuration: the shared tier, plus the engine tier
+/// flattened into the same document.
+///
+/// See the [module note](crate::options) for the document's shape, its
+/// defaulting rules and the exact text of each refusal.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+// Every tier defaults, so a partial document fills the rest from `new()`
+// instead of being refused by the first missing field's name. The flatten
+// below is why this struct cannot also carry `deny_unknown_fields` (serde
+// forbids the pair); an unmatched key is refused by the engine tier's own
+// `deny_unknown_fields` instead — see the module note.
+#[cfg_attr(feature = "serde", serde(default))]
+pub struct Options {
+  request: RequestOptions,
+  image_budget: ImageBudget,
+  /// The engine tier. Flattened, so its `backend` tag and the selected
+  /// road's knobs sit at the document's top level beside the shared ones.
+  #[cfg_attr(feature = "serde", serde(flatten))]
+  backend: BackendOptions,
+}
+
 impl Options {
-  /// Defaults: `RequestOptions::deterministic()`, `ImageBudget::new()`,
-  /// `ThreadOptions::default()`, no backend pin (auto-select),
-  /// `GraphOptimizationLevel::Level1`
-  /// (matches siglip2/egemma — higher levels can subtly alter numerics).
+  /// Defaults: `RequestOptions::deterministic()`, `ImageBudget::new()`, and
+  /// [`BackendOptions::auto`] — the checkpoint layout picks the road, and
+  /// that road runs on its own tier's defaults.
   pub const fn new() -> Self {
     Self {
       request: RequestOptions::deterministic(),
       image_budget: ImageBudget::new(),
-      thread: ThreadOptions::new(),
-      backend: None,
-      #[cfg(all(feature = "inference", ort_backend))]
-      optimization_level: GraphOptLevelMirror::Level1,
+      backend: BackendOptions::auto(),
     }
   }
 
@@ -670,28 +1072,38 @@ impl Options {
   pub const fn image_budget(&self) -> &ImageBudget {
     &self.image_budget
   }
-  /// Returns a reference to the ORT thread configuration.
-  pub const fn thread(&self) -> &ThreadOptions {
-    &self.thread
+
+  /// Returns a reference to the engine tier: the road and its own knobs.
+  pub const fn backend(&self) -> &BackendOptions {
+    &self.backend
   }
 
   /// The explicit backend pin, or `None` when the backend is auto-selected
   /// from the checkpoint layout (the default).
-  pub const fn backend(&self) -> Option<BackendKind> {
-    self.backend
+  pub const fn backend_kind(&self) -> Option<BackendKind> {
+    self.backend.kind()
   }
 
-  /// Returns the ORT graph optimization level.
+  /// The ORT knobs this configuration runs the ONNX road with: the ones the
+  /// engine tier carries when it names `onnx`, and [`OrtOptions::new`]
+  /// otherwise — a document that leaves the road to the checkpoint layout
+  /// cannot have tuned a road it did not name.
   #[cfg(all(feature = "inference", ort_backend))]
   #[cfg_attr(
     docsrs,
-    doc(cfg(any(
-      not(all(target_arch = "aarch64", target_os = "macos")),
-      feature = "ort"
+    doc(cfg(all(
+      not(target_arch = "wasm32"),
+      any(
+        not(all(target_arch = "aarch64", target_os = "macos")),
+        feature = "ort"
+      )
     )))
   )]
-  pub fn optimization_level(&self) -> GraphOptimizationLevel {
-    self.optimization_level.into()
+  pub const fn effective_ort_options(&self) -> OrtOptions {
+    match self.backend.ort_options() {
+      Some(o) => *o,
+      None => OrtOptions::new(),
+    }
   }
 
   /// Returns a copy with the given sampler configuration.
@@ -704,44 +1116,25 @@ impl Options {
     self.image_budget = b;
     self
   }
-  /// Returns a copy with the given thread configuration.
-  pub const fn with_thread(mut self, t: ThreadOptions) -> Self {
-    self.thread = t;
-    self
-  }
 
-  /// Returns a copy that pins the backend
-  /// [`Engine::from_dir`](crate::Engine::from_dir) must select.
+  /// Returns a copy carrying the given engine tier.
   ///
+  /// This is how a road is pinned:
+  /// `Options::new().with_backend(BackendOptions::mlx(MlxOptions::new()))`.
   /// A pin that cannot be served — the directory holds only the other
-  /// format's checkpoint, or the platform does not compile the requested
-  /// backend — is
-  /// [`Error::BackendUnavailable`](crate::Error::BackendUnavailable). A pin is
+  /// format's checkpoint — is
+  /// [`Error::BackendUnavailable`]. A pin is
   /// also how a directory that carries BOTH an ONNX graph set and an MLX
   /// weight set is resolved deliberately instead of by the default
   /// ONNX-graph-wins rule.
-  pub const fn with_backend(mut self, kind: BackendKind) -> Self {
-    self.backend = Some(kind);
+  pub const fn with_backend(mut self, backend: BackendOptions) -> Self {
+    self.backend = backend;
     self
   }
 
   /// Returns a copy with the backend pin cleared (back to auto-selection).
   pub const fn with_auto_backend(mut self) -> Self {
-    self.backend = None;
-    self
-  }
-
-  /// Returns a copy with the given ORT graph optimization level.
-  #[cfg(all(feature = "inference", ort_backend))]
-  #[cfg_attr(
-    docsrs,
-    doc(cfg(any(
-      not(all(target_arch = "aarch64", target_os = "macos")),
-      feature = "ort"
-    )))
-  )]
-  pub fn with_optimization_level(mut self, lvl: GraphOptimizationLevel) -> Self {
-    self.optimization_level = lvl.into();
+    self.backend = BackendOptions::auto();
     self
   }
 
@@ -755,29 +1148,10 @@ impl Options {
     self.image_budget = b;
     self
   }
-  /// Sets the thread sub-config in place.
-  pub fn set_thread(&mut self, t: ThreadOptions) -> &mut Self {
-    self.thread = t;
-    self
-  }
 
-  /// Sets (or, with `None`, clears) the backend pin in place.
-  pub fn set_backend(&mut self, kind: Option<BackendKind>) -> &mut Self {
-    self.backend = kind;
-    self
-  }
-
-  /// Sets the ORT graph optimization level in place.
-  #[cfg(all(feature = "inference", ort_backend))]
-  #[cfg_attr(
-    docsrs,
-    doc(cfg(any(
-      not(all(target_arch = "aarch64", target_os = "macos")),
-      feature = "ort"
-    )))
-  )]
-  pub fn set_optimization_level(&mut self, lvl: GraphOptimizationLevel) -> &mut Self {
-    self.optimization_level = lvl.into();
+  /// Sets the engine tier in place.
+  pub fn set_backend(&mut self, backend: BackendOptions) -> &mut Self {
+    self.backend = backend;
     self
   }
 }
@@ -798,9 +1172,12 @@ impl Default for Options {
 #[cfg(all(feature = "inference", ort_backend))]
 #[cfg_attr(
   docsrs,
-  doc(cfg(any(
-    not(all(target_arch = "aarch64", target_os = "macos")),
-    feature = "ort"
+  doc(cfg(all(
+    not(target_arch = "wasm32"),
+    any(
+      not(all(target_arch = "aarch64", target_os = "macos")),
+      feature = "ort"
+    )
   )))
 )]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -863,32 +1240,80 @@ impl From<GraphOptLevelMirror> for GraphOptimizationLevel {
 mod tests {
   use super::*;
 
-  /// An `Options` document written before the backend pin existed still
-  /// deserializes: an absent `backend` key means auto-select, which is the
-  /// default the field carries anyway.
+  /// `backend` is a required key of the document. Serde's flatten cannot
+  /// supply a missing tag for an internally tagged enum, so the tier that
+  /// names the road has no absent form — `"auto"` is how a document says
+  /// "let the checkpoint layout decide". The refusal names the key.
   #[test]
   #[cfg(feature = "serde")]
-  fn options_deserialize_without_backend_key() {
+  fn options_document_requires_the_backend_key() {
     let json = serde_json::to_value(Options::new()).expect("serialize Options");
     let mut map = json.as_object().expect("object").clone();
-    assert!(
-      map.remove("backend").is_some(),
-      "the field must be present when serialized"
+    assert_eq!(
+      map.remove("backend"),
+      Some(serde_json::Value::String("auto".into())),
+      "the default document names the auto road"
     );
-    let restored: Options =
-      serde_json::from_value(serde_json::Value::Object(map)).expect("deserialize without backend");
-    assert_eq!(restored.backend(), None);
-    assert_eq!(restored, Options::new());
+    let err = serde_json::from_value::<Options>(serde_json::Value::Object(map))
+      .expect_err("a document with no backend key must be refused");
+    assert!(
+      err.to_string().starts_with("missing field `backend`"),
+      "unexpected refusal: {err}"
+    );
   }
 
-  /// A pin round-trips through serde as the backend's own name.
+  /// The auto road round-trips, and carries no engine knobs.
   #[test]
   #[cfg(feature = "serde")]
-  fn backend_pin_round_trips() {
-    let opts = Options::new().with_backend(BackendKind::Mlx);
+  fn auto_backend_round_trips() {
+    let opts = Options::new();
     let json = serde_json::to_string(&opts).expect("serialize");
     let back: Options = serde_json::from_str(&json).expect("deserialize");
-    assert_eq!(back.backend(), Some(BackendKind::Mlx));
+    assert_eq!(back, opts);
+    assert_eq!(back.backend_kind(), None);
+    assert_eq!(*back.backend(), BackendOptions::auto());
+  }
+
+  /// A pin round-trips through serde as the backend's own lower-case name —
+  /// the same one `BackendKind::as_str` reports.
+  #[test]
+  #[cfg(all(
+    feature = "serde",
+    feature = "inference",
+    target_os = "macos",
+    target_arch = "aarch64"
+  ))]
+  fn mlx_pin_round_trips() {
+    let opts = Options::new().with_backend(BackendOptions::mlx(MlxOptions::new()));
+    let json = serde_json::to_string(&opts).expect("serialize");
+    assert!(
+      json.contains(r#""backend":"mlx""#),
+      "the tag is the backend's own name: {json}"
+    );
+    let back: Options = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back.backend_kind(), Some(BackendKind::Mlx));
+    assert_eq!(back, opts);
+  }
+
+  /// The ONNX tier carries its own knobs, and they survive the round-trip
+  /// flattened beside the shared ones.
+  #[test]
+  #[cfg(all(feature = "serde", feature = "inference", ort_backend))]
+  fn onnx_tier_round_trips_with_its_knobs() {
+    let opts = Options::new().with_backend(BackendOptions::onnx(OrtOptions::deterministic()));
+    let json = serde_json::to_string(&opts).expect("serialize");
+    let back: Options = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back, opts);
+    let ort = back.backend().ort_options().expect("the onnx tier");
+    assert_eq!(ort.thread().intra_threads(), Some(1));
+    // Under `auto` the ORT road runs on its own tier's defaults, not on the
+    // knobs a document never named a road to carry.
+    assert_eq!(
+      Options::new().effective_ort_options(),
+      OrtOptions::new(),
+      "auto cannot have tuned a road it did not name"
+    );
+    assert_eq!(back.effective_ort_options(), OrtOptions::deterministic());
   }
 
   // ===== RequestOptions =====
@@ -1037,6 +1462,61 @@ mod tests {
 
   // ===== ImageBudget =====
 
+  // ===== ThreadOptions: the execution-mode rule =====
+
+  /// `build_session` cannot be unit-tested without a real graph — it ends at
+  /// `commit_from_file` — so the rule it reads lives here, where it can be.
+  /// ort's inter-op pool exists only in parallel execution mode, so a count
+  /// above 1 must select that mode or be inert; 1 and unset must NOT, or every
+  /// existing recipe would silently change execution mode.
+  #[test]
+  fn inter_threads_above_one_asks_for_parallel_execution() {
+    assert!(
+      ThreadOptions::new()
+        .with_inter_threads(2)
+        .requires_parallel_execution()
+    );
+    assert!(
+      ThreadOptions::new()
+        .with_inter_threads(8)
+        .requires_parallel_execution()
+    );
+
+    assert!(!ThreadOptions::new().requires_parallel_execution());
+    assert!(
+      !ThreadOptions::new()
+        .with_inter_threads(1)
+        .requires_parallel_execution()
+    );
+    // 0 is ort's "you choose" and stays sequential rather than turning the
+    // mode on with no thread budget to run it.
+    assert!(
+      !ThreadOptions::new()
+        .with_inter_threads(0)
+        .requires_parallel_execution()
+    );
+    // The intra-op count never selects the execution mode.
+    assert!(
+      !ThreadOptions::new()
+        .with_intra_threads(16)
+        .requires_parallel_execution()
+    );
+  }
+
+  /// The bit-stability preset must stay sequential: it is what the crate's
+  /// determinism docs promise, and parallel execution is not bit-stable.
+  #[test]
+  fn the_deterministic_thread_preset_stays_sequential() {
+    assert_eq!(ThreadOptions::deterministic().inter_threads(), Some(1));
+    assert!(!ThreadOptions::deterministic().requires_parallel_execution());
+    #[cfg(all(feature = "inference", ort_backend))]
+    assert!(
+      !OrtOptions::deterministic()
+        .thread()
+        .requires_parallel_execution()
+    );
+  }
+
   #[test]
   fn image_budget_new_matches_preprocessor_config() {
     let b = ImageBudget::new();
@@ -1155,6 +1635,7 @@ mod tests {
     req::<RequestOptions>();
     req::<ImageBudget>();
     req::<ThreadOptions>();
+    req::<BackendOptions>();
     req::<Options>();
   }
 }
