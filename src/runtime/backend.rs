@@ -23,9 +23,11 @@ use crate::{
   preproc::{ImagePlan, Preprocessor},
 };
 
-// The ORT-backed component wrappers — `ort` is mandatory everywhere except
-// aarch64-macos, where it is optional behind the `ort` feature; see the
-// `ort_backend` cfg (build.rs) and the target tables in Cargo.toml.
+// The ORT-backed component wrappers — `ort` is mandatory on the ALLOW-listed
+// targets (Linux x86_64/aarch64-gnu, Windows x86_64/aarch64-msvc) and optional on
+// aarch64-apple-darwin behind the `ort` feature; every other target compiles
+// neither. See the `ort_backend` cfg (build.rs) and the target tables in
+// Cargo.toml.
 #[cfg(ort_backend)]
 use crate::runtime::{
   decoder::{Decoder, KvCache},
@@ -137,9 +139,10 @@ impl OrtEmbeds {
 /// (vision encoder, embed-tokens, decoder); embeds are host `Vec<f32>`
 /// and the cache is the ONNX [`KvCache`].
 ///
-/// `ort` is mandatory on every target except aarch64-macos, where it is
-/// optional behind the `ort` feature (see `Cargo.toml`) — hence the
-/// `ort_backend` gate on this whole type.
+/// `ort` is mandatory on the ALLOW-listed targets (Linux x86_64/aarch64-gnu,
+/// Windows x86_64/aarch64-msvc) and optional on aarch64-apple-darwin behind the `ort`
+/// feature (see `Cargo.toml`) — hence the `ort_backend` gate on this whole
+/// type.
 #[cfg(ort_backend)]
 pub(crate) struct OrtBackend {
   vision: VisionEncoder,
@@ -289,13 +292,22 @@ impl Backend for OrtBackend {
 /// The backend [`Engine`](crate::Engine) drives generation through.
 ///
 /// The ORT variant is compiled whenever `ort_backend` holds — mandatory on
-/// every target except aarch64-macos, opt-in there behind the `ort` feature
-/// (see `Cargo.toml`). On Apple Silicon a second on-device
+/// the ALLOW-listed targets (Linux x86_64/aarch64-gnu, Windows x86_64/aarch64-msvc),
+/// opt-in on aarch64-apple-darwin behind the `ort` feature (see `Cargo.toml`). On
+/// Apple Silicon a second on-device
 /// [`MlxBackend`](crate::runtime::mlx_backend::MlxBackend) arm is ALWAYS
 /// compiled in and auto-selected by checkpoint shape (see
-/// [`Engine::from_dir`](crate::Engine)); at least one of the two arms is
-/// always present (Ort everywhere it isn't aarch64-macos; Mlx everywhere it
-/// is), so the enum is never empty. The enum implements [`Backend`] by
+/// [`Engine::from_dir`](crate::Engine)); on the allow-listed targets and on
+/// aarch64-apple-darwin, at least one of the two arms is present. Outside both
+/// groups — e.g. `x86_64-apple-darwin` with the `inference` feature on —
+/// `BackendImpl` has ZERO variants: `backend_available` (build.rs) is false
+/// there, and the [`Backend`] impl below adds one `#[cfg(not(backend_available))]`
+/// fallback arm per method for exactly that case (see the comment on
+/// [`Backend::kind`] for why the fallback has to exist at all, not merely
+/// document the gap). No `Engine` constructor ever actually reaches such a
+/// value, though: `Engine::from_dir` and `require_backend_compiled`
+/// (`engine.rs`) refuse with `Error::BackendUnavailable` first, under the
+/// same condition. The enum implements [`Backend`] by
 /// delegating to the active variant, so [`generate`](crate::generate::generate)
 /// stays generic over [`Backend`]. The associated [`Backend::Embeds`] /
 /// [`Backend::Cache`] types are themselves enums ([`EngineEmbeds`] /
@@ -308,10 +320,7 @@ impl Backend for OrtBackend {
 /// not a layout concern — hence the `large_enum_variant` allow when both
 /// variants are compiled in. The larger MLX model is still boxed to keep the
 /// moved-around enum small.
-#[cfg_attr(
-  all(target_os = "macos", target_arch = "aarch64", ort_backend),
-  allow(clippy::large_enum_variant)
-)]
+#[cfg_attr(all(mlx_backend, ort_backend), allow(clippy::large_enum_variant))]
 pub(crate) enum BackendImpl {
   /// ONNX/`ort` backend.
   #[cfg(ort_backend)]
@@ -320,7 +329,7 @@ pub(crate) enum BackendImpl {
   /// [`Lfm2Vl`](mlxrs::vlm::models::lfm2_vl::Lfm2Vl) model is much larger than
   /// the ORT variant's session handles; boxing keeps `BackendImpl` small (one
   /// `Engine` holds exactly one backend, so the indirection cost is negligible).
-  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  #[cfg(mlx_backend)]
   Mlx(Box<crate::runtime::mlx_backend::MlxBackend>),
 }
 
@@ -331,7 +340,7 @@ pub(crate) enum EngineEmbeds {
   #[cfg(ort_backend)]
   Ort(OrtEmbeds),
   /// On-device mlx [`Array`](mlxrs::Array) embeds for the MLX backend.
-  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  #[cfg(mlx_backend)]
   Mlx(mlxrs::Array),
 }
 
@@ -342,7 +351,7 @@ pub(crate) enum EngineCache {
   #[cfg(ort_backend)]
   Ort(KvCache),
   /// The LFM2 heterogeneous per-layer KV/conv cache for the MLX backend.
-  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  #[cfg(mlx_backend)]
   Mlx(Vec<Box<dyn mlxrs::lm::cache::KvCache>>),
 }
 
@@ -354,8 +363,38 @@ impl Backend for BackendImpl {
     match self {
       #[cfg(ort_backend)]
       Self::Ort(b) => b.kind(),
-      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      #[cfg(mlx_backend)]
       Self::Mlx(b) => b.kind(),
+      // `backend_available` (build.rs) is false on a target outside the ORT
+      // allow-list that is also not aarch64-apple-darwin — e.g. `x86_64-apple-darwin`
+      // with the `inference` feature on. The allow-list conversion (D8) made
+      // this a real, reachable build configuration rather than a
+      // hypothetical one: both arms above are `#[cfg]`-gated out and
+      // `BackendImpl` has zero variants there.
+      //
+      // Rust still requires this match to be exhaustive, because a
+      // REFERENCE is always considered inhabited regardless of the
+      // referent's own inhabitedness (`rustc --explain E0004`: "references
+      // are always considered inhabited") — `&BackendImpl` is never "empty"
+      // to the exhaustiveness checker even when `BackendImpl` itself
+      // provably is, so an empty `match self {}` here is refused as
+      // non-exhaustive rather than accepted as dead code. `match *self {}`
+      // dereferences first: `*self: BackendImpl` IS the provably-uninhabited
+      // value type, so the empty match is accepted there — and unlike
+      // `unreachable!()`, the compiler itself verifies this can never
+      // execute rather than merely trusting an assertion. It cannot execute
+      // in practice either way: every `Engine` constructor already refuses
+      // with `Error::BackendUnavailable` before a `BackendImpl` value would
+      // need to exist on such a target (see `engine.rs`'s `from_dir` and
+      // `require_backend_compiled`, gated on the same `backend_available`
+      // condition spelled as `not(ort_backend) && not(macos-aarch64)`).
+      //
+      // The other five methods below hit the same zero-arm case; each adds
+      // its own `#[cfg(not(backend_available))]` fallback (an `Err` where
+      // the return type allows one, since only this method's bare
+      // `BackendKind` return forces the `match *self {}` form instead).
+      #[cfg(not(backend_available))]
+      _ => match *self {},
     }
   }
 
@@ -363,11 +402,22 @@ impl Backend for BackendImpl {
     match self {
       #[cfg(ort_backend)]
       Self::Ort(b) => Ok(EngineCache::Ort(b.make_cache()?)),
-      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      #[cfg(mlx_backend)]
       Self::Mlx(b) => Ok(EngineCache::Mlx(b.make_cache()?)),
+      // See `kind` above for why this arm must exist at all.
+      #[cfg(not(backend_available))]
+      _ => Err(crate::error::Error::InvalidRequest(
+        "no backend is compiled for this target (outside the ORT allow-list \
+         and not aarch64-apple-darwin); unreachable in practice, since no `Engine` \
+         can be constructed here either",
+      )),
     }
   }
 
+  // Every parameter but `self` is read only by the real arms below; on a
+  // `not(backend_available)` build only the fallback arm compiles, and it
+  // ignores them all (see `kind` above for why the arm exists at all).
+  #[cfg_attr(not(backend_available), allow(unused_variables))]
   fn plan_image(
     &self,
     preproc: &Preprocessor,
@@ -378,11 +428,20 @@ impl Backend for BackendImpl {
     match self {
       #[cfg(ort_backend)]
       Self::Ort(b) => b.plan_image(preproc, index, width, height),
-      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      #[cfg(mlx_backend)]
       Self::Mlx(b) => b.plan_image(preproc, index, width, height),
+      // See `kind` above for why this arm must exist at all.
+      #[cfg(not(backend_available))]
+      _ => Err(crate::error::Error::InvalidRequest(
+        "no backend is compiled for this target (outside the ORT allow-list \
+         and not aarch64-apple-darwin); unreachable in practice, since no `Engine` \
+         can be constructed here either",
+      )),
     }
   }
 
+  // See `plan_image` above: same reasoning, same fallback-only unused set.
+  #[cfg_attr(not(backend_available), allow(unused_variables))]
   fn prepare_prompt_embeds(
     &mut self,
     preproc: &Preprocessor,
@@ -400,7 +459,7 @@ impl Backend for BackendImpl {
         plans,
         image_positions,
       )?)),
-      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      #[cfg(mlx_backend)]
       Self::Mlx(b) => Ok(EngineEmbeds::Mlx(b.prepare_prompt_embeds(
         preproc,
         input_ids,
@@ -408,18 +467,38 @@ impl Backend for BackendImpl {
         plans,
         image_positions,
       )?)),
+      // See `kind` above for why this arm must exist at all.
+      #[cfg(not(backend_available))]
+      _ => Err(crate::error::Error::InvalidRequest(
+        "no backend is compiled for this target (outside the ORT allow-list \
+         and not aarch64-apple-darwin); unreachable in practice, since no `Engine` \
+         can be constructed here either",
+      )),
     }
   }
 
+  // See `plan_image` above: same reasoning (`token_id` is the unused one here).
+  #[cfg_attr(not(backend_available), allow(unused_variables))]
   fn embed_one(&mut self, token_id: i64) -> Result<Self::Embeds> {
     match self {
       #[cfg(ort_backend)]
       Self::Ort(b) => Ok(EngineEmbeds::Ort(b.embed_one(token_id)?)),
-      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      #[cfg(mlx_backend)]
       Self::Mlx(b) => Ok(EngineEmbeds::Mlx(b.embed_one(token_id)?)),
+      // See `kind` above for why this arm must exist at all.
+      #[cfg(not(backend_available))]
+      _ => Err(crate::error::Error::InvalidRequest(
+        "no backend is compiled for this target (outside the ORT allow-list \
+         and not aarch64-apple-darwin); unreachable in practice, since no `Engine` \
+         can be constructed here either",
+      )),
     }
   }
 
+  // `self`, `cache` and `embeds` are all used as the match scrutinee tuple
+  // regardless of which arms compile, but `seq_len` is read only by the real
+  // arms; see `plan_image` above for the general reasoning.
+  #[cfg_attr(not(backend_available), allow(unused_variables))]
   fn decoder_step(
     &mut self,
     cache: &mut Self::Cache,
@@ -431,7 +510,7 @@ impl Backend for BackendImpl {
       (Self::Ort(b), EngineCache::Ort(cache), EngineEmbeds::Ort(embeds)) => {
         b.decoder_step(cache, embeds, seq_len)
       }
-      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      #[cfg(mlx_backend)]
       (Self::Mlx(b), EngineCache::Mlx(cache), EngineEmbeds::Mlx(embeds)) => {
         b.decoder_step(cache, embeds, seq_len)
       }
@@ -442,9 +521,20 @@ impl Backend for BackendImpl {
       // `ort` feature on); everywhere else exactly one arm exists and is
       // exhaustive by itself, so the wildcard is compiled out (an always-taken
       // single arm plus this wildcard would be an unreachable-pattern error).
-      #[cfg(all(target_os = "macos", target_arch = "aarch64", ort_backend))]
+      #[cfg(all(mlx_backend, ort_backend))]
       _ => Err(crate::error::Error::InvalidRequest(
         "backend / cache / embeds variant mismatch (internal invariant violation)",
+      )),
+      // See `kind` above for why this arm must exist at all when NEITHER
+      // backend is compiled: the tuple's components are all references, and
+      // a reference is always considered inhabited regardless of its
+      // referent, so the two real arms alone would leave this non-exhaustive
+      // rather than dead code.
+      #[cfg(not(backend_available))]
+      (_, _, _) => Err(crate::error::Error::InvalidRequest(
+        "no backend is compiled for this target (outside the ORT allow-list \
+         and not aarch64-apple-darwin); unreachable in practice, since no `Engine` \
+         can be constructed here either",
       )),
     }
   }

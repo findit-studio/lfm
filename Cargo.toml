@@ -1,6 +1,6 @@
 [package]
 name          = "lfm"
-version       = "0.3.0"
+version       = "0.3.1"
 edition       = "2024"
 rust-version  = "1.95"
 description   = "Rust ONNX/MLX inference for LiquidAI LFM2.5-VL (vision-language) models — implements the engine-agnostic llmtask::Task contract via llguidance for schema-constrained sampling"
@@ -25,7 +25,8 @@ include      = [
 
 [dependencies]
 llmtask     = { version = "0.3", features = ["json", "regex"] }
-# ort moved to the target tables below (mandatory everywhere except aarch64-macos).
+# ort moved to the target tables below (mandatory only on the ALLOW-listed
+# targets; opt-in via the `ort` feature on aarch64-macos; absent elsewhere).
 tokenizers  = { version = "0.23", optional = true, default-features = false, features = ["fancy-regex"] }
 llguidance  = { version = "1.7", optional = true }
 toktrie     = { version = "1.7", optional = true }
@@ -39,20 +40,85 @@ serde       = { version = "1", features = ["derive"] }
 serde_json  = { version = "1" }
 fast_image_resize = "6"
 
-# ort: mandatory except on aarch64-macos, where MLX (below) is the native road
-# and ort is opt-in via the `ort` feature (off by default) — and except on
-# wasm32, where `ort-sys` publishes no prebuilt binaries at all. A target
-# dependency is resolved before features are, so `--no-default-features` cannot
-# opt out of it: the exclusion has to live in the cfg. wasm therefore builds
-# with NO backend, and an `Options` document there parses with `auto` only.
-# `build.rs` emits `ort_backend` under exactly this predicate.
-[target.'cfg(all(not(target_arch = "wasm32"), not(all(target_arch = "aarch64", target_os = "macos"))))'.dependencies]
+# ort: mandatory ONLY on the four EXACT target triples below, restricted to
+# the desktop/server targets this crate supports — an ALLOW-list, not the
+# deny-list this row used to be, and by EXACT triple, not by `cfg(...)`. A
+# target dependency is resolved before features are, so
+# `--no-default-features` cannot opt out of it.
+#
+# Source: `ort-sys` 2.0.0-rc.13's own `build/download/dist.tsv` roster
+# (vendored at
+# `~/.cargo/registry/src/*/ort-sys-2.0.0-rc.13/build/download/dist.tsv`;
+# served from `https://cdn.pyke.io/0/pyke:ort-rs/ms@1.28.0/<target>...`). Its
+# `target` column lists exactly: aarch64-apple-darwin, aarch64-apple-ios,
+# aarch64-apple-ios-sim, aarch64-linux-android, aarch64-pc-windows-msvc,
+# aarch64-unknown-linux-gnu, x86_64-pc-windows-msvc, x86_64-unknown-linux-gnu
+# — note the absence of `x86_64-apple-darwin`, which is why the old deny-list
+# row (`cfg(all(not(wasm32), not(aarch64-macos)))`) failed there
+# unconditionally: it pulled `ort` onto a target `ort-sys` has never shipped
+# a distribution for. The four tables below are the subset of that roster
+# this crate defaults `ort` on: the Linux/Windows desktop-and-server triples,
+# `aarch64-pc-windows-msvc` (Windows-on-ARM is a real desktop target)
+# included (USER-SEALED D9 2026-09-06). aarch64-apple-darwin IS on the
+# roster too (a `coreml`-flavored distribution) but deliberately stays off
+# this list — MLX is the native road there, and `ort` remains opt-in behind
+# the `ort` feature (row below, unchanged). The remaining roster entries
+# (the iOS pair, Android) are not product targets this crate supports and
+# are left off both this list and the opt-in row below — same as
+# `x86_64-apple-darwin` and wasm32 (which has no roster entry at all, on any
+# target column), the `ort` feature is a no-op for them today (no target row
+# makes `ort` a dependency there to enable). NOTE for the coordinator: this
+# differs from D9's own aside that "the explicit `ort` feature still
+# reaches" the excluded iOS/Android roster entries — it does not, under this
+# manifest, unless the opt-in row below is widened to name them too
+# (mirroring the aarch64-macos carve-out); flagging rather than widening it
+# myself, since that is a step beyond the allow-list change D9 asked for.
+#
+# EXACT triple, not `cfg(target_arch = ..., target_os = ..., target_env =
+# ...)`: an `(arch, os, env)` triple does not uniquely name a target. Real,
+# distinct triples share one of these four's `(arch, os, env)` while sitting
+# outside `ort-sys`'s roster — `aarch64_be-unknown-linux-gnu` (big-endian:
+# `target_endian` differs, not `target_arch`), `aarch64-oe-linux-gnu` and
+# `aarch64-uwp-windows-msvc` (`target_vendor` "oe"/"uwp" vs "unknown"/"pc"),
+# `x86_64-win7-windows-msvc` (`target_vendor` "win7" vs "pc") all pass an
+# `(arch, os, env)`-only check. `ort-sys` keys its distributions on the
+# exact target string, so a `cfg(...)`-based allow-list would still fail
+# those variants in its build script — the same class of bug this table is
+# here to fix, just relocated. Cargo's bare `[target.<triple>.dependencies]`
+# form matches ONLY that literal string, with no `cfg` evaluation at all.
+#
+# `build.rs` emits `ort_backend` by comparing `env::var("TARGET")` — the
+# same exact string these four table names are — against the same four
+# literals (plus the aarch64-macos opt-in below, checked by `(arch, os)`
+# same as ever). `ort_allow_list_matches_the_manifest_target_table`
+# (`tests/options_document.rs`) parses this file's `target` tables and pins
+# that the two spell the same four-target set; update both together.
+[target.x86_64-unknown-linux-gnu.dependencies]
 ort = { version = "2.0.0-rc.13" }
 
-[target.'cfg(all(target_arch = "aarch64", target_os = "macos"))'.dependencies]
-ort = { version = "2.0.0-rc.13", optional = true }
+[target.aarch64-unknown-linux-gnu.dependencies]
+ort = { version = "2.0.0-rc.13" }
 
-[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+[target.x86_64-pc-windows-msvc.dependencies]
+ort = { version = "2.0.0-rc.13" }
+
+[target.aarch64-pc-windows-msvc.dependencies]
+ort = { version = "2.0.0-rc.13" }
+
+# The MLX road: `aarch64-apple-darwin` EXACTLY, not a `cfg(target_arch =
+# "aarch64", target_os = "macos")` predicate — that pair also matches
+# `arm64e-apple-darwin` (Apple's pointer-authentication ABI variant;
+# `target_arch` normalizes it to plain "aarch64" and `target_vendor` is
+# "apple" for both, so no cfg key tells them apart). `ort-sys` has no
+# distribution for `arm64e-apple-darwin` either, so the `ort` opt-in row
+# below needs the same exact-triple discipline as the mandatory rows
+# above, and `mlxrs` — which this crate has never claimed to support there
+# — belongs in the same table for the same reason. `build.rs` emits
+# `mlx_backend` under this exact string; `tests/options_document.rs`'s
+# `ort_allow_list_matches_the_manifest_target_table` pins that this table
+# name, `mlx_backend`'s check, and each other agree.
+[target.aarch64-apple-darwin.dependencies]
+ort = { version = "2.0.0-rc.13", optional = true }
 mlxrs = { version = "0.2", default-features = false, features = ["lfm2-vl"] }
 
 [dev-dependencies]
@@ -69,7 +135,11 @@ criterion = "0.8"
 default     = ["inference", "bundled", "decoders"]
 inference   = ["dep:tokenizers", "dep:llguidance", "dep:toktrie", "dep:toktrie_hf_tokenizers", "dep:minijinja"]
 # Opt-in ORT backend on aarch64-macos (MLX is native there and is what
-# `default` gets); a no-op everywhere else, where ort is already mandatory.
+# `default` gets): a no-op on the allow-listed targets above, where ort is
+# already mandatory, and equally a no-op on every target with no `ort`
+# dependency at all to enable (x86_64-apple-darwin and wasm32 included —
+# `ort-sys` ships no prebuilt binary for either, so there is nothing this
+# feature could opt into there).
 ort         = ["dep:ort"]
 bundled     = ["inference", "decoders"]
 decoders    = ["image/jpeg", "image/png"]
@@ -136,4 +206,4 @@ rustdoc-args = ["--cfg", "docsrs"]
 [lints.rust]
 rust_2018_idioms     = "warn"
 single_use_lifetimes = "warn"
-unexpected_cfgs      = { level = "warn", check-cfg = ['cfg(docsrs)', 'cfg(tarpaulin)', 'cfg(ort_backend)'] }
+unexpected_cfgs      = { level = "warn", check-cfg = ['cfg(docsrs)', 'cfg(tarpaulin)', 'cfg(ort_backend)', 'cfg(backend_available)', 'cfg(mlx_backend)'] }

@@ -1,8 +1,10 @@
 //! Runtime modules. The whole tree is gated on `feature = "inference"`; the
 //! ORT-specific submodules (`decoder`, `embed_tokens`, `session`, `vision`,
 //! and the `Ort` arm of `backend`) are additionally gated on `ort_backend` —
-//! `ort` is mandatory everywhere except aarch64-macos, where it is optional
-//! behind the `ort` feature (MLX is the native road there).
+//! `ort` is mandatory on the ALLOW-listed targets (Linux x86_64/aarch64-gnu,
+//! Windows x86_64/aarch64-msvc) and optional on aarch64-apple-darwin behind the `ort`
+//! feature (MLX is the native road there); every other target compiles
+//! neither.
 
 // The Backend seam drives the per-image vision encode + splice, which
 // decodes images via the `decoders`-gated helpers; gate it on the same
@@ -16,18 +18,23 @@ pub(crate) mod backend;
 // gate rather than inside the macOS-only `mlx_backend`.
 #[cfg(feature = "decoders")]
 pub(crate) mod checkpoint;
-// The ORT-backed component wrappers. `ort` is mandatory everywhere except
-// aarch64-macos, where it is optional behind the `ort` feature — see the
-// `ort_backend` cfg emitted by build.rs and the target tables in Cargo.toml.
+// The ORT-backed component wrappers. `ort` is mandatory on the ALLOW-listed
+// targets (Linux x86_64/aarch64-gnu, Windows x86_64/aarch64-msvc) and optional on
+// aarch64-apple-darwin behind the `ort` feature; every other target compiles
+// neither. See the `ort_backend` cfg emitted by build.rs and the target
+// tables in Cargo.toml.
 #[cfg(ort_backend)]
 pub(crate) mod decoder;
 #[cfg(ort_backend)]
 pub(crate) mod embed_tokens;
 // The MLX (mlxrs) backend is the Apple-Silicon-only on-device alternative to
-// the ORT path. It is compiled only on macOS/arm64 (where the `mlxrs` target
-// dependency exists) and under the same `decoders` gate the `backend` seam
-// lives under. There is intentionally no `mlx` Cargo feature — see Cargo.toml.
-#[cfg(all(feature = "decoders", target_os = "macos", target_arch = "aarch64"))]
+// the ORT path. It is compiled only on `aarch64-apple-darwin` exactly — not
+// `arm64e-apple-darwin`, which shares that target's (target_arch, target_os)
+// cfg pair but has no `mlxrs` dependency row either (see build.rs's
+// `mlx_backend` cfg and Cargo.toml's exact-triple target table) — and under
+// the same `decoders` gate the `backend` seam lives under. There is
+// intentionally no `mlx` Cargo feature — see Cargo.toml.
+#[cfg(all(feature = "decoders", mlx_backend))]
 pub(crate) mod mlx_backend;
 pub(crate) mod sampler;
 #[cfg(ort_backend)]
