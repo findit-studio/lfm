@@ -68,7 +68,8 @@ use toktrie::TokEnv;
 /// Public engine for LFM2.5-VL inference.
 ///
 /// Construct via [`Engine::from_dir`] for the standard HuggingFace download
-/// layout, or via [`Engine::from_paths`] for unusual file arrangements.
+/// layout, or via `Engine::from_paths` (ONNX road only) for unusual file
+/// arrangements.
 pub struct Engine {
   preproc: Preprocessor,
   /// Drives vision encode / text embed / decoder forward / KV cache.
@@ -128,8 +129,10 @@ impl Engine {
   ///   [`ImageBudget`] the prompt's markers are rendered from.
   ///
   /// Requires the `bundled` feature so the byte-compare references are
-  /// available. The named escape hatches are [`Engine::from_paths`] (ONNX) and
-  /// [`Engine::from_mlx_dir_unchecked`] and friends (MLX).
+  /// available. The named escape hatches are `Engine::from_paths` (ONNX road
+  /// only) and `Engine::from_mlx_dir_unchecked` and friends (MLX, Apple Silicon
+  /// only). Both are named rather than linked: each is compiled only where its
+  /// backend is, so a link would dangle on the builds that lack it.
   ///
   /// # Backend selection
   ///
@@ -147,7 +150,7 @@ impl Engine {
   #[cfg_attr(docsrs, doc(cfg(feature = "bundled")))]
   pub fn from_dir<P: AsRef<Path>>(model_dir: P, opts: Options) -> Result<Self> {
     let dir: PathBuf = model_dir.as_ref().to_path_buf();
-    match select_backend(&dir, opts.backend())? {
+    match select_backend(&dir, opts.backend_kind())? {
       #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
       BackendKind::Mlx => Self::from_mlx_dir(&dir, opts),
       // `select_backend` has already refused an MLX selection on a platform
@@ -280,7 +283,8 @@ impl Engine {
   ///
   /// Always builds the ONNX/`ort` backend. The MLX (`mlxrs`) backend is reached
   /// only through the platform auto-routing in [`from_dir`](Self::from_dir) /
-  /// [`from_mlx_dir`](Self::from_mlx_dir) — there is no user-facing backend knob.
+  /// `from_mlx_dir` (Apple Silicon only) — there is no user-facing backend
+  /// knob.
   ///
   /// Requires `ort` to be compiled in: unconditional on every target except
   /// aarch64-macos, where it needs the `ort` feature (MLX is the native road
@@ -600,8 +604,8 @@ impl Engine {
   ///
   /// On the ONNX road that is the budget from [`Options`]. On the MLX road a
   /// default [`ImageBudget`] is replaced by the checkpoint's own tiling (see
-  /// [`from_mlx_dir_unchecked`](Self::from_mlx_dir_unchecked)), so reading it
-  /// back is the way to see what the model will actually do.
+  /// `from_mlx_dir_unchecked`, Apple Silicon only), so reading it back is the
+  /// way to see what the model will actually do.
   pub fn image_budget(&self) -> &ImageBudget {
     self.preproc.budget()
   }
@@ -1536,7 +1540,8 @@ fn simple_hash_hex(bytes: &[u8]) -> String {
   format!("{h:016x}")
 }
 
-/// Paths to the four model files used by [`Engine::from_paths`].
+/// Paths to the four model files used by `Engine::from_paths` (ONNX road
+/// only).
 pub struct EnginePaths {
   /// Path to `vision_encoder.onnx`.
   vision: PathBuf,

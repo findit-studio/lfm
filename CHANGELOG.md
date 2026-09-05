@@ -5,6 +5,102 @@ and this crate adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **`Options` is a layered document: the shared knobs on top, the selected
+  engine's own knobs flattened in, and every tier defaults.** A table naming
+  only a road — `{ "backend": "mlx" }` — used to be refused by the first
+  missing field's name; each tier now fills from its own `new()`. The engine
+  tier is the new `BackendOptions`, an internally tagged enum serialized under
+  the key `backend`, so one key both names the road and selects that road's
+  knob struct: `AutoOptions` (none), `OrtOptions` (`thread`,
+  `optimization_level`) or `MlxOptions` (none yet). Its variants are
+  `cfg`-gated on their backend's presence, so the roster serde prints in
+  `unknown variant ...` is exactly the set of roads the build can run, and a
+  document naming a road this build did not compile is refused by that roster
+  rather than at load time. **Breaking**, in five places:
+  - `Options::backend` returns `&BackendOptions` (the tier) instead of
+    `Option<BackendKind>`; the pin alone is now `Options::backend_kind`.
+  - `Options::with_backend` / `set_backend` take a `BackendOptions` —
+    `Options::new().with_backend(BackendOptions::mlx(MlxOptions::new()))`.
+    `with_auto_backend` is unchanged.
+  - `Options::thread` / `with_thread` / `set_thread` and `optimization_level` /
+    `with_optimization_level` / `set_optimization_level` moved to `OrtOptions`,
+    which owns them: both are ONNX Runtime's alone, and the MLX road (Metal)
+    silently ignored them. Setting them therefore means naming the ONNX road;
+    under `backend = "auto"` the session is built from `OrtOptions::new()`.
+    `OrtOptions::deterministic()` is the bit-stability preset that
+    `Options::new().with_thread(ThreadOptions::deterministic())` used to be.
+  - `backend` is a **required** key of the serde document: serde's flatten
+    cannot supply a missing tag, so a document with no `backend` is
+    ``missing field `backend` `` rather than auto-select. `"auto"` is how a
+    document defers the road to the checkpoint layout — and it is a zero-field
+    struct rather than a unit variant precisely so that a key written beside it
+    is refused by name instead of silently absorbed.
+  - `BackendKind`'s wire form is now lower-case (`"onnx"` / `"mlx"`, was
+    `"Onnx"` / `"Mlx"`), the same name `BackendKind::as_str` reports and the
+    same one the document's tag uses: one vocabulary in documents, diagnostics
+    and `Engine::backend`.
+
+  The top-level key set of a full ONNX document is unchanged
+  (`request`, `image_budget`, `backend`, `thread`, `optimization_level`) —
+  `thread` and `optimization_level` changed tiers, not depth, because the
+  engine tier is flattened. Key order moved: `backend` now leads the knobs it
+  owns. On a build without the ORT backend those two keys are absent, which is
+  the point of the gating.
+
+### Added
+
+- **`ort` is no longer a dependency on `wasm32`.** The platform-default target
+  row pulled it on every target that is not Apple Silicon macOS, wasm included,
+  and a *target* dependency is resolved before features are — so
+  `--no-default-features` could not opt out of it and `ort-sys` failed the build
+  with "no prebuilt binaries available for target wasm32-unknown-unknown". The
+  row's cfg now also excludes `wasm32`, and `build.rs` emits `ort_backend` under
+  exactly the same predicate. wasm builds with no backend at all; an `Options`
+  document there still parses, with `auto` as the only road in its roster.
+- **`ThreadOptions`' counts are `Option<u16>`, not `Option<usize>`.** `ort`
+  forwards a thread count to the C API's signed `int`, so a `usize` above
+  `i32::MAX` wrapped silently and a merely large one asked for a per-session
+  pool big enough to exhaust the process — three times over, since an `Engine`
+  builds three sessions, and the new parallel-execution path forwarded every
+  value above 1. `u16` makes both unrepresentable rather than merely rejected:
+  the session seam converts with `usize::from`, infallibly and losslessly, so
+  there is no ceiling constant, no validation hook to forget, and no cast. An
+  out-of-range count is refused by serde's own range check (`invalid value:
+  integer \`65536\`, expected u16`) in JSON, YAML and TOML alike. **Breaking**
+  for Rust callers of `ThreadOptions`' accessors and setters; **the wire form of
+  every sane document is unchanged** — `1` is `1` in both types, and only a
+  count above 65 535 changes meaning, from silently wrapped to refused.
+- **`inter_threads > 1` now selects ort's parallel execution mode**, via the new
+  `ThreadOptions::requires_parallel_execution`. ort's inter-op thread pool
+  exists only in that mode; in the default sequential mode
+  `SetInterOpNumThreads` is accepted and ignored, so every ONNX session built
+  before this took an `inter_threads` setting and silently ran
+  single-graph-threaded anyway. `None` and `Some(1)` keep the sequential mode,
+  so `ThreadOptions::deterministic()`, `OrtOptions::deterministic()` and every
+  other existing recipe build byte-identically to before — parallel execution
+  is not bit-stable, and nothing opts into it without asking for more than one
+  inter-op thread.
+- **Every nested options table refuses unknown keys.** `deny_unknown_fields`
+  does not recurse, so a tier's strictness could not see inside `thread`,
+  `request` or `image_budget`: `{ "backend": "onnx", "thread": {
+  "intra_thread": 1 } }` deserialized happily with *both* thread counts left at
+  `None`, handing back ORT's defaults for a misspelled determinism control.
+  `RequestOptions`, `ImageBudget` and `ThreadOptions` now each carry
+  `#[serde(deny_unknown_fields)]`. **Breaking** for a document that carried a
+  stray key inside one of those tables; the required-field semantics of those
+  tables are unchanged.
+- **`BackendOptions`, `AutoOptions`, `OrtOptions` and `MlxOptions`** — the
+  tiers above, exported from the crate root under their backends' `cfg`s.
+  `Options::effective_ort_options` reports the ORT knobs a configuration
+  actually runs the ONNX road with.
+- **`tests/options_document.rs`** pins the document's shape: per-tier
+  defaulting, the roster's refusal of an uncompiled road, `deny_unknown_fields`
+  on each engine tier (including for a misspelled *shared* key, which falls
+  through the flatten and is refused there), one refusal per nested table in
+  both JSON and TOML, and the JSON and TOML document forms.
+
 ## [0.2.0] — 2026-08-31
 
 ### Changed

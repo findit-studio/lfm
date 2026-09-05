@@ -19,9 +19,9 @@
 //! the features simply bind to the wrong spatial positions, with no error at
 //! all and quietly wrong conditioning.
 //!
-//! So the plan is produced by the backend that will execute it
-//! ([`Backend::plan_image`](crate::runtime::backend::Backend::plan_image)),
-//! consumed by everything downstream, and then **checked against reality**: the
+//! So the plan is produced by the backend that will execute it (the crate's
+//! internal `Backend::plan_image` seam), consumed by everything downstream, and
+//! then **checked against reality**: the
 //! backend re-derives the layout from the pixels it actually decoded and raises
 //! [`Error::ImagePlanMismatch`](crate::Error::ImagePlanMismatch) if it differs.
 //! On the MLX road a third gate runs at load time — the checkpoint's tiling

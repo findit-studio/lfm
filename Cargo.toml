@@ -1,6 +1,6 @@
 [package]
 name          = "lfm"
-version       = "0.2.0"
+version       = "0.3.0"
 edition       = "2024"
 rust-version  = "1.95"
 description   = "Rust ONNX/MLX inference for LiquidAI LFM2.5-VL (vision-language) models — implements the engine-agnostic llmtask::Task contract via llguidance for schema-constrained sampling"
@@ -39,9 +39,14 @@ serde       = { version = "1", features = ["derive"] }
 serde_json  = { version = "1" }
 fast_image_resize = "6"
 
-# ort: mandatory except aarch64-macos, where MLX (below) is the native road
-# and ort is opt-in via the `ort` feature (off by default).
-[target.'cfg(not(all(target_arch = "aarch64", target_os = "macos")))'.dependencies]
+# ort: mandatory except on aarch64-macos, where MLX (below) is the native road
+# and ort is opt-in via the `ort` feature (off by default) — and except on
+# wasm32, where `ort-sys` publishes no prebuilt binaries at all. A target
+# dependency is resolved before features are, so `--no-default-features` cannot
+# opt out of it: the exclusion has to live in the cfg. wasm therefore builds
+# with NO backend, and an `Options` document there parses with `auto` only.
+# `build.rs` emits `ort_backend` under exactly this predicate.
+[target.'cfg(all(not(target_arch = "wasm32"), not(all(target_arch = "aarch64", target_os = "macos"))))'.dependencies]
 ort = { version = "2.0.0-rc.13" }
 
 [target.'cfg(all(target_arch = "aarch64", target_os = "macos"))'.dependencies]
@@ -52,6 +57,10 @@ mlxrs = { version = "0.2", default-features = false, features = ["lfm2-vl"] }
 
 [dev-dependencies]
 serde_json = "1"
+# The `Options` document's consumer formats are JSON, YAML and TOML; TOML is
+# the one that needs a crate here to pin (YAML shares serde's self-describing
+# map path with JSON, which `serde_json` already covers).
+toml       = "0.9"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 criterion = "0.8"
@@ -82,6 +91,13 @@ lax-feature-matching = ["inference", "ort", "ort/lax-feature-matching"]
 name              = "integration"
 path              = "tests/integration.rs"
 required-features = ["integration"]
+
+# The `Options` document's shape: tier defaulting, the variant roster's
+# refusals, and the JSON/TOML forms. Needs the derives, hence `serde`.
+[[test]]
+name              = "options_document"
+path              = "tests/options_document.rs"
+required-features = ["serde"]
 
 [[example]]
 name              = "smoke"

@@ -16,15 +16,21 @@ use crate::{
 
 /// Build an ORT session from a path with the given options.
 ///
-/// Wires `optimization_level` and thread counts from `Options`. EP
-/// registration (cuda/tensorrt/etc.) is feature-gated below per
-/// spec §5.3 EP-feature pattern.
+/// Wires `optimization_level` and thread counts from the ONNX road's own tier
+/// of `Options` — `Options::effective_ort_options`, which is that tier when the
+/// document pinned `backend = "onnx"` and `OrtOptions::new()` when it left the
+/// road to the checkpoint layout. An `inter_threads` above 1 also selects ort's
+/// parallel execution mode, without which that count would be inert. EP
+/// registration (cuda/tensorrt/etc.) is feature-gated below per spec §5.3
+/// EP-feature pattern.
 #[allow(dead_code)]
 pub(crate) fn build_session(graph: &Path, opts: &Options) -> Result<Session> {
   if !graph.exists() {
     return Err(Error::NotFound(graph.to_path_buf()));
   }
-  let level = opts.optimization_level();
+  let ort_opts = opts.effective_ort_options();
+  let level = ort_opts.optimization_level();
+  let parallel = ort_opts.thread().requires_parallel_execution();
   // Session::builder() returns ort::Result<SessionBuilder>.
   // with_* methods return BuilderResult = Result<SessionBuilder, Error<SessionBuilder>>.
   // Error<SessionBuilder> converts to ort::Error (Error<()>) via From.
@@ -33,14 +39,32 @@ pub(crate) fn build_session(graph: &Path, opts: &Options) -> Result<Session> {
     .with_optimization_level(level)
     .map_err(|e| Error::Ort(ort::Error::from(e)))?;
 
-  if let Some(t) = opts.thread().intra_threads() {
+  // ort's inter-op thread pool exists only in parallel execution mode; in the
+  // default sequential mode `SetInterOpNumThreads` is accepted and ignored. An
+  // `inter_threads` above 1 is therefore a request for that mode too, or the
+  // knob would be inert — see `ThreadOptions::requires_parallel_execution`,
+  // which is where the rule and its unit test live (this function cannot be
+  // tested without a real graph: it ends at `commit_from_file`).
+  if parallel {
     builder = builder
-      .with_intra_threads(t)
+      .with_parallel_execution(true)
       .map_err(|e| Error::Ort(ort::Error::from(e)))?;
   }
-  if let Some(t) = opts.thread().inter_threads() {
+
+  // `usize::from` and not a cast: `ThreadOptions` stores both counts as `u16`
+  // precisely so this seam is infallible and lossless. ort forwards the count
+  // to the C API's signed `int`, where a `usize` above `i32::MAX` would wrap
+  // and a merely huge one would ask for a pool that can exhaust the process —
+  // an `Engine` builds three sessions. A `u16` cannot express either, so there
+  // is nothing to validate or recover from here.
+  if let Some(t) = ort_opts.thread().intra_threads() {
     builder = builder
-      .with_inter_threads(t)
+      .with_intra_threads(usize::from(t))
+      .map_err(|e| Error::Ort(ort::Error::from(e)))?;
+  }
+  if let Some(t) = ort_opts.thread().inter_threads() {
+    builder = builder
+      .with_inter_threads(usize::from(t))
       .map_err(|e| Error::Ort(ort::Error::from(e)))?;
   }
 

@@ -140,7 +140,7 @@ fn main() -> lfm::Result<()> {
 
 ```toml
 [dependencies]
-lfm = "0.2"
+lfm = "0.3"
 ```
 
 Download the ONNX artifacts from [`LiquidAI/LFM2.5-VL-450M-ONNX`][lfm-card] and set `LFM_MODEL_PATH` to the directory containing them:
@@ -161,7 +161,7 @@ Defaults: `["inference", "bundled", "decoders"]`.
 | `inference`   |   yes   | Pulls `ort`, `tokenizers`, `llguidance`, `minijinja`. Activates `Engine`. Native targets only.                     |
 | `bundled`     |   yes   | Embeds `tokenizer.json` + JSON configs (~4.5 MB) at compile time; adds `Engine::from_onnx_dir`. Implies `inference`. |
 | `decoders`    |   yes   | Activates JPEG/PNG decoding via the `image` crate.                                                                 |
-| `serde`       |   no    | `Serialize`/`Deserialize` on `Options`, `RequestOptions`, `ThreadOptions`, `ImageBudget`.                          |
+| `serde`       |   no    | `Serialize`/`Deserialize` on the `Options` document and its tiers (`RequestOptions`, `ImageBudget`, `BackendOptions`, `OrtOptions`, `MlxOptions`, `ThreadOptions`). |
 | `cuda`        |   no    | NVIDIA GPUs (Linux / Windows). Requires CUDA toolkit + cuDNN. Implies `inference`.                                 |
 | `tensorrt`    |   no    | NVIDIA, optimized inference. Falls back to CUDA, then CPU. Implies `inference`.                                    |
 | `directml`    |   no    | Windows GPUs (any vendor) via DirectX 12. Implies `inference`.                                                     |
