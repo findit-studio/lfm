@@ -5,6 +5,120 @@ and this crate adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **`RequestOptions`, `ImageBudget` and `ThreadOptions` are each
+  `serde(default)` now.** A partial nested table — `{ "request": {
+  "max_new_tokens": 512 } }` — used to be refused at the next field it left
+  out instead of filling it; each now fills a missing key from that type's
+  own `Default`, which is by construction exactly the value the enclosing
+  tier already substituted for an entirely absent table (a full table, and a
+  misspelled key inside one, are unaffected — `deny_unknown_fields` stays on
+  all three). For `RequestOptions` that value is
+  `RequestOptions::deterministic()`, **not** `RequestOptions::new()` —
+  `Options::new()` was already carrying `deterministic()` for an absent
+  `request` table, so `RequestOptions::default()` now matches it
+  (**Breaking** for Rust callers of `RequestOptions::default()` /
+  `#[derive(Default)]` call sites that expected the model-card preset;
+  `RequestOptions::new()` is unchanged and remains the explicit,
+  model-card-recommended constructor). `ImageBudget`'s and `ThreadOptions`'
+  absent-table values were already `new()` and `None`/`None` respectively, so
+  their `Default` impls are unchanged — only the attribute is new, and it
+  only widens what a partial table accepts.
+
+### Fixed
+
+- **The ORT platform default is an ALLOW-list of EXACT target triples, not
+  a deny-list and not a `cfg(target_arch/os/env)` predicate.** The previous
+  target row (`cfg(all(not(wasm32), not(aarch64-macos)))`) made `ort` a
+  mandatory dependency on every target *except* wasm32 and Apple Silicon
+  macOS — including `x86_64-apple-darwin`, for which `ort-sys` 2.0.0-rc.13
+  ships no prebuilt binary at all (absent from its own
+  `build/download/dist.tsv` roster), so the crate failed to build there
+  unconditionally, even with `--no-default-features`. An intermediate
+  allow-list keyed on `(target_arch, target_os, target_env)` fixed that
+  target but reintroduced the same class of bug on OTHER real targets:
+  `aarch64_be-unknown-linux-gnu` (big-endian; distinguished only by
+  `target_endian`), `aarch64-oe-linux-gnu` and `aarch64-uwp-windows-msvc`
+  (distinguished only by `target_vendor`), and `x86_64-win7-windows-msvc`
+  (`target_vendor` again) all satisfy an `(arch, os, env)`-only check while
+  being outside `ort-sys`'s roster, which keys distributions on the exact
+  target string. `ort` is now mandatory only on four EXACT target triples —
+  `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
+  `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc` (Windows-on-ARM; added
+  after the deny-to-allow-list conversion — it is a real desktop target and
+  is on the `ort-sys` roster) — via Cargo's bare `[target.<triple>.dependencies]`
+  table form, which matches only that literal string with no `cfg`
+  evaluation, and `build.rs` compares `env::var("TARGET")` (the exact
+  string Cargo always sets for build scripts) against the same four
+  literals. Apple Silicon macOS (`aarch64-apple-darwin`) is unchanged — MLX
+  stays the native road there and `ort` stays opt-in behind the `ort`
+  feature, checked by `(target_arch, target_os)` as before (no known
+  same-arch/os vendor variant of Apple Silicon exists to collide with).
+  Every other target — `x86_64-apple-darwin`, wasm32, and the four
+  cfg-equivalent-but-distinct triples above included — now builds with no
+  ONNX backend and no `ort` feature to opt in with, instead of failing in
+  `ort-sys`'s build script. `ort_allow_list_matches_the_manifest_target_table`
+  (`tests/options_document.rs`) parses Cargo.toml's actual TOML structure
+  and build.rs's literal target list and asserts the two name the same
+  four-target set.
+- **A target outside the ORT allow-list *and* outside aarch64-macos —
+  `x86_64-apple-darwin` with the `inference` feature on, the allow-list
+  conversion's own motivating case — failed to compile at all** (`E0004`,
+  reported against `impl Backend for BackendImpl` in `runtime/backend.rs`):
+  with neither backend compiled, `BackendImpl` has zero variants, but Rust's
+  exhaustiveness checker still requires an arm because a *reference* to an
+  uninhabited type is not itself treated as uninhabited (`rustc --explain
+  E0004`: "references are always considered inhabited"). The three checks
+  this crate ran before only exercised this target with
+  `--no-default-features`, which never compiled the affected code at all.
+  Fixed with a new `backend_available` cfg (`build.rs`, `any(ort_backend,
+  aarch64-macos)`): each of `Backend for BackendImpl`'s methods gets one
+  `#[cfg(not(backend_available))]` fallback arm (an honest `Err` where the
+  return type allows one; `kind`'s bare `BackendKind` return uses `match
+  *self {}` instead, which the compiler verifies is truly unreachable rather
+  than merely asserting it). `Engine::from_dir`'s backend-selection match and
+  `require_backend_compiled` (`engine.rs`) previously gave every
+  `not(ort_backend)` target the SAME "aarch64-apple-darwin without the `ort`
+  feature — MLX is native here" message, which is false off Apple Silicon;
+  the message is now split so the generic no-backend case names only the
+  remedies that actually exist there. `cargo check --target
+  x86_64-apple-darwin`, with default features and with `--all-features`, are
+  new gates precisely because the old ones missed this.
+- **The `aarch64-apple-darwin` (MLX) carve-out admitted `arm64e-apple-darwin`
+  too — the same class of bug as the ORT allow-list fix above, relocated to
+  the macOS side.** Every gate keyed on `cfg(target_arch = "aarch64",
+  target_os = "macos")` — Cargo.toml's `mlxrs`/opt-in-`ort` target row and
+  every MLX-touching `#[cfg(...)]` in `src/**` — also matched
+  `arm64e-apple-darwin` (Apple's pointer-authentication ABI variant:
+  `target_arch` normalizes it to plain `"aarch64"`, and `target_vendor` is
+  `"apple"` for both, so no stable cfg key distinguishes them). Enabling the
+  `ort` feature there would have turned `ort_backend` on for a target
+  `ort-sys` has no distribution for either; building with `inference` on
+  would have compiled MLX-touching code against a `mlxrs` dependency that
+  no longer resolves. Fixed by sweeping the whole class: `build.rs` now
+  emits `mlx_backend` from an exact `TARGET == "aarch64-apple-darwin"`
+  comparison (mirroring `ORT_MANDATORY_TARGETS`'s exact-string discipline),
+  Cargo.toml's `mlxrs` and opt-in `ort` rows now live under one bare
+  `[target.aarch64-apple-darwin.dependencies]` table (no `cfg(...)` at all),
+  and every real `#[cfg(...)]` gate in `src/**` that named the platform
+  directly (`BackendImpl`/`EngineEmbeds`/`EngineCache`'s `Mlx` variants,
+  `MlxOptions`, `BackendOptions::Mlx`, every `Engine::from_mlx_*`
+  constructor and its bundled-identity validators, the MLX-shaped `Error`
+  variants, the `runtime::mlx_backend` module inclusion) now reads
+  `mlx_backend` instead. `doc(cfg(...))` annotations are unchanged (still
+  `(target_arch, target_os)` for human readability — there is no stable cfg
+  key, `target_vendor` included, that excludes `arm64e-apple-darwin` while
+  including `aarch64-apple-darwin`, so this is a deliberate, harmless
+  over-approximation in the doc label only; the real gate is exact).
+  Verified directly: `cargo tree --target arm64e-apple-darwin -i {ort,mlxrs}`
+  shows neither dependency (before this fix, `--features ort` there would
+  have pulled `ort`); `cargo tree --target aarch64-apple-darwin -i mlxrs`
+  still shows `mlxrs`, and `--features ort` there still shows `ort`.
+  `ort_allow_list_matches_the_manifest_target_table` (`tests/options_document.rs`)
+  now also asserts the `aarch64-apple-darwin` opt-in row is the same exact
+  triple `build.rs`'s `mlx_backend` compares against.
+
 ## [0.3.0] — 2026-09-05
 
 ### Changed

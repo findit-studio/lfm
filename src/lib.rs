@@ -1,7 +1,10 @@
 //! Rust ONNX/MLX inference for LiquidAI LFM2.5-VL (vision-language) models.
-//! ONNX (`ort`) is the mandatory backend on every target except aarch64-macos,
-//! where MLX (`mlxrs`) is the always-compiled native road and `ort` becomes
-//! opt-in behind the `ort` feature (see `Cargo.toml`).
+//! ONNX (`ort`) is the default backend on the targets `ort-sys` ships
+//! prebuilt binaries for that this crate supports (Linux x86_64/aarch64-gnu,
+//! Windows x86_64/aarch64-msvc); on aarch64-apple-darwin, MLX (`mlxrs`) is the
+//! always-compiled native road and `ort` becomes opt-in behind the `ort`
+//! feature; every other target builds with no ONNX backend (see
+//! `Cargo.toml`).
 //!
 //! See `docs/superpowers/specs/2026-05-03-lfm-vlm-wrapper-design.md`
 //! for the full design rationale.
@@ -51,27 +54,67 @@ pub use error::{Error, Result};
 #[cfg(all(feature = "inference", ort_backend))]
 #[cfg_attr(
   docsrs,
-  doc(cfg(all(
-    not(target_arch = "wasm32"),
-    any(
-      not(all(target_arch = "aarch64", target_os = "macos")),
-      feature = "ort"
-    )
+  doc(cfg(any(
+    all(
+      target_arch = "x86_64",
+      target_vendor = "unknown",
+      target_os = "linux",
+      target_env = "gnu"
+    ),
+    all(
+      target_arch = "aarch64",
+      target_vendor = "unknown",
+      target_os = "linux",
+      target_env = "gnu"
+    ),
+    all(
+      target_arch = "x86_64",
+      target_vendor = "pc",
+      target_os = "windows",
+      target_env = "msvc"
+    ),
+    all(
+      target_arch = "aarch64",
+      target_vendor = "pc",
+      target_os = "windows",
+      target_env = "msvc"
+    ),
+    all(target_os = "macos", target_arch = "aarch64", feature = "ort")
   )))
 )]
 pub use options::GraphOptimizationLevel;
-#[cfg(all(feature = "inference", target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(feature = "inference", mlx_backend))]
 #[cfg_attr(docsrs, doc(cfg(all(target_os = "macos", target_arch = "aarch64"))))]
 pub use options::MlxOptions;
 #[cfg(all(feature = "inference", ort_backend))]
 #[cfg_attr(
   docsrs,
-  doc(cfg(all(
-    not(target_arch = "wasm32"),
-    any(
-      not(all(target_arch = "aarch64", target_os = "macos")),
-      feature = "ort"
-    )
+  doc(cfg(any(
+    all(
+      target_arch = "x86_64",
+      target_vendor = "unknown",
+      target_os = "linux",
+      target_env = "gnu"
+    ),
+    all(
+      target_arch = "aarch64",
+      target_vendor = "unknown",
+      target_os = "linux",
+      target_env = "gnu"
+    ),
+    all(
+      target_arch = "x86_64",
+      target_vendor = "pc",
+      target_os = "windows",
+      target_env = "msvc"
+    ),
+    all(
+      target_arch = "aarch64",
+      target_vendor = "pc",
+      target_os = "windows",
+      target_env = "msvc"
+    ),
+    all(target_os = "macos", target_arch = "aarch64", feature = "ort")
   )))
 )]
 pub use options::OrtOptions;

@@ -369,7 +369,7 @@ pub enum Error {
   /// [`Tokenizer`](Self::Tokenizer) / [`LlGuidance`](Self::LlGuidance) wrap their
   /// sources) because lfm does not depend on `mlxrs` off macOS/arm64, so the
   /// concrete type cannot appear in the public `Error` shape on every platform.
-  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  #[cfg(mlx_backend)]
   #[error("mlx backend: {0}")]
   Mlx(String),
 
@@ -423,7 +423,7 @@ impl Error {
   /// `Error` shape (lfm does not depend on `mlxrs` off macOS/arm64), so it is
   /// stringified at the boundary.
   #[allow(dead_code)]
-  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  #[cfg(mlx_backend)]
   pub(crate) fn from_mlx<E: std::fmt::Display>(e: E) -> Self {
     Self::Mlx(e.to_string())
   }
@@ -431,7 +431,7 @@ impl Error {
   /// Build an [`Mlx`](Self::Mlx) error from a static message (an MLX-path
   /// invariant with no source error).
   #[allow(dead_code)]
-  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  #[cfg(mlx_backend)]
   pub(crate) fn mlx(msg: &'static str) -> Self {
     Self::Mlx(msg.to_string())
   }
@@ -439,7 +439,7 @@ impl Error {
   /// Build an [`Mlx`](Self::Mlx) error from an owned, runtime-built message
   /// (e.g. one naming an offending token id or a bad logits shape).
   #[allow(dead_code)]
-  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  #[cfg(mlx_backend)]
   pub(crate) fn mlx_owned(msg: String) -> Self {
     Self::Mlx(msg)
   }

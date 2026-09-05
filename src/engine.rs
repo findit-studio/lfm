@@ -39,9 +39,9 @@ use tokenizers::Tokenizer;
 use crate::{
   ChatMessage, ContentPart, ImageInput,
   chat_template::{
-    BOS, BOS_TOKEN_ID, EOS_TOKEN_ID, IM_END, IM_START, IM_START_TOKEN_ID, IMAGE_END,
-    IMAGE_END_TOKEN_ID, IMAGE_START, IMAGE_START_TOKEN_ID, IMAGE_THUMBNAIL,
-    IMAGE_THUMBNAIL_TOKEN_ID, IMAGE_TOKEN, IMAGE_TOKEN_ID, IMG_ROW_COL_BASE_ID,
+    BOS, BOS_TOKEN_ID, IM_START, IM_START_TOKEN_ID, IMAGE_END, IMAGE_END_TOKEN_ID, IMAGE_START,
+    IMAGE_START_TOKEN_ID, IMAGE_THUMBNAIL, IMAGE_THUMBNAIL_TOKEN_ID, IMAGE_TOKEN, IMAGE_TOKEN_ID,
+    IMG_ROW_COL_BASE_ID,
   },
   error::{Error, Result},
   generate::{GenerateInputs, generate},
@@ -53,10 +53,16 @@ use crate::{
     sampler::{ConstrainedSampler, FreeSampler},
   },
 };
+// `assemble`'s tokenizer cross-check is the only user of these two; import
+// them under the same `backend_available` gate it carries (see `assemble`).
+#[cfg(backend_available)]
+use crate::chat_template::{EOS_TOKEN_ID, IM_END};
 
-// The ORT-backed component wrappers — `ort` is mandatory everywhere except
-// aarch64-macos, where it is optional behind the `ort` feature; see the
-// `ort_backend` cfg (build.rs) and the target tables in Cargo.toml.
+// The ORT-backed component wrappers — `ort` is mandatory on the ALLOW-listed
+// targets (Linux x86_64/aarch64-gnu, Windows x86_64/aarch64-msvc) and optional on
+// aarch64-apple-darwin behind the `ort` feature; every other target compiles
+// neither. See the `ort_backend` cfg (build.rs) and the target tables in
+// Cargo.toml.
 #[cfg(ort_backend)]
 use crate::runtime::{
   backend::OrtBackend, decoder::Decoder, embed_tokens::EmbedTokens, vision::VisionEncoder,
@@ -151,26 +157,38 @@ impl Engine {
   pub fn from_dir<P: AsRef<Path>>(model_dir: P, opts: Options) -> Result<Self> {
     let dir: PathBuf = model_dir.as_ref().to_path_buf();
     match select_backend(&dir, opts.backend_kind())? {
-      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      #[cfg(mlx_backend)]
       BackendKind::Mlx => Self::from_mlx_dir(&dir, opts),
       // `select_backend` has already refused an MLX selection on a platform
       // that does not compile the backend, so this arm is unreachable there;
       // it keeps the match exhaustive across the platform-gated variant set.
-      #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+      #[cfg(not(mlx_backend))]
       BackendKind::Mlx => Err(Error::BackendUnavailable {
         requested: BackendKind::Mlx,
         reason: "the MLX backend is compiled only on macOS/arm64 (aarch64-apple-darwin)",
       }),
       #[cfg(ort_backend)]
       _ => Self::from_onnx_checkpoint_dir(&dir, opts),
-      // `select_backend` has already refused an ONNX selection on aarch64-macos
+      // `select_backend` has already refused an ONNX selection on aarch64-apple-darwin
       // without the `ort` feature (via `require_backend_compiled`), so this arm
       // is unreachable there; it keeps the match exhaustive across the
-      // platform-gated variant set, mirroring the Mlx arm above.
-      #[cfg(not(ort_backend))]
+      // platform-gated variant set, mirroring the Mlx arm above. Apple-Silicon
+      // specific: MLX genuinely is the native, always-compiled road here, so
+      // naming it as the remedy is accurate only on this platform.
+      #[cfg(all(not(ort_backend), mlx_backend))]
       _ => Err(Error::BackendUnavailable {
         requested: BackendKind::Onnx,
         reason: "the ONNX (`ort`) backend is not compiled in on aarch64-apple-darwin without the `ort` feature — MLX is the native road here",
+      }),
+      // `backend_available` false: neither backend compiles here (outside the
+      // ORT allow-list and not aarch64-apple-darwin, e.g. `x86_64-apple-darwin`).
+      // Unlike the arm above, this target has no `ort` opt-in route at all —
+      // `ort` is not declared as a dependency here under any feature — so the
+      // message must not suggest enabling the `ort` feature as a remedy.
+      #[cfg(not(backend_available))]
+      _ => Err(Error::BackendUnavailable {
+        requested: BackendKind::Onnx,
+        reason: "the ONNX (`ort`) backend is not compiled in for this target — it is outside lfm's ORT allow-list (see Cargo.toml) and this platform has no `ort` opt-in route either; this target has no default backend",
       }),
     }
   }
@@ -260,8 +278,31 @@ impl Engine {
     doc(cfg(all(
       feature = "bundled",
       any(
-        not(all(target_arch = "aarch64", target_os = "macos")),
-        feature = "ort"
+        all(
+          target_arch = "x86_64",
+          target_vendor = "unknown",
+          target_os = "linux",
+          target_env = "gnu"
+        ),
+        all(
+          target_arch = "aarch64",
+          target_vendor = "unknown",
+          target_os = "linux",
+          target_env = "gnu"
+        ),
+        all(
+          target_arch = "x86_64",
+          target_vendor = "pc",
+          target_os = "windows",
+          target_env = "msvc"
+        ),
+        all(
+          target_arch = "aarch64",
+          target_vendor = "pc",
+          target_os = "windows",
+          target_env = "msvc"
+        ),
+        all(target_os = "macos", target_arch = "aarch64", feature = "ort")
       )
     )))
   )]
@@ -286,15 +327,39 @@ impl Engine {
   /// `from_mlx_dir` (Apple Silicon only) — there is no user-facing backend
   /// knob.
   ///
-  /// Requires `ort` to be compiled in: unconditional on every target except
-  /// aarch64-macos, where it needs the `ort` feature (MLX is the native road
-  /// there — see `Cargo.toml`).
+  /// Requires `ort` to be compiled in: unconditional on the targets `ort-sys`
+  /// ships prebuilt binaries for that this crate defaults `ort` on (Linux
+  /// x86_64/aarch64-gnu, Windows x86_64/aarch64-msvc — see `Cargo.toml`), and needing
+  /// the `ort` feature on aarch64-apple-darwin (MLX is the native road there).
   #[cfg(ort_backend)]
   #[cfg_attr(
     docsrs,
     doc(cfg(any(
-      not(all(target_arch = "aarch64", target_os = "macos")),
-      feature = "ort"
+      all(
+        target_arch = "x86_64",
+        target_vendor = "unknown",
+        target_os = "linux",
+        target_env = "gnu"
+      ),
+      all(
+        target_arch = "aarch64",
+        target_vendor = "unknown",
+        target_os = "linux",
+        target_env = "gnu"
+      ),
+      all(
+        target_arch = "x86_64",
+        target_vendor = "pc",
+        target_os = "windows",
+        target_env = "msvc"
+      ),
+      all(
+        target_arch = "aarch64",
+        target_vendor = "pc",
+        target_os = "windows",
+        target_env = "msvc"
+      ),
+      all(target_os = "macos", target_arch = "aarch64", feature = "ort")
     )))
   )]
   pub fn from_paths(paths: EnginePaths, opts: Options) -> Result<Self> {
@@ -332,7 +397,7 @@ impl Engine {
   /// contract every MLX road enforces (see
   /// [`from_mlx_dir_unchecked`](Self::from_mlx_dir_unchecked)). Use the
   /// `_unchecked` door for a custom checkpoint.
-  #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "bundled"))]
+  #[cfg(all(mlx_backend, feature = "bundled"))]
   #[cfg_attr(
     docsrs,
     doc(cfg(all(target_os = "macos", target_arch = "aarch64", feature = "bundled")))
@@ -366,7 +431,7 @@ impl Engine {
   /// - the checkpoint's tiling must be one the prompt's markers can express,
   ///   and must agree with a non-default [`ImageBudget`] (see
   ///   [`Error::MlxTilingMismatch`](crate::Error::MlxTilingMismatch)).
-  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  #[cfg(mlx_backend)]
   #[cfg_attr(docsrs, doc(cfg(all(target_os = "macos", target_arch = "aarch64"))))]
   pub fn from_mlx_dir_unchecked<P: AsRef<Path>>(model_dir: P, opts: Options) -> Result<Self> {
     let dir = model_dir.as_ref();
@@ -385,7 +450,7 @@ impl Engine {
   /// There is no ONNX fallback — this constructor always builds the MLX backend,
   /// and it is strict; see
   /// [`from_mlx_safetensors_unchecked`](Self::from_mlx_safetensors_unchecked).
-  #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "bundled"))]
+  #[cfg(all(mlx_backend, feature = "bundled"))]
   #[cfg_attr(
     docsrs,
     doc(cfg(all(target_os = "macos", target_arch = "aarch64", feature = "bundled")))
@@ -400,7 +465,7 @@ impl Engine {
   /// bundled-identity validations — see
   /// [`from_mlx_dir_unchecked`](Self::from_mlx_dir_unchecked) for exactly what
   /// that does and does not skip.
-  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  #[cfg(mlx_backend)]
   #[cfg_attr(docsrs, doc(cfg(all(target_os = "macos", target_arch = "aarch64"))))]
   pub fn from_mlx_safetensors_unchecked<P: AsRef<Path>>(weights: P, opts: Options) -> Result<Self> {
     let weights = weights.as_ref();
@@ -420,12 +485,7 @@ impl Engine {
   /// Explicit-format MLX constructor (see
   /// [`from_mlx_safetensors`](Self::from_mlx_safetensors)); always builds the MLX
   /// backend, no ONNX fallback, strict.
-  #[cfg(all(
-    target_os = "macos",
-    target_arch = "aarch64",
-    feature = "npz",
-    feature = "bundled"
-  ))]
+  #[cfg(all(mlx_backend, feature = "npz", feature = "bundled"))]
   #[cfg_attr(
     docsrs,
     doc(cfg(all(
@@ -443,7 +503,7 @@ impl Engine {
 
   /// [`from_mlx_npz`](Self::from_mlx_npz) without the bundled-identity
   /// validations — see [`from_mlx_dir_unchecked`](Self::from_mlx_dir_unchecked).
-  #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "npz"))]
+  #[cfg(all(mlx_backend, feature = "npz"))]
   #[cfg_attr(
     docsrs,
     doc(cfg(all(target_os = "macos", target_arch = "aarch64", feature = "npz")))
@@ -468,12 +528,7 @@ impl Engine {
   /// Explicit-format MLX constructor (see
   /// [`from_mlx_safetensors`](Self::from_mlx_safetensors)); always builds the MLX
   /// backend, no ONNX fallback, strict.
-  #[cfg(all(
-    target_os = "macos",
-    target_arch = "aarch64",
-    feature = "gguf",
-    feature = "bundled"
-  ))]
+  #[cfg(all(mlx_backend, feature = "gguf", feature = "bundled"))]
   #[cfg_attr(
     docsrs,
     doc(cfg(all(
@@ -491,7 +546,7 @@ impl Engine {
 
   /// [`from_mlx_gguf`](Self::from_mlx_gguf) without the bundled-identity
   /// validations — see [`from_mlx_dir_unchecked`](Self::from_mlx_dir_unchecked).
-  #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "gguf"))]
+  #[cfg(all(mlx_backend, feature = "gguf"))]
   #[cfg_attr(
     docsrs,
     doc(cfg(all(target_os = "macos", target_arch = "aarch64", feature = "gguf")))
@@ -516,7 +571,7 @@ impl Engine {
   /// that reconciliation — the checkpoint's own, when the caller passed the
   /// default — is what the engine's [`Preprocessor`] renders every prompt from,
   /// so the markers and the features are planned by the same parameters.
-  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  #[cfg(mlx_backend)]
   fn assemble_mlx(
     backend: crate::runtime::mlx_backend::MlxBackend,
     tokenizer_path: &Path,
@@ -540,6 +595,13 @@ impl Engine {
   /// budget in play per engine.
   ///
   /// The caller has already validated the image budget.
+  ///
+  /// `backend_available` (build.rs): the two callers are `from_paths`
+  /// (needs `ort_backend`) and `assemble_mlx` (needs aarch64-apple-darwin), so on a
+  /// target with neither — e.g. `x86_64-apple-darwin` with the `inference`
+  /// feature on — there is no `BackendImpl` value to call this with either
+  /// (see `runtime/backend.rs`'s `Backend for BackendImpl` impl).
+  #[cfg(backend_available)]
   fn assemble(backend: BackendImpl, tokenizer_path: &Path, budget: ImageBudget) -> Result<Self> {
     let preproc = Preprocessor::new(budget);
     // read bytes ONCE, then build the
@@ -834,23 +896,37 @@ fn select_backend(dir: &Path, pinned: Option<BackendKind>) -> Result<BackendKind
 /// `mlxrs` is a macOS/arm64-only target dependency, so an MLX checkpoint opened
 /// on any other host has no backend to run on. Naming that beats reporting a
 /// missing `onnx/vision_encoder.onnx`, which is what a directory of MLX files
-/// used to produce. Symmetrically, `ort` is optional on aarch64-macos (behind
-/// the `ort` feature — MLX is the native road there), so an ONNX checkpoint
-/// opened there without that feature is named too, rather than failing deep
-/// inside a constructor that does not exist.
+/// used to produce. Symmetrically, `ort` is mandatory only on the ORT
+/// allow-list and optional on aarch64-apple-darwin (behind the `ort` feature — MLX
+/// is the native road there), so an ONNX checkpoint opened on a target with
+/// neither is named too, rather than failing deep inside a constructor that
+/// does not exist. The two `ort`-less cases get DIFFERENT messages: only
+/// aarch64-apple-darwin actually has an `ort` opt-in route to point at.
 fn require_backend_compiled(kind: BackendKind) -> Result<BackendKind> {
-  #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+  #[cfg(not(mlx_backend))]
   if matches!(kind, BackendKind::Mlx) {
     return Err(Error::BackendUnavailable {
       requested: BackendKind::Mlx,
       reason: "the MLX backend is compiled only on macOS/arm64 (aarch64-apple-darwin)",
     });
   }
-  #[cfg(not(ort_backend))]
+  #[cfg(all(not(ort_backend), mlx_backend))]
   if matches!(kind, BackendKind::Onnx) {
     return Err(Error::BackendUnavailable {
       requested: BackendKind::Onnx,
       reason: "the ONNX (`ort`) backend is not compiled in on aarch64-apple-darwin without the `ort` feature — MLX is the native road here",
+    });
+  }
+  // `backend_available` false: neither backend compiles here (outside the ORT
+  // allow-list and not aarch64-apple-darwin, e.g. `x86_64-apple-darwin`). Unlike the
+  // arm above, this target has no `ort` opt-in route at all — `ort` is not
+  // declared as a dependency here under any feature — so the message must
+  // not suggest enabling the `ort` feature as a remedy.
+  #[cfg(not(backend_available))]
+  if matches!(kind, BackendKind::Onnx) {
+    return Err(Error::BackendUnavailable {
+      requested: BackendKind::Onnx,
+      reason: "the ONNX (`ort`) backend is not compiled in for this target — it is outside lfm's ORT allow-list (see Cargo.toml) and this platform has no `ort` opt-in route either; this target has no default backend",
     });
   }
   Ok(kind)
@@ -880,7 +956,7 @@ fn require_backend_compiled(kind: BackendKind) -> Result<BackendKind> {
 /// checkpoint), so a revision that changes any of them would feed
 /// systematically wrong pixels to the vision tower with every count, grid and
 /// dimension check still green. See [`check_preprocessing_pixel_contract`].
-#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "bundled"))]
+#[cfg(all(mlx_backend, feature = "bundled"))]
 fn validate_mlx_checkpoint_identity(dir: &Path) -> Result<()> {
   validate_tokenizer_matches_bundled(&dir.join("tokenizer.json"))?;
   validate_chat_template_matches_bundled(&dir.join("chat_template.jinja"))?;
@@ -1218,7 +1294,7 @@ fn validate_preprocessor_config(path: &Path) -> Result<()> {
 /// The MLX geometry (patch size, downsample factor, tile size, tile band,
 /// thumbnail policy) is validated from the loaded `ModelConfig` instead, so
 /// only the shared pixel contract is read from this file.
-#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "bundled"))]
+#[cfg(all(mlx_backend, feature = "bundled"))]
 fn validate_mlx_preprocessing_contract(path: &Path) -> Result<()> {
   let cfg = read_preprocessor_config(path)?;
   check_preprocessing_pixel_contract(&cfg)
@@ -1306,7 +1382,11 @@ fn validate_config_contract_matches_bundled(path: &Path) -> Result<()> {
 /// Callers with stripped-down model directories should use
 /// `from_paths` (which explicitly opts out) or `from_onnx_dir`
 /// (which uses bundled assets, so no drift is possible).
-#[cfg(feature = "bundled")]
+// `backend_available` (build.rs): the two callers (`from_onnx_checkpoint_dir`,
+// which needs `ort_backend`, and `validate_mlx_checkpoint_identity`, which
+// needs aarch64-apple-darwin) are the whole of this function's reachability outside
+// tests, so on a target with neither, nothing calls it.
+#[cfg(all(feature = "bundled", backend_available))]
 fn validate_chat_template_matches_bundled(path: &Path) -> Result<()> {
   if !path.exists() {
     return Err(Error::InvalidRequest(
@@ -1358,7 +1438,10 @@ fn validate_chat_template_matches_bundled(path: &Path) -> Result<()> {
 /// difference there is still drift. A comment anywhere past the header is drift
 /// too — fail-closed, and `from_paths` / the `_unchecked` constructors remain
 /// the named door for a checkpoint that legitimately carries one.
-#[cfg(feature = "bundled")]
+// See `validate_chat_template_matches_bundled` above for why this needs
+// `backend_available` too: it is `validate_chat_template_matches_bundled`'s
+// own helper and has no other caller outside tests.
+#[cfg(all(feature = "bundled", backend_available))]
 fn chat_templates_render_alike(supplied: &[u8], bundled: &[u8]) -> bool {
   strip_leading_comment_header(supplied) == strip_leading_comment_header(bundled)
 }
@@ -1371,7 +1454,8 @@ fn chat_templates_render_alike(supplied: &[u8], bundled: &[u8]) -> bool {
 /// neither. An unterminated `{#` is left verbatim rather than swallowing the
 /// rest of the file: a template that cannot be tokenized is drift, and silently
 /// discarding its tail would hide that.
-#[cfg(feature = "bundled")]
+// See `validate_chat_template_matches_bundled` above: same reachability.
+#[cfg(all(feature = "bundled", backend_available))]
 fn strip_leading_comment_header(template: &[u8]) -> &[u8] {
   const OPEN: &[u8] = b"{#";
   const CLOSE: &[u8] = b"#}";
@@ -1386,7 +1470,9 @@ fn strip_leading_comment_header(template: &[u8]) -> &[u8] {
 }
 
 /// Index of the first occurrence of `needle` in `haystack`.
-#[cfg(feature = "bundled")]
+// See `validate_chat_template_matches_bundled` above: same reachability
+// (`strip_leading_comment_header`'s own helper, plus one direct test call).
+#[cfg(all(feature = "bundled", backend_available))]
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
   if needle.is_empty() || haystack.len() < needle.len() {
     return None;
@@ -1405,7 +1491,11 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// Called from `from_dir` (strict constructor) only; `from_paths` remains the
 /// explicit escape hatch for callers intentionally pairing custom tokenizers
 /// with custom ONNX.
-#[cfg(feature = "bundled")]
+// `backend_available` (build.rs): same reachability as
+// `validate_chat_template_matches_bundled` above — `from_onnx_checkpoint_dir`
+// (`ort_backend`) and `validate_mlx_checkpoint_identity` (aarch64-apple-darwin) are
+// its only callers outside tests.
+#[cfg(all(feature = "bundled", backend_available))]
 fn validate_tokenizer_matches_bundled(path: &Path) -> Result<()> {
   let supplied = std::fs::read(path).map_err(Error::Io)?;
   if supplied != crate::bundled::TOKENIZER_JSON {
@@ -1715,7 +1805,7 @@ mod tests {
     //
     // Exercise via the bundled tokenizer (available under `bundled` +
     // `ort_backend` — `write_bundled_tokenizer` is the ONNX-only bundled
-    // tokenizer writer; on aarch64-macos without the `ort` feature this
+    // tokenizer writer; on aarch64-apple-darwin without the `ort` feature this
     // block is skipped and the cap behavior goes untested here, covered
     // instead by the MLX-road strict-constructor tests).
     #[cfg(all(feature = "bundled", ort_backend))]
@@ -1737,7 +1827,7 @@ mod tests {
   }
 
   #[test]
-  #[cfg(feature = "bundled")]
+  #[cfg(all(feature = "bundled", backend_available))]
   fn validate_tokenizer_matches_bundled_rejects_drift() {
     // a tokenizer with valid special-token IDs but
     // any drift in normal vocabulary must be rejected by the strict
@@ -1870,7 +1960,7 @@ mod tests {
   }
 
   #[test]
-  #[cfg(feature = "bundled")]
+  #[cfg(all(feature = "bundled", backend_available))]
   fn validate_chat_template_matches_bundled_rejects_drift_and_missing() {
     // from_dir's strict drift check for
     // the model directory's chat_template.jinja. A model rev that
@@ -1914,7 +2004,7 @@ mod tests {
   /// whitespace it leaves behind is swallowed by the template's own
   /// `{{- bos_token -}}`.
   #[test]
-  #[cfg(feature = "bundled")]
+  #[cfg(all(feature = "bundled", backend_available))]
   fn chat_template_comment_header_is_not_drift_but_content_is() {
     let bundled = crate::bundled::CHAT_TEMPLATE_JINJA;
 
@@ -1964,7 +2054,7 @@ mod tests {
   /// blind span-strip normalizes it straight back onto the bundled bytes and
   /// reports no drift. Only the leading-header rule refuses it.
   #[test]
-  #[cfg(feature = "bundled")]
+  #[cfg(all(feature = "bundled", backend_available))]
   fn chat_template_comment_inside_a_string_literal_is_drift() {
     let bundled = crate::bundled::CHAT_TEMPLATE_JINJA;
     const SPAN: &[u8] = b"{# drift #}";
@@ -2103,7 +2193,7 @@ mod tests {
   /// different failure (no `config.json` / no weights) proves the gate was
   /// passed rather than short-circuiting everything.
   #[test]
-  #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "bundled"))]
+  #[cfg(all(mlx_backend, feature = "bundled"))]
   fn strict_mlx_constructors_refuse_preprocessing_skew() {
     let root = std::env::temp_dir().join(format!("lfm-test-mlx-preproc-{}", std::process::id()));
 

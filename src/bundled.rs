@@ -12,7 +12,15 @@
 ///
 /// LFM2.5-VL-450M tokenizer: Qwen2-style, 151 665-token vocabulary.
 /// Consumed by [`crate::engine::Engine::from_onnx_dir`] via
-/// `write_bundled_tokenizer()` at runtime.
+/// `write_bundled_tokenizer()` at runtime, and by both strict roads'
+/// checkpoint-identity validation (byte comparison) at load time.
+///
+/// `backend_available` (build.rs): every reader of this constant is reachable
+/// only through a backend-specific constructor (the ONNX bundled door needs
+/// `ort_backend`, the MLX strict-identity check needs aarch64-apple-darwin), so on a
+/// target with neither — e.g. `x86_64-apple-darwin` with the `inference`
+/// feature on — nothing reads it.
+#[cfg(backend_available)]
 pub(crate) const TOKENIZER_JSON: &[u8] = include_bytes!("../models/tokenizer.json");
 
 /// Bundled `tokenizer_config.json` bytes.

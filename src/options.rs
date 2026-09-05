@@ -18,6 +18,24 @@
 //!   "thread": { .. }, "optimization_level": ".." }  <- that road's own knobs
 //! ```
 //!
+//! # Nested tables default too, key by key
+//!
+//! Every nested, non-flattened table of the document — [`RequestOptions`],
+//! [`ImageBudget`] and (under `backend = "onnx"`) `ThreadOptions` — is itself
+//! `#[serde(default)]`. A table naming only one key, `{ "request": {
+//! "max_new_tokens": 512 } }`, used to be refused by the *next* missing
+//! field's name instead of the first; it now fills the rest from that type's
+//! own `Default`. That `Default` is, by construction, EXACTLY the value the
+//! enclosing tier already substitutes when the whole table is absent — one
+//! source of truth, not a second copy of the numbers: [`ImageBudget::default`]
+//! and `ThreadOptions::default` simply return `new()` (the absent-table value
+//! was already `new()`/`None`+`None`), but [`RequestOptions::default`] returns
+//! [`RequestOptions::deterministic`], **not** [`RequestOptions::new`] —
+//! because `deterministic()`, not `new()`, is what [`Options::new`] was
+//! already carrying for an absent `request` table. `new()` keeps its own
+//! meaning throughout: the explicit, model-card-recommended constructor a
+//! caller reaches for by name, never the type's ambient default.
+//!
 //! # What the shape refuses, and how it says so
 //!
 //! - **A road this build does not compile** is refused by the variant roster
@@ -46,12 +64,32 @@
 #[cfg(all(feature = "inference", ort_backend))]
 #[cfg_attr(
   docsrs,
-  doc(cfg(all(
-    not(target_arch = "wasm32"),
-    any(
-      not(all(target_arch = "aarch64", target_os = "macos")),
-      feature = "ort"
-    )
+  doc(cfg(any(
+    all(
+      target_arch = "x86_64",
+      target_vendor = "unknown",
+      target_os = "linux",
+      target_env = "gnu"
+    ),
+    all(
+      target_arch = "aarch64",
+      target_vendor = "unknown",
+      target_os = "linux",
+      target_env = "gnu"
+    ),
+    all(
+      target_arch = "x86_64",
+      target_vendor = "pc",
+      target_os = "windows",
+      target_env = "msvc"
+    ),
+    all(
+      target_arch = "aarch64",
+      target_vendor = "pc",
+      target_os = "windows",
+      target_env = "msvc"
+    ),
+    all(target_os = "macos", target_arch = "aarch64", feature = "ort")
   )))
 )]
 pub use ort::session::builder::GraphOptimizationLevel;
@@ -72,9 +110,18 @@ use crate::error::{Error, Result};
 /// the model card's recommended sampler. Two named presets ship out of
 /// the box: `RequestOptions::new()` (model-card defaults) and
 /// `RequestOptions::deterministic()` (greedy + retained repetition_penalty).
+///
+/// `#[serde(default)]`: a partial `request` table fills whatever key it
+/// leaves out from [`Self::default`] — the same value an absent `request`
+/// table already got from [`Options::new`]'s own field value. That value is
+/// [`Self::deterministic`], **not** [`Self::new`]: the safer, bit-stable
+/// preset is what a caller gets for free, and `new()` remains the explicit
+/// constructor for a caller who wants the model card's own recommended
+/// (non-deterministic) values. The two are documented as differing on
+/// purpose; see `default_differs_from_new_on_purpose` for the pin.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
+#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
 pub struct RequestOptions {
   temperature: f32,
   min_p: f32,
@@ -280,9 +327,16 @@ pub const MAX_REPETITION_PENALTY: f32 = 100.0;
 /// running the model past its valid position-embedding range.
 pub const MODEL_CONTEXT_TOKENS: usize = 128_000;
 
+/// Returns [`Self::deterministic`], **not** [`Self::new`]. This is the value
+/// an absent `request` table fills from ([`Options::new`] carries
+/// `RequestOptions::deterministic()`, not `RequestOptions::new()`), and
+/// `#[serde(default)]` on this struct reuses this same impl so a partial
+/// table fills its missing keys with the identical value — one source of
+/// truth for both the whole-table-absent and the some-keys-absent case.
+/// `new()` is unaffected and stays the explicit model-card constructor.
 impl Default for RequestOptions {
   fn default() -> Self {
-    Self::new()
+    Self::deterministic()
   }
 }
 
@@ -303,9 +357,16 @@ impl Default for RequestOptions {
 // images to the multi-tile path when upstream Python's float
 // threshold would have kept them
 // single-tile — a real algorithmic-parity break.
+//
+// `#[serde(default)]`: a partial `image_budget` table fills whatever key it
+// leaves out from `Self::default()`, which is `Self::new()` — the same value
+// an absent `image_budget` table already got from `Options::new`. Unlike
+// `RequestOptions`, `Default` and `new()` do not diverge here: there is only
+// one candidate default, so `#[serde(default)]` only widens what a partial
+// table accepts and changes no value.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
+#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
 pub struct ImageBudget {
   min_image_tokens: usize,
   max_image_tokens: usize,
@@ -565,9 +626,19 @@ impl Default for ImageBudget {
 /// refused by serde's own integer range check, at the field, in every format —
 /// not by a ceiling constant this crate would have to invent and enforce. See
 /// the fields for why that is the honest bound.
+///
+/// `#[serde(default)]`: a partial `thread` table fills whatever key it leaves
+/// out from `Self::default()`, which is `Self::new()` — `None`/`None`, the
+/// same value an absent `thread` table already got from `OrtOptions::new`.
+/// Both fields are `Option`, so a correctly-spelled-but-omitted key already
+/// deserialized to `None` without this attribute; the attribute makes that
+/// contract explicit at the container level instead of leaving it an
+/// unstated consequence of every field happening to be `Option`, and is what
+/// a fully-empty `{}` table (or an entirely absent one reached some other
+/// way) resolves through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
+#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
 pub struct ThreadOptions {
   /// Both counts are `u16` so that "a value ORT can actually take" is a
   /// property of the type rather than of a validation hook someone can forget
@@ -676,11 +747,13 @@ impl Default for ThreadOptions {
 /// Which inference backend an [`Engine`](crate::Engine) runs on.
 ///
 /// The set is closed and framework-owned: `lfm` compiles the ONNX Runtime
-/// (`ort`) backend unconditionally on every target except macOS/arm64, where
-/// MLX (`mlxrs`) is the native road instead and `ort` becomes opt-in behind
-/// the `ort` feature (see `Cargo.toml`). The MLX (`mlxrs`) Metal backend
-/// itself is compiled **only** on macOS/arm64. It is `#[non_exhaustive]` so
-/// adding a third backend later is not a SemVer break.
+/// (`ort`) backend by default only on the targets `ort-sys` ships prebuilt
+/// binaries for that this crate supports (Linux x86_64/aarch64-gnu, Windows
+/// x86_64-msvc). On macOS/arm64, MLX (`mlxrs`) is the native road instead and
+/// `ort` becomes opt-in behind the `ort` feature; every other target compiles
+/// neither (see `Cargo.toml`). The MLX (`mlxrs`) Metal backend itself is
+/// compiled **only** on macOS/arm64. It is `#[non_exhaustive]` so adding a
+/// third backend later is not a SemVer break.
 ///
 /// The type is used in both directions:
 ///
@@ -764,11 +837,14 @@ impl Default for AutoOptions {
 
 /// The ONNX Runtime road's own knobs.
 ///
-/// Compiled with the ORT backend itself: `ort` is a mandatory dependency on
-/// every target except aarch64-macos, where MLX is the native road and `ort`
-/// is opt-in behind the `ort` feature (see `Cargo.toml`'s target tables and
-/// the `ort_backend` cfg `build.rs` emits). On a build without it, `onnx` is
-/// not in [`BackendOptions`]'s roster and a document naming it is refused.
+/// Compiled with the ORT backend itself: `ort` is a mandatory dependency only
+/// on the targets `ort-sys` ships prebuilt binaries for that this crate
+/// defaults it on (Linux x86_64/aarch64-gnu, Windows x86_64/aarch64-msvc); on
+/// aarch64-apple-darwin, MLX is the native road and `ort` is opt-in behind the `ort`
+/// feature; every other target compiles neither (see `Cargo.toml`'s target
+/// tables and the `ort_backend` cfg `build.rs` emits). On a build without it,
+/// `onnx` is not in [`BackendOptions`]'s roster and a document naming it is
+/// refused.
 ///
 /// Both knobs are ORT's alone — the MLX road runs on Metal and has no CPU
 /// thread budget or graph-optimization pass — which is why they live in this
@@ -778,12 +854,32 @@ impl Default for AutoOptions {
 #[cfg(all(feature = "inference", ort_backend))]
 #[cfg_attr(
   docsrs,
-  doc(cfg(all(
-    not(target_arch = "wasm32"),
-    any(
-      not(all(target_arch = "aarch64", target_os = "macos")),
-      feature = "ort"
-    )
+  doc(cfg(any(
+    all(
+      target_arch = "x86_64",
+      target_vendor = "unknown",
+      target_os = "linux",
+      target_env = "gnu"
+    ),
+    all(
+      target_arch = "aarch64",
+      target_vendor = "unknown",
+      target_os = "linux",
+      target_env = "gnu"
+    ),
+    all(
+      target_arch = "x86_64",
+      target_vendor = "pc",
+      target_os = "windows",
+      target_env = "msvc"
+    ),
+    all(
+      target_arch = "aarch64",
+      target_vendor = "pc",
+      target_os = "windows",
+      target_env = "msvc"
+    ),
+    all(target_os = "macos", target_arch = "aarch64", feature = "ort")
   )))
 )]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -871,14 +967,14 @@ impl Default for OrtOptions {
 /// reshaping the document, and — being a struct with `deny_unknown_fields`
 /// rather than a unit variant — it is what refuses an ORT knob (or a
 /// misspelled shared one) written beside `backend = "mlx"`.
-#[cfg(all(feature = "inference", target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(feature = "inference", mlx_backend))]
 #[cfg_attr(docsrs, doc(cfg(all(target_os = "macos", target_arch = "aarch64"))))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
 pub struct MlxOptions {}
 
-#[cfg(all(feature = "inference", target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(feature = "inference", mlx_backend))]
 impl MlxOptions {
   /// The only value this type has.
   pub const fn new() -> Self {
@@ -886,7 +982,7 @@ impl MlxOptions {
   }
 }
 
-#[cfg(all(feature = "inference", target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(feature = "inference", mlx_backend))]
 impl Default for MlxOptions {
   fn default() -> Self {
     Self::new()
@@ -926,17 +1022,37 @@ pub enum BackendOptions {
   #[cfg(all(feature = "inference", ort_backend))]
   #[cfg_attr(
     docsrs,
-    doc(cfg(all(
-      not(target_arch = "wasm32"),
-      any(
-        not(all(target_arch = "aarch64", target_os = "macos")),
-        feature = "ort"
-      )
+    doc(cfg(any(
+      all(
+        target_arch = "x86_64",
+        target_vendor = "unknown",
+        target_os = "linux",
+        target_env = "gnu"
+      ),
+      all(
+        target_arch = "aarch64",
+        target_vendor = "unknown",
+        target_os = "linux",
+        target_env = "gnu"
+      ),
+      all(
+        target_arch = "x86_64",
+        target_vendor = "pc",
+        target_os = "windows",
+        target_env = "msvc"
+      ),
+      all(
+        target_arch = "aarch64",
+        target_vendor = "pc",
+        target_os = "windows",
+        target_env = "msvc"
+      ),
+      all(target_os = "macos", target_arch = "aarch64", feature = "ort")
     )))
   )]
   Onnx(OrtOptions),
   /// Pin the MLX (Metal) road and carry its knobs.
-  #[cfg(all(feature = "inference", target_os = "macos", target_arch = "aarch64"))]
+  #[cfg(all(feature = "inference", mlx_backend))]
   #[cfg_attr(docsrs, doc(cfg(all(target_os = "macos", target_arch = "aarch64"))))]
   Mlx(MlxOptions),
 }
@@ -951,12 +1067,32 @@ impl BackendOptions {
   #[cfg(all(feature = "inference", ort_backend))]
   #[cfg_attr(
     docsrs,
-    doc(cfg(all(
-      not(target_arch = "wasm32"),
-      any(
-        not(all(target_arch = "aarch64", target_os = "macos")),
-        feature = "ort"
-      )
+    doc(cfg(any(
+      all(
+        target_arch = "x86_64",
+        target_vendor = "unknown",
+        target_os = "linux",
+        target_env = "gnu"
+      ),
+      all(
+        target_arch = "aarch64",
+        target_vendor = "unknown",
+        target_os = "linux",
+        target_env = "gnu"
+      ),
+      all(
+        target_arch = "x86_64",
+        target_vendor = "pc",
+        target_os = "windows",
+        target_env = "msvc"
+      ),
+      all(
+        target_arch = "aarch64",
+        target_vendor = "pc",
+        target_os = "windows",
+        target_env = "msvc"
+      ),
+      all(target_os = "macos", target_arch = "aarch64", feature = "ort")
     )))
   )]
   pub const fn onnx(opts: OrtOptions) -> Self {
@@ -964,7 +1100,7 @@ impl BackendOptions {
   }
 
   /// Pin the MLX (Metal) road with the given knobs.
-  #[cfg(all(feature = "inference", target_os = "macos", target_arch = "aarch64"))]
+  #[cfg(all(feature = "inference", mlx_backend))]
   #[cfg_attr(docsrs, doc(cfg(all(target_os = "macos", target_arch = "aarch64"))))]
   pub const fn mlx(opts: MlxOptions) -> Self {
     Self::Mlx(opts)
@@ -983,7 +1119,7 @@ impl BackendOptions {
       Self::Auto(_) => None,
       #[cfg(all(feature = "inference", ort_backend))]
       Self::Onnx(_) => Some(BackendKind::Onnx),
-      #[cfg(all(feature = "inference", target_os = "macos", target_arch = "aarch64"))]
+      #[cfg(all(feature = "inference", mlx_backend))]
       Self::Mlx(_) => Some(BackendKind::Mlx),
     }
   }
@@ -993,12 +1129,32 @@ impl BackendOptions {
   #[cfg(all(feature = "inference", ort_backend))]
   #[cfg_attr(
     docsrs,
-    doc(cfg(all(
-      not(target_arch = "wasm32"),
-      any(
-        not(all(target_arch = "aarch64", target_os = "macos")),
-        feature = "ort"
-      )
+    doc(cfg(any(
+      all(
+        target_arch = "x86_64",
+        target_vendor = "unknown",
+        target_os = "linux",
+        target_env = "gnu"
+      ),
+      all(
+        target_arch = "aarch64",
+        target_vendor = "unknown",
+        target_os = "linux",
+        target_env = "gnu"
+      ),
+      all(
+        target_arch = "x86_64",
+        target_vendor = "pc",
+        target_os = "windows",
+        target_env = "msvc"
+      ),
+      all(
+        target_arch = "aarch64",
+        target_vendor = "pc",
+        target_os = "windows",
+        target_env = "msvc"
+      ),
+      all(target_os = "macos", target_arch = "aarch64", feature = "ort")
     )))
   )]
   pub const fn ort_options(&self) -> Option<&OrtOptions> {
@@ -1010,7 +1166,7 @@ impl BackendOptions {
 
   /// The MLX knobs this tier carries, or `None` when it does not name the MLX
   /// road.
-  #[cfg(all(feature = "inference", target_os = "macos", target_arch = "aarch64"))]
+  #[cfg(all(feature = "inference", mlx_backend))]
   #[cfg_attr(docsrs, doc(cfg(all(target_os = "macos", target_arch = "aarch64"))))]
   pub const fn mlx_options(&self) -> Option<&MlxOptions> {
     match self {
@@ -1091,12 +1247,32 @@ impl Options {
   #[cfg(all(feature = "inference", ort_backend))]
   #[cfg_attr(
     docsrs,
-    doc(cfg(all(
-      not(target_arch = "wasm32"),
-      any(
-        not(all(target_arch = "aarch64", target_os = "macos")),
-        feature = "ort"
-      )
+    doc(cfg(any(
+      all(
+        target_arch = "x86_64",
+        target_vendor = "unknown",
+        target_os = "linux",
+        target_env = "gnu"
+      ),
+      all(
+        target_arch = "aarch64",
+        target_vendor = "unknown",
+        target_os = "linux",
+        target_env = "gnu"
+      ),
+      all(
+        target_arch = "x86_64",
+        target_vendor = "pc",
+        target_os = "windows",
+        target_env = "msvc"
+      ),
+      all(
+        target_arch = "aarch64",
+        target_vendor = "pc",
+        target_os = "windows",
+        target_env = "msvc"
+      ),
+      all(target_os = "macos", target_arch = "aarch64", feature = "ort")
     )))
   )]
   pub const fn effective_ort_options(&self) -> OrtOptions {
@@ -1172,12 +1348,32 @@ impl Default for Options {
 #[cfg(all(feature = "inference", ort_backend))]
 #[cfg_attr(
   docsrs,
-  doc(cfg(all(
-    not(target_arch = "wasm32"),
-    any(
-      not(all(target_arch = "aarch64", target_os = "macos")),
-      feature = "ort"
-    )
+  doc(cfg(any(
+    all(
+      target_arch = "x86_64",
+      target_vendor = "unknown",
+      target_os = "linux",
+      target_env = "gnu"
+    ),
+    all(
+      target_arch = "aarch64",
+      target_vendor = "unknown",
+      target_os = "linux",
+      target_env = "gnu"
+    ),
+    all(
+      target_arch = "x86_64",
+      target_vendor = "pc",
+      target_os = "windows",
+      target_env = "msvc"
+    ),
+    all(
+      target_arch = "aarch64",
+      target_vendor = "pc",
+      target_os = "windows",
+      target_env = "msvc"
+    ),
+    all(target_os = "macos", target_arch = "aarch64", feature = "ort")
   )))
 )]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1277,12 +1473,7 @@ mod tests {
   /// A pin round-trips through serde as the backend's own lower-case name —
   /// the same one `BackendKind::as_str` reports.
   #[test]
-  #[cfg(all(
-    feature = "serde",
-    feature = "inference",
-    target_os = "macos",
-    target_arch = "aarch64"
-  ))]
+  #[cfg(all(feature = "serde", feature = "inference", mlx_backend))]
   fn mlx_pin_round_trips() {
     let opts = Options::new().with_backend(BackendOptions::mlx(MlxOptions::new()));
     let json = serde_json::to_string(&opts).expect("serialize");
@@ -1332,6 +1523,25 @@ mod tests {
     let r = RequestOptions::deterministic();
     assert_eq!(r.temperature(), 0.0);
     assert_eq!(r.repetition_penalty(), 1.05);
+  }
+
+  /// `Default` and `new()` are documented as differing on purpose:
+  /// `Default` (and therefore `#[serde(default)]`, and an absent `request`
+  /// table) is the safer `deterministic()` preset, while `new()` remains the
+  /// explicit model-card constructor. Pin that they actually do differ, so
+  /// this doesn't silently become a distinction without a difference.
+  #[test]
+  fn default_differs_from_new_on_purpose() {
+    assert_eq!(RequestOptions::default(), RequestOptions::deterministic());
+    assert_ne!(RequestOptions::default(), RequestOptions::new());
+    assert_eq!(Options::new().request(), &RequestOptions::default());
+
+    // ImageBudget and ThreadOptions have no such split: their absent-table
+    // value already was `new()`, so `Default` stays `new()` for both.
+    assert_eq!(ImageBudget::default(), ImageBudget::new());
+    assert_eq!(ThreadOptions::default(), ThreadOptions::new());
+    assert_eq!(ThreadOptions::default().intra_threads(), None);
+    assert_eq!(ThreadOptions::default().inter_threads(), None);
   }
 
   #[test]
