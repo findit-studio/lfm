@@ -5,6 +5,8 @@ and this crate adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-09-06
+
 ### Changed
 
 - **`RequestOptions`, `ImageBudget` and `ThreadOptions` are each
@@ -480,6 +482,7 @@ The weights ship under the [LFM Open License v1.0](https://www.liquid.ai/lfm-lic
 — verify your use case complies with Liquid AI's terms separately from
 this crate's MIT OR Apache-2.0 license.
 
+[0.3.1]: https://github.com/findit-studio/lfm/releases/tag/v0.3.1
 [0.3.0]: https://github.com/findit-studio/lfm/releases/tag/v0.3.0
 [0.2.0]: https://github.com/findit-studio/lfm/releases/tag/v0.2.0
 [0.1.2]: https://github.com/findit-studio/lfm/releases/tag/v0.1.2
