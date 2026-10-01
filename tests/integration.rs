@@ -23,7 +23,7 @@
 use std::path::PathBuf;
 
 use lfm::{
-  ChatContent, ChatMessage, ContentPart, Engine, ImageAnalysisTask, ImageInput, Options,
+  ChatContent, ChatMessage, ContentPart, Engine, Extension, ImageAnalysisTask, ImageInput, Options,
   RequestOptions,
 };
 use smol_str::SmolStr;
@@ -83,9 +83,10 @@ fn t02_scene_task_structured_output() {
   let req = RequestOptions::default();
   let task = ImageAnalysisTask::default().with_accept_empty(true);
   let analysis = engine.run(&task, &images, &req).unwrap();
-  // Accept either a non-empty description or at least some detected objects.
+  // The default task asks for `description` and `tags` only; accept either
+  // one non-empty.
   assert!(
-    !analysis.description().is_empty() || !analysis.objects().is_empty(),
+    !analysis.description().is_empty() || !analysis.tags().is_empty(),
     "empty ImageAnalysis: {analysis:?}"
   );
 }
@@ -523,9 +524,14 @@ fn t10_ort_mlx_parity() {
   // length before converging on the same JSON shape (see the cosine-
   // similarity commentary above) — 256 left no margin for that and
   // intermittently hit `MaxTokensExceeded` before the object closed. 512
-  // matches the budget `t09_image_analysis_airport_fixtures` already
-  // proves sufficient for this exact task against real images.
-  let task = ImageAnalysisTask::default().with_accept_empty(true);
+  // matches the budget `t09_image_analysis_airport_fixtures` proved
+  // sufficient for this ten-field task against real images. Since `llmtask`
+  // 0.4 the default task asks for `description` and `tags` only, so every
+  // extension is switched on here to keep the ten-field answer this check
+  // and its budget were written for.
+  let task = ImageAnalysisTask::new()
+    .with_extensions(Extension::ALL)
+    .with_accept_empty(true);
   let json_req = RequestOptions::default()
     .with_temperature(0.0)
     .with_max_new_tokens(512);

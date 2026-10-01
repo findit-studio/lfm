@@ -238,11 +238,102 @@ pub enum ImageInput<'a> {
 
 // ===== Task + image-analysis exports =====
 //
-// `ImageAnalysis` and `ImageAnalysisTask` moved to `llmtask` (0.3+) as the
-// canonical cross-engine implementation (prompt, JSON Schema, parser); lfm no
-// longer carries its own copy. Re-exported here so `lfm::ImageAnalysis` /
-// `lfm::ImageAnalysisTask` stay valid import paths for existing callers —
-// only the underlying field shape changed (`mood` → `emotion`, plus a new
-// required `categories` field; see CHANGELOG).
-pub use llmtask::{ImageAnalysis, image_analysis::ImageAnalysisTask};
+// `ImageAnalysis`, `ImageAnalysisTask` and `Extension` live in `llmtask` as
+// the canonical cross-engine implementation (prompt, JSON Schema, parser);
+// lfm carries no copy of its own. They are re-exported here so a consumer
+// with no direct `llmtask` dependency (mediagraph mounts the roster through
+// lfm) can name all three. Since llmtask 0.4 the task is built from a field
+// roster: `ImageAnalysisTask::new()` asks for `description` and `tags` only,
+// each other field is an `Extension` switched on with `with_extensions`, and
+// `parse` holds the answer to the task's schema (see CHANGELOG).
+pub use llmtask::{
+  ImageAnalysis,
+  image_analysis::{Extension, ImageAnalysisTask},
+};
 pub use task::{JsonParseError, Task};
+
+#[cfg(test)]
+mod tests {
+  use crate::{Extension, ImageAnalysisTask, JsonParseError, Task};
+
+  /// The `required` list of `task`'s JSON Schema, in order.
+  fn required(task: &ImageAnalysisTask) -> Vec<&str> {
+    task.schema()["required"]
+      .as_array()
+      .expect("the schema's `required` is an array")
+      .iter()
+      .map(|name| name.as_str().expect("a required field name is a string"))
+      .collect()
+  }
+
+  /// The keys of `task`'s schema `properties`, sorted.
+  fn properties(task: &ImageAnalysisTask) -> Vec<&str> {
+    let mut keys: Vec<&str> = task.schema()["properties"]
+      .as_object()
+      .expect("the schema's `properties` is an object")
+      .keys()
+      .map(String::as_str)
+      .collect();
+    keys.sort_unstable();
+    keys
+  }
+
+  /// LAW: through lfm's own paths (`lfm::ImageAnalysisTask`,
+  /// `lfm::Extension`, `lfm::JsonParseError`), the default task asks for
+  /// exactly `description` and `tags`, both capped, and refuses an answer
+  /// that carries a field it did not ask for; `with_extensions(Extension::ALL)`
+  /// restores the ten-field schema.
+  #[test]
+  fn the_reexported_task_asks_for_its_roster() {
+    let task = ImageAnalysisTask::new();
+    assert_eq!(required(&task), ["description", "tags"]);
+    assert_eq!(properties(&task), ["description", "tags"]);
+    assert_eq!(task.schema()["additionalProperties"], false);
+    assert_eq!(
+      task.schema()["properties"]["description"]["maxLength"],
+      ImageAnalysisTask::DEFAULT_DESCRIPTION_MAX_CHARS.get()
+    );
+    assert_eq!(
+      task.schema()["properties"]["tags"]["maxItems"],
+      ImageAnalysisTask::DEFAULT_TAGS_MAX_ITEMS.get()
+    );
+    for extension in Extension::ALL {
+      assert!(
+        !task.has_extension(extension),
+        "{extension:?} must be off by default"
+      );
+    }
+    assert_eq!(ImageAnalysisTask::default().schema(), task.schema());
+
+    let analysis = task
+      .parse(r#"{"description":"A person reads by a window.","tags":["reading"]}"#)
+      .expect("the default task's own two fields parse");
+    assert_eq!(analysis.description(), "A person reads by a window.");
+    assert!(
+      analysis.scene().is_empty(),
+      "a field not asked for reads empty"
+    );
+    match task.parse(r#"{"description":"A person reads.","tags":["reading"],"scene":"library"}"#) {
+      Err(JsonParseError::UnknownFields(fields)) => assert_eq!(fields, ["scene"]),
+      other => panic!("a field the task did not ask for must be UnknownFields, got {other:?}"),
+    }
+
+    let full = ImageAnalysisTask::new().with_extensions(Extension::ALL);
+    let ten = [
+      "scene",
+      "description",
+      "subjects",
+      "objects",
+      "actions",
+      "emotion",
+      "shot_type",
+      "lighting",
+      "tags",
+      "categories",
+    ];
+    assert_eq!(required(&full), ten);
+    let mut sorted = ten;
+    sorted.sort_unstable();
+    assert_eq!(properties(&full), sorted);
+  }
+}
