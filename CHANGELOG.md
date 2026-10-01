@@ -5,6 +5,8 @@ and this crate adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-01
+
 ### Changed
 
 - **Breaking: `llmtask` 0.3 → 0.4 (the dependency requires 0.4.1), and the
