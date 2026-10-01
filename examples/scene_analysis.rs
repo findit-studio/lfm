@@ -16,7 +16,10 @@ fn main() -> lfm::Result<()> {
 
   let opts = lfm::Options::default();
   let mut engine = lfm::Engine::from_dir(&model_dir, opts)?;
-  let task = lfm::ImageAnalysisTask::default();
+  // The default task asks for `description` (one capped sentence) and
+  // `tags` (a capped label array) only. This demo switches every other
+  // field on, so it prints the full ten-field analysis.
+  let task = lfm::ImageAnalysisTask::new().with_extensions(lfm::Extension::ALL);
 
   // Engine::run wires the task prompt internally — caller only supplies
   // images + the task instance.

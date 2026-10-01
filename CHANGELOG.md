@@ -5,6 +5,44 @@ and this crate adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking: `llmtask` 0.3 → 0.4 (the dependency requires 0.4.1), and the
+  default image-analysis task asks for `description` and `tags` only.** `ImageAnalysisTask::new()` /
+  `default()` ask for one sentence of at most
+  `ImageAnalysisTask::DEFAULT_DESCRIPTION_MAX_CHARS` (120) characters and at
+  most `ImageAnalysisTask::DEFAULT_TAGS_MAX_ITEMS` (8) tags; both caps are in
+  the schema (`maxLength`, `maxItems`) and in the prompt. Each of the other
+  eight fields (`scene`, `subjects`, `objects`, `actions`, `emotion`,
+  `shot_type`, `lighting`, `categories`) is an `Extension`, switched on with
+  `with_extensions([Extension::Scene, …])`; `with_extensions(Extension::ALL)`
+  asks for all ten, as the task did before. A field the task did not ask for
+  reads empty in the parsed `ImageAnalysis`.
+- **Breaking: `ImageAnalysisTask::parse` is strict.** It accepts each field
+  only in the JSON type the task's schema declares and within its cap, and
+  refuses any other value by the field's name as
+  `JsonParseError::MissingFields`; an answer that carries a field the task
+  did not ask for is `JsonParseError::UnknownFields`. The 0.3 drift
+  tolerances are gone: a comma-separated `tags` string, a bare string for a
+  label array and a one-element array for `shot_type` are refused, never
+  coerced, and an over-cap value is refused, never truncated.
+  `Engine::run` constrains decoding to the task's schema, so its answers
+  have the declared shape; text parsed from another source can now be
+  refused where 0.3 coerced it.
+
+### Added
+
+- `lfm::Extension` and `lfm::UnknownExtension`, re-exported from
+  `llmtask::image_analysis` beside `ImageAnalysisTask`, so a crate that
+  depends on lfm alone can switch extensions on and name them from a
+  document. An extension is named by its field's JSON key: `FromStr` and
+  `TryFrom<&str>` read it (`"shot_type"` is `Extension::ShotType`),
+  `Display` writes it, and with the `serde` feature a document's list of
+  names deserializes as `Vec<Extension>`. Any other name, `description` and
+  `tags` included, is refused as `UnknownExtension`, which carries the name
+  and lists the eight; `Extension::NAMES` lists them too. The name road
+  arrived in llmtask 0.4.1, so the dependency now requires 0.4.1.
+
 ## [0.3.1] — 2026-09-06
 
 ### Changed

@@ -22,12 +22,13 @@ Rust ONNX/MLX inference for [LiquidAI LFM2.5-VL][lfm-card] — a 450M-parameter 
 `lfm` is the [LiquidAI LFM2.5-VL][lfm-card] inference engine on Rust + ONNX Runtime / MLX + llguidance:
 
 - **[`Engine`]** — sync, single-threaded; built on `ort` 2.0, with an MLX (Metal) backend auto-selected on Apple Silicon. `Engine::run<T: Task<Value = serde_json::Value>>` accepts any [`llmtask::Task`] whose grammar is JSON Schema, Lark, or Regex. Schema-constrained sampling is enforced by [llguidance] token-mask filtering. `Engine::generate` is the unconstrained path for free-form text.
-- **[`ImageAnalysisTask`]** — built-in image-analysis preset that produces the canonical [`llmtask::ImageAnalysis`] output type, sharing the schema and parser with [`qwen3-vl`].
+- **[`ImageAnalysisTask`]** — built-in image-analysis preset that produces the canonical [`llmtask::ImageAnalysis`] output type, sharing the schema and parser with [`qwen3-vl`]. The task is built from a field roster: by default it asks for one length-capped `description` sentence and one count-capped `tags` array, and each other field is an [`Extension`] switched on with `with_extensions` (`Extension::ALL` for all ten).
 - **Bundled assets** — the `bundled` feature ships LFM2.5-VL's tokenizer, chat template, and preprocessor configs as `include_bytes!`. `Engine::from_onnx_dir` then accepts a directory containing only the three ONNX graphs; no separate tokenizer download required.
 - **Wasm-friendly preprocessing** — `preproc::Preprocessor`, `TileGrid`, and EXIF-aware decode helpers compile under `--no-default-features --features decoders` (no `ort`, no `tokenizers`).
 
 [`Engine`]: https://docs.rs/lfm/latest/lfm/struct.Engine.html
 [`ImageAnalysisTask`]: https://docs.rs/lfm/latest/lfm/struct.ImageAnalysisTask.html
+[`Extension`]: https://docs.rs/lfm/latest/lfm/enum.Extension.html
 [`llmtask::Task`]: https://docs.rs/llmtask/latest/llmtask/task/trait.Task.html
 [`llmtask::ImageAnalysis`]: https://docs.rs/llmtask/latest/llmtask/image_analysis/struct.ImageAnalysis.html
 [`qwen3-vl`]: https://docs.rs/qwen3-vl
@@ -110,27 +111,19 @@ fn main() -> lfm::Result<()> {
 ### Structured output via the `ImageAnalysisTask` preset
 
 ```rust,no_run
-use lfm::{
-    ChatContent, ChatMessage, ContentPart, Engine, ImageAnalysisTask, ImageInput,
-    Options, RequestOptions, Task,
-};
-use smol_str::SmolStr;
+use lfm::{Engine, Extension, ImageAnalysisTask, ImageInput, Options, RequestOptions};
 
 fn main() -> lfm::Result<()> {
     let model_dir = std::env::var("LFM_MODEL_PATH").unwrap();
     let mut engine = Engine::from_dir(&model_dir, Options::default())?;
-    let task = ImageAnalysisTask::default();
+    // `description` and `tags` by default; switch other fields on by extension
+    // (`Extension::ALL` asks for all ten).
+    let task = ImageAnalysisTask::new().with_extensions([Extension::Scene, Extension::Objects]);
 
-    let messages = vec![ChatMessage {
-        role: SmolStr::new_static("user"),
-        content: ChatContent::Parts(vec![
-            ContentPart::Image,
-            ContentPart::Text(task.prompt().to_owned()),
-        ]),
-    }];
+    // `Engine::run` sends the images with the task's prompt, constrains decoding
+    // to the task's JSON Schema, and parses the answer.
     let images = vec![ImageInput::Path(std::path::Path::new("frame.jpg"))];
-
-    let analysis = engine.run(&task, &messages, &images, &RequestOptions::default())?;
+    let analysis = engine.run(&task, &images, &RequestOptions::default())?;
     println!("{analysis:#?}");
     Ok(())
 }
