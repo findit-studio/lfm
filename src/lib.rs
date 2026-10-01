@@ -238,23 +238,27 @@ pub enum ImageInput<'a> {
 
 // ===== Task + image-analysis exports =====
 //
-// `ImageAnalysis`, `ImageAnalysisTask` and `Extension` live in `llmtask` as
-// the canonical cross-engine implementation (prompt, JSON Schema, parser);
-// lfm carries no copy of its own. They are re-exported here so a consumer
-// with no direct `llmtask` dependency (mediagraph mounts the roster through
-// lfm) can name all three. Since llmtask 0.4 the task is built from a field
-// roster: `ImageAnalysisTask::new()` asks for `description` and `tags` only,
-// each other field is an `Extension` switched on with `with_extensions`, and
-// `parse` holds the answer to the task's schema (see CHANGELOG).
+// `ImageAnalysis`, `ImageAnalysisTask`, `Extension` and `UnknownExtension`
+// live in `llmtask` as the canonical cross-engine implementation (prompt,
+// JSON Schema, parser); lfm carries no copy of its own. They are re-exported
+// here so a consumer with no direct `llmtask` dependency (mediagraph mounts
+// the roster through lfm) can name all four. Since llmtask 0.4 the task is
+// built from a field roster: `ImageAnalysisTask::new()` asks for
+// `description` and `tags` only, each other field is an `Extension` switched
+// on with `with_extensions`, and `parse` holds the answer to the task's
+// schema. Since llmtask 0.4.1 an `Extension` is named by its field's JSON key
+// (`FromStr`, `TryFrom<&str>`, `Display`, and serde with the `serde`
+// feature), and any other name is refused as `UnknownExtension` (see
+// CHANGELOG).
 pub use llmtask::{
   ImageAnalysis,
-  image_analysis::{Extension, ImageAnalysisTask},
+  image_analysis::{Extension, ImageAnalysisTask, UnknownExtension},
 };
 pub use task::{JsonParseError, Task};
 
 #[cfg(test)]
 mod tests {
-  use crate::{Extension, ImageAnalysisTask, JsonParseError, Task};
+  use crate::{Extension, ImageAnalysisTask, JsonParseError, Task, UnknownExtension};
 
   /// The `required` list of `task`'s JSON Schema, in order.
   fn required(task: &ImageAnalysisTask) -> Vec<&str> {
@@ -335,5 +339,33 @@ mod tests {
     let mut sorted = ten;
     sorted.sort_unstable();
     assert_eq!(properties(&full), sorted);
+  }
+
+  /// LAW: through lfm's paths, an extension is named by its field's JSON
+  /// key. `"shot_type"` reads as `Extension::ShotType` through `FromStr` and
+  /// `TryFrom<&str>`, and `Display` writes it back; every name in
+  /// `Extension::NAMES` reads back, and the eight together ask for all ten
+  /// fields. `"tags"`, which every task asks for and which is not an
+  /// extension, is refused as `lfm::UnknownExtension` carrying the name.
+  #[test]
+  fn an_extension_is_named_by_its_json_key() {
+    assert_eq!("shot_type".parse::<Extension>(), Ok(Extension::ShotType));
+    assert_eq!(Extension::try_from("shot_type"), Ok(Extension::ShotType));
+    assert_eq!(Extension::ShotType.to_string(), "shot_type");
+
+    let refused: UnknownExtension = "tags"
+      .parse::<Extension>()
+      .expect_err("`tags` is not an extension");
+    assert_eq!(refused.name(), "tags");
+    assert_eq!(Extension::try_from("tags"), Err(refused));
+
+    let named = Extension::NAMES.map(|name| {
+      name
+        .parse::<Extension>()
+        .unwrap_or_else(|err| panic!("{name} must read back: {err}"))
+    });
+    assert_eq!(named, Extension::ALL);
+    let full = ImageAnalysisTask::new().with_extensions(named);
+    assert_eq!(required(&full).len(), 10);
   }
 }

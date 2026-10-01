@@ -7,8 +7,8 @@ and this crate adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- **Breaking: `llmtask` 0.3 → 0.4, and the default image-analysis task asks
-  for `description` and `tags` only.** `ImageAnalysisTask::new()` /
+- **Breaking: `llmtask` 0.3 → 0.4 (the dependency requires 0.4.1), and the
+  default image-analysis task asks for `description` and `tags` only.** `ImageAnalysisTask::new()` /
   `default()` ask for one sentence of at most
   `ImageAnalysisTask::DEFAULT_DESCRIPTION_MAX_CHARS` (120) characters and at
   most `ImageAnalysisTask::DEFAULT_TAGS_MAX_ITEMS` (8) tags; both caps are in
@@ -32,9 +32,16 @@ and this crate adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- `lfm::Extension`, re-exported from `llmtask::image_analysis` beside
-  `ImageAnalysisTask`, so a crate that depends on lfm alone can switch
-  extensions on.
+- `lfm::Extension` and `lfm::UnknownExtension`, re-exported from
+  `llmtask::image_analysis` beside `ImageAnalysisTask`, so a crate that
+  depends on lfm alone can switch extensions on and name them from a
+  document. An extension is named by its field's JSON key: `FromStr` and
+  `TryFrom<&str>` read it (`"shot_type"` is `Extension::ShotType`),
+  `Display` writes it, and with the `serde` feature a document's list of
+  names deserializes as `Vec<Extension>`. Any other name, `description` and
+  `tags` included, is refused as `UnknownExtension`, which carries the name
+  and lists the eight; `Extension::NAMES` lists them too. The name road
+  arrived in llmtask 0.4.1, so the dependency now requires 0.4.1.
 
 ## [0.3.1] — 2026-09-06
 
