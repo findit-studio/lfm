@@ -5,6 +5,14 @@ and this crate adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- Dev-dependency: `toml` 0.9 → 1.1 (the TOML road of `tests/options_document.rs`).
+  `toml` is a `[dev-dependencies]` row, so no consumer of the crate sees it, and
+  there is no lfm API change and no source change: the test file's
+  `toml::to_string`, `toml::from_str`, `toml::Table` and `toml::Value` uses compile
+  and pass unchanged against toml 1.1.
+
 ## [0.4.0] - 2026-10-01
 
 ### Changed

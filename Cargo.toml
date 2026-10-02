@@ -126,7 +126,7 @@ serde_json = "1"
 # The `Options` document's consumer formats are JSON, YAML and TOML; TOML is
 # the one that needs a crate here to pin (YAML shares serde's self-describing
 # map path with JSON, which `serde_json` already covers).
-toml       = "0.9"
+toml       = "1.1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 criterion = "0.8"
