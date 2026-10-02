@@ -97,6 +97,20 @@ jobs:
         run: cargo test --lib --no-default-features --verbose
       - name: test (lib only, decoders)
         run: cargo test --lib --no-default-features --features decoders --verbose
+      # `serde` is in no default set, so none of the three runs above compiles
+      # the derives, the serde-gated unit tests in `src/options.rs`, or
+      # `tests/options_document.rs` (`required-features = ["serde"]` makes cargo
+      # skip a target it cannot enable). These rows compile and RUN them;
+      # `build (--features serde)` builds the library alone, never a test
+      # target. The second options-document row drops the inference backend, so
+      # the round-trip is also proven without it. `integration` and the `smoke` /
+      # `scene_analysis` examples need a model, so nothing here runs them.
+      - name: test (lib only, --features serde)
+        run: cargo test --lib --features serde --verbose
+      - name: test (options document, --features serde)
+        run: cargo test --features serde --test options_document --verbose
+      - name: test (options document, --no-default-features --features serde)
+        run: cargo test --no-default-features --features serde --test options_document --verbose
 
   wasm:
     name: wasm check

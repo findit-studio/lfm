@@ -7,6 +7,12 @@ and this crate adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- CI only (no API change, no source change): the `test` job now compiles and
+  runs `tests/options_document.rs` (`--features serde`, and again with
+  `--no-default-features`) and the serde-gated unit tests in `src/options.rs`
+  (`cargo test --lib --features serde`). No run compiled them before, because
+  `serde` is in no default feature set and the job only ran `--lib` without it.
+  Not a release by itself.
 - Dev-dependency: `toml` 0.9 → 1.1 (the TOML road of `tests/options_document.rs`).
   `toml` is a `[dev-dependencies]` row, so no consumer of the crate sees it, and
   there is no lfm API change and no source change: the test file's
