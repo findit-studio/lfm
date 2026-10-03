@@ -33,9 +33,22 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+  # Every row runs on both OSes. `build.rs` emits `mlx_backend` only for
+  # `aarch64-apple-darwin`, so the ubuntu leg lints none of the mlx backend:
+  # `src/runtime/mlx_backend.rs`, the `Mlx` arms, and the mlx-gated items in
+  # `src/engine.rs`, `src/options.rs` and `tests/options_document.rs`. The macOS
+  # leg lints them, which compiles `mlxrs-sys` as `build` does there; `mlxrs` is
+  # a target dependency, so even `--no-default-features` builds it. `macos-15`
+  # is an Apple Silicon image, the only kind that has the target.
   clippy:
-    name: clippy
-    runs-on: ubuntu-latest
+    name: clippy (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-15
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable

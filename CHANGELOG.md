@@ -19,6 +19,13 @@ and this crate adheres to [Semantic Versioning](https://semver.org/).
   (`-D warnings`). No clippy run enabled `serde`, so the derives and the
   serde-gated unit tests in `src/options.rs`, and `tests/options_document.rs`,
   were never linted. Not a release by itself.
+- CI only (no API change, no source change): the `clippy` job now runs on macOS
+  as well as ubuntu (`clippy (ubuntu-latest)` and `clippy (macos-15)`), the same
+  five rows on each, `-D warnings`. `build.rs` emits `mlx_backend` only for
+  `aarch64-apple-darwin`, so the ubuntu-only job linted none of the mlx backend:
+  `src/runtime/mlx_backend.rs`, the `Mlx` arms, and the mlx-gated items in
+  `src/engine.rs`, `src/options.rs` and `tests/options_document.rs`. Not a
+  release by itself.
 - Dev-dependency: `toml` 0.9 → 1.1 (the TOML road of `tests/options_document.rs`).
   `toml` is a `[dev-dependencies]` row, so no consumer of the crate sees it, and
   there is no lfm API change and no source change: the test file's
