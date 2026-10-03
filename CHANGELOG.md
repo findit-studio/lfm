@@ -13,6 +13,12 @@ and this crate adheres to [Semantic Versioning](https://semver.org/).
   (`cargo test --lib --features serde`). No run compiled them before, because
   `serde` is in no default feature set and the job only ran `--lib` without it.
   Not a release by itself.
+- CI only (no API change, no source change): the `clippy` job now also lints the
+  serde-gated code, with `cargo clippy --all-targets --features serde` and
+  `cargo clippy --all-targets --no-default-features --features serde`
+  (`-D warnings`). No clippy run enabled `serde`, so the derives and the
+  serde-gated unit tests in `src/options.rs`, and `tests/options_document.rs`,
+  were never linted. Not a release by itself.
 - Dev-dependency: `toml` 0.9 → 1.1 (the TOML road of `tests/options_document.rs`).
   `toml` is a `[dev-dependencies]` row, so no consumer of the crate sees it, and
   there is no lfm API change and no source change: the test file's
