@@ -36,6 +36,15 @@ and this crate adheres to [Semantic Versioning](https://semver.org/).
   doors, and `Error::Mlx`. The `npz` and `gguf` constructors stay undocumented on
   both legs, since the job's feature set enables neither. Not a release by
   itself.
+- CI only (no API change, no source change): the `doc` job's macOS leg
+  (`doc build (macos-15)`) now runs a second `cargo doc --no-deps --features
+  inference,bundled,decoders,serde,npz,gguf` under the same `RUSTDOCFLAGS`, so
+  `Engine::from_mlx_npz` and `from_mlx_gguf` with their `_unchecked` doors are
+  documented by a row. No `doc` row enabled `npz` or `gguf`, so those
+  constructors' docs were built by none. Both features forward to `mlxrs`, a
+  dependency of `aarch64-apple-darwin` alone, so the step is macOS-only; the
+  first step stays, so that leg still documents the MLX items with both formats
+  off. Not a release by itself.
 - Dev-dependency: `toml` 0.9 → 1.1 (the TOML road of `tests/options_document.rs`).
   `toml` is a `[dev-dependencies]` row, so no consumer of the crate sees it, and
   there is no lfm API change and no source change: the test file's

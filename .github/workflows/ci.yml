@@ -157,8 +157,12 @@ jobs:
   # link in their docs fails no `-D warnings` row there. The macOS leg documents
   # them, which compiles `mlxrs-sys` as `build` and `clippy` do there. `macos-15`
   # is an Apple Silicon image, the only kind that has the target. The `npz` and
-  # `gguf` constructors stay undocumented on both legs: this feature set enables
-  # neither.
+  # `gguf` constructors (`Engine::from_mlx_npz` and `from_mlx_gguf` with their
+  # `_unchecked` doors) are documented by the second step, which only the macOS
+  # leg runs: both features forward to `mlxrs`, a dependency of that target
+  # alone, so they enable nothing on ubuntu. It runs beside the first step, not
+  # in place of it, so the macOS leg still documents the MLX items with both
+  # formats off, where a link from an always-present item to a gated one fails.
   doc:
     name: doc build (${{ matrix.os }})
     strategy:
@@ -176,3 +180,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo doc
         run: cargo doc --no-deps --features inference,bundled,decoders,serde
+      - name: cargo doc (npz, gguf)
+        if: runner.os == 'macOS'
+        run: cargo doc --no-deps --features inference,bundled,decoders,serde,npz,gguf
