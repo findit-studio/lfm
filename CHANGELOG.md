@@ -26,6 +26,16 @@ and this crate adheres to [Semantic Versioning](https://semver.org/).
   `src/runtime/mlx_backend.rs`, the `Mlx` arms, and the mlx-gated items in
   `src/engine.rs`, `src/options.rs` and `tests/options_document.rs`. Not a
   release by itself.
+- CI only (no API change, no source change): the `doc` job now runs on macOS as
+  well as ubuntu (`doc build (ubuntu-latest)` and `doc build (macos-15)`), the
+  same `cargo doc --no-deps --features inference,bundled,decoders,serde` under
+  `RUSTDOCFLAGS="--cfg docsrs -D warnings"` on each. `build.rs` emits
+  `mlx_backend` only for `aarch64-apple-darwin`, so the ubuntu-only job built none
+  of the mlx-gated public docs: `MlxOptions`, `BackendOptions::Mlx`,
+  `Engine::from_mlx_dir` and `from_mlx_safetensors` with their `_unchecked`
+  doors, and `Error::Mlx`. The `npz` and `gguf` constructors stay undocumented on
+  both legs, since the job's feature set enables neither. Not a release by
+  itself.
 - Dev-dependency: `toml` 0.9 → 1.1 (the TOML road of `tests/options_document.rs`).
   `toml` is a `[dev-dependencies]` row, so no consumer of the crate sees it, and
   there is no lfm API change and no source change: the test file's
