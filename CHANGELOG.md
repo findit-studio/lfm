@@ -45,6 +45,17 @@ and this crate adheres to [Semantic Versioning](https://semver.org/).
   dependency of `aarch64-apple-darwin` alone, so the step is macOS-only; the
   first step stays, so that leg still documents the MLX items with both formats
   off. Not a release by itself.
+- CI only (no API change, no source change): the `clippy` and `test` jobs' macOS
+  legs now also run `cargo clippy --all-targets --features npz,gguf` (`-D warnings`)
+  and `cargo test --lib --features npz,gguf` (`clippy (macos-15)` and
+  `test (macos-latest)`), each as an extra step under `if: runner.os == 'macOS'`.
+  No clippy, build or test row enabled `npz` or `gguf`, so `Engine::from_mlx_npz`
+  and `from_mlx_gguf` with their `_unchecked` doors, the `mlx_backend` loaders
+  behind them, the two feature-gated blocks of the preprocessing-skew unit test in
+  `src/engine.rs` and the formats-on arm of `disabled_weight_format_is_named` were
+  compiled by none. Both features forward to `mlxrs`, a dependency of
+  `aarch64-apple-darwin` alone, so the steps are macOS-only. Not a release by
+  itself.
 - Dev-dependency: `toml` 0.9 → 1.1 (the TOML road of `tests/options_document.rs`).
   `toml` is a `[dev-dependencies]` row, so no consumer of the crate sees it, and
   there is no lfm API change and no source change: the test file's
