@@ -49,6 +49,16 @@ jobs:
         run: cargo clippy --all-targets --no-default-features -- -D warnings
       - name: clippy (decoders only)
         run: cargo clippy --all-targets --no-default-features --features decoders -- -D warnings
+      # `serde` is in no default set, so none of the three runs above lints the
+      # derives or the serde-gated unit tests in `src/options.rs`, and
+      # `tests/options_document.rs` (`required-features = ["serde"]`) is a target
+      # cargo skips when it cannot enable it: that code was never linted. The
+      # second row drops the inference backend, so the same code is also linted
+      # without it.
+      - name: clippy (--features serde)
+        run: cargo clippy --all-targets --features serde -- -D warnings
+      - name: clippy (--no-default-features --features serde)
+        run: cargo clippy --all-targets --no-default-features --features serde -- -D warnings
 
   build:
     name: build (${{ matrix.os }})
