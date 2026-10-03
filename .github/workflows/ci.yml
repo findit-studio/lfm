@@ -72,6 +72,16 @@ jobs:
         run: cargo clippy --all-targets --features serde -- -D warnings
       - name: clippy (--no-default-features --features serde)
         run: cargo clippy --all-targets --no-default-features --features serde -- -D warnings
+      # `npz` and `gguf` are in no default set, and both forward to `mlxrs`, a
+      # dependency of `aarch64-apple-darwin` alone: they enable nothing on the
+      # ubuntu leg, so this row runs on the macOS leg only. None of the rows
+      # above lints `Engine::from_mlx_npz` and `from_mlx_gguf` with their
+      # `_unchecked` doors, the `mlx_backend` loaders behind them, or the two
+      # feature-gated blocks of the preprocessing-skew unit test in
+      # `src/engine.rs`.
+      - name: clippy (--features npz,gguf)
+        if: runner.os == 'macOS'
+        run: cargo clippy --all-targets --features npz,gguf -- -D warnings
 
   build:
     name: build (${{ matrix.os }})
@@ -134,6 +144,16 @@ jobs:
         run: cargo test --features serde --test options_document --verbose
       - name: test (options document, --no-default-features --features serde)
         run: cargo test --no-default-features --features serde --test options_document --verbose
+      # `npz` and `gguf` forward to `mlxrs`, a dependency of `aarch64-apple-darwin`
+      # alone, so this row runs on the macOS leg only. No row above enables
+      # either format, so none compiles or runs the two feature-gated blocks of
+      # the preprocessing-skew unit test in `src/engine.rs` (the strict npz and
+      # gguf doors refuse a skewed checkpoint) or the formats-on arm of
+      # `disabled_weight_format_is_named` in `src/runtime/checkpoint.rs`. Library
+      # tests only: no other target gates on either feature.
+      - name: test (lib only, --features npz,gguf)
+        if: runner.os == 'macOS'
+        run: cargo test --lib --features npz,gguf --verbose
 
   wasm:
     name: wasm check
