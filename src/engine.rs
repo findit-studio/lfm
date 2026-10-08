@@ -50,7 +50,6 @@ use crate::{
   runtime::{
     backend::{Backend, BackendImpl},
     checkpoint::{self, CheckpointLayout},
-    field_caps::FieldCaps,
     field_ends::field_ends,
     sampler::{ConstrainedSampler, FreeSampler},
   },
@@ -756,11 +755,11 @@ impl Engine {
   /// JSON-decoded and untrimmed. It never names a cut token: a string the
   /// grammar closes at its `maxLength` always ends in a whole character.
   ///
-  /// A JSON Schema task whose schema does not fix a top-level string field's
-  /// `maxLength` by itself — a union whose branches disagree on it, a `$ref`
-  /// that is not a local JSON Pointer — is refused before generation with
-  /// [`Error::UnsupportedFieldCap`](crate::Error::UnsupportedFieldCap), naming
-  /// the field.
+  /// A field's cap is the one the task declares
+  /// ([`llmtask::Task::field_caps`]); lfm reads no cap out of the schema. A
+  /// field that closed holding exactly its declared cap is `cap`; a field
+  /// with no declared cap is never `cap` (the model's close is still
+  /// `model`).
   ///
   /// The `ParserFactory` is constructed once and cached across calls.
   pub fn run<T: llmtask::Task>(
@@ -874,11 +873,6 @@ impl<B: Backend> ConstrainedRun<'_, B> {
 
     let grammar = task.grammar();
     let constraint = build_constraint(self.factory, &grammar)?;
-    // The answer to a JSON Schema is a JSON text: follow it, so the task
-    // learns how the decoder ended each of its string fields, read against
-    // the caps the schema puts on them. A cap the schema alone does not fix
-    // is refused here, before a token is drawn.
-    let caps = grammar.as_json_schema().map(FieldCaps::of).transpose()?;
     let seed = take_seed(self.next_seed);
     let mut sampler = ConstrainedSampler::new(
       constraint,
@@ -886,7 +880,10 @@ impl<B: Backend> ConstrainedRun<'_, B> {
       seed,
       self.tokenizer.get_vocab_size(true) as u32,
     );
-    if caps.is_some() {
+    // The answer to a JSON Schema is a JSON text: follow it, so the task
+    // learns how the decoder ended each of its string fields.
+    let json = grammar.is_json_schema();
+    if json {
       sampler = sampler.with_field_tracking();
     }
     let text = generate(
@@ -896,9 +893,13 @@ impl<B: Backend> ConstrainedRun<'_, B> {
       &mut sampler,
       GenerateInputs::new(&messages, images, req, self.eos_token_id),
     )?;
-    let ends = caps.map_or_else(FieldEnds::new, |caps| {
-      field_ends(&text, sampler.field_members(), &caps)
-    });
+    // Read against the caps the task declares: lfm derives none from the
+    // schema.
+    let ends = if json {
+      field_ends(&text, sampler.field_members(), &task.field_caps())
+    } else {
+      FieldEnds::new()
+    };
     task.parse_ended(&text, &ends).map_err(Error::from)
   }
 }
@@ -2384,8 +2385,6 @@ mod tests {
   /// image is read.
   struct ScriptedBackend {
     script: Script,
-    /// How many decoder steps ran.
-    steps: usize,
   }
 
   impl Backend for ScriptedBackend {
@@ -2421,7 +2420,6 @@ mod tests {
     }
 
     fn decoder_step(&mut self, _: &mut (), _: &(), _: usize) -> Result<Vec<f32>> {
-      self.steps += 1;
       Ok(self.script.logits(trie().vocab_size()))
     }
   }
@@ -2464,6 +2462,10 @@ mod tests {
       *self.ends.borrow_mut() = Some(ends.clone());
       self.task.parse_ended(raw, ends)
     }
+
+    fn field_caps(&self) -> llmtask::FieldCaps {
+      self.task.field_caps()
+    }
   }
 
   impl Recorded {
@@ -2492,20 +2494,10 @@ mod tests {
   where
     Error: From<T::ParseError>,
   {
-    let (result, next_seed, _) = run_counted(task, steps);
-    (result, next_seed)
-  }
-
-  /// [`run_scripted`], with how many decoder steps the backend ran.
-  fn run_counted<T: Task>(task: &T, steps: Vec<Step>) -> (Result<T::Output>, u64, usize)
-  where
-    Error: From<T::ParseError>,
-  {
     let tokenizer = Tokenizer::from_bytes(bundled_tokenizer_json()).expect("the tokenizer loads");
     let preproc = Preprocessor::new(ImageBudget::default());
     let mut backend = ScriptedBackend {
       script: Script::new(steps),
-      steps: 0,
     };
     let mut next_seed = 7;
     let result = ConstrainedRun {
@@ -2517,12 +2509,38 @@ mod tests {
       next_seed: &mut next_seed,
     }
     .run(task, &[], &RequestOptions::deterministic());
-    (result, next_seed, backend.steps)
+    (result, next_seed)
   }
 
-  /// A JSON Schema task that parses any answer to nothing.
+  /// A JSON Schema task that declares `caps`, parses any answer to nothing,
+  /// and keeps the accounts `parse_ended` is handed.
   struct SchemaTask {
     schema: serde_json::Value,
+    caps: llmtask::FieldCaps,
+    ends: std::cell::RefCell<Option<llmtask::FieldEnds>>,
+  }
+
+  impl SchemaTask {
+    fn new(schema: serde_json::Value, caps: &[(&str, usize)]) -> Self {
+      let mut declared = llmtask::FieldCaps::new();
+      for &(field, cap) in caps {
+        declared.insert(field, cap);
+      }
+      Self {
+        schema,
+        caps: declared,
+        ends: std::cell::RefCell::new(None),
+      }
+    }
+
+    /// The accounts the last `parse_ended` call was handed.
+    fn ends(&self) -> llmtask::FieldEnds {
+      self
+        .ends
+        .borrow()
+        .clone()
+        .expect("`parse_ended` was called")
+    }
   }
 
   impl Task for SchemaTask {
@@ -2545,38 +2563,104 @@ mod tests {
     fn parse(&self, _: &str) -> std::result::Result<(), llmtask::JsonParseError> {
       Ok(())
     }
+
+    fn parse_ended(
+      &self,
+      raw: &str,
+      ends: &llmtask::FieldEnds,
+    ) -> std::result::Result<(), llmtask::JsonParseError> {
+      *self.ends.borrow_mut() = Some(ends.clone());
+      self.parse(raw)
+    }
+
+    fn field_caps(&self) -> llmtask::FieldCaps {
+      self.caps.clone()
+    }
   }
 
-  /// LAW (Codex R2, [medium]): **a task whose schema leaves a field's cap to
-  /// the branch of a union is refused by the field's name at admission** —
-  /// an `anyOf` of `maxLength` 5 and 8 — before a seed is drawn or the
-  /// decoder runs, rather than run with that field's account silently out.
-  #[test]
-  fn a_branch_dependent_cap_is_refused_by_name_at_admission() {
-    let task = SchemaTask {
-      schema: serde_json::json!({
-        "type": "object",
-        "properties": {"description": {"anyOf": [
-          {"type": "string", "maxLength": 5},
-          {"type": "string", "maxLength": 8},
-        ]}},
-        "required": ["description"],
-        "additionalProperties": false,
-      }),
-    };
-    let (result, next_seed, steps) = run_counted(&task, vec![text(r#"{"description":"abcde"}"#)]);
-    match result {
-      Err(Error::UnsupportedFieldCap { field, reason }) => {
-        assert_eq!(field, "description");
-        assert_eq!(
-          reason,
-          "branch-dependent maxLength is not supported for field-end accounts"
-        );
-      }
-      other => panic!("must be refused by name, got {other:?}"),
+  /// `D_n`: a description schema that `allOf`s two references to `D_{n-1}`,
+  /// down to `D_0`, a string of at most 5 — compact, acyclic, and `2^n`
+  /// references deep when each is expanded anew.
+  fn doubling_schema(depth: usize) -> serde_json::Value {
+    let mut defs = serde_json::Map::new();
+    defs.insert(
+      "d0".to_owned(),
+      serde_json::json!({"type": "string", "maxLength": 5}),
+    );
+    for level in 1..=depth {
+      let below = format!("#/$defs/d{}", level - 1);
+      defs.insert(
+        format!("d{level}"),
+        serde_json::json!({"allOf": [{"$ref": below}, {"$ref": below}]}),
+      );
     }
-    assert_eq!(next_seed, 7, "no seed is drawn");
-    assert_eq!(steps, 0, "the decoder never runs");
+    serde_json::json!({
+      "type": "object",
+      "properties": {"description": {"$ref": format!("#/$defs/d{depth}")}},
+      "required": ["description"],
+      "additionalProperties": false,
+      "$defs": defs,
+    })
+  }
+
+  /// LAW (Codex R3, [high]): **lfm reads no cap out of the schema, so a
+  /// compact schema is no cost at admission.** `D_30` doubles its references
+  /// thirty times; llguidance compiles it once per reference, and lfm, which
+  /// takes the description's cap from the task, never walks it. The whole run
+  /// — admission, decode, the account — finishes within a budget a walk of
+  /// `2^30` references could not, and the description the matcher closed at 5
+  /// is `cap("abcde")` under the task's declared cap.
+  #[test]
+  fn a_compact_schema_admits_without_walking_it() {
+    factory();
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+      let task = SchemaTask::new(doubling_schema(30), &[("description", 5)]);
+      let (result, _) = run_scripted(&task, vec![text(r#"{"description":"abcde"}"#)]);
+      let _ = done.send(result.map(|()| task.ends()));
+    });
+    let ends = finished
+      .recv_timeout(std::time::Duration::from_secs(20))
+      .expect("the run finishes within its budget")
+      .expect("the run parses");
+    assert_eq!(
+      ends.get("description"),
+      Some(&llmtask::FieldEnd::cap("abcde"))
+    );
+  }
+
+  /// LAW (Codex R3, [high]): **a cap behind an `$id` subresource is the cap
+  /// the task declares.** The description refers to `#/$defs/inner`, which
+  /// sets its own `$id`: inside it `#/$defs/cap` names the subresource's cap
+  /// of 3, not the document root's cap of 9. llguidance resolves it in the
+  /// subresource and closes the description at `"abc"`; the task declares 3,
+  /// and the account is `cap("abc")`.
+  #[test]
+  fn a_cap_behind_an_id_subresource_is_the_one_the_task_declares() {
+    let schema = serde_json::json!({
+      "type": "object",
+      "properties": {"description": {"$ref": "#/$defs/inner"}},
+      "required": ["description"],
+      "additionalProperties": false,
+      "$defs": {
+        "cap": {"type": "string", "maxLength": 9},
+        "inner": {
+          "$id": "https://example.com/fieldend/inner",
+          "$ref": "#/$defs/cap",
+          "$defs": {"cap": {"type": "string", "maxLength": 3}},
+        },
+      },
+    });
+    let task = SchemaTask::new(schema, &[("description", 3)]);
+    let (result, _) = run_scripted(
+      &task,
+      vec![text(r#"{"description":""#), text("abc"), text(r#""}"#)],
+    );
+    result.expect("the run parses");
+    assert_eq!(
+      task.ends().get("description"),
+      Some(&llmtask::FieldEnd::cap("abc"))
+    );
   }
 
   /// The answer to `task` whose description is `written`, `scene` (when the

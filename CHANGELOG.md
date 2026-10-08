@@ -7,13 +7,13 @@ and this crate adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- **Breaking: `llmtask` 0.4 → 0.5 (the dependency requires 0.5.1).** lfm
+- **Breaking: `llmtask` 0.4 → 0.5 (the dependency requires 0.5.2).** lfm
   re-exports `ImageAnalysis`, `ImageAnalysisTask`, `Extension`,
   `UnknownExtension`, `JsonParseError` and `Task` from llmtask, and
   `Engine::run` takes any `llmtask::Task`, so llmtask 0.5's changes reach
   lfm's API: `ImageAnalysis` gains `description_end` (serialized last),
   `JsonParseError` gains `DescriptionCapMismatch`, and `Task` gains the
-  provided `parse_ended`.
+  provided `parse_ended` and `field_caps`.
 - `Engine::run` hands the task the constrained decoder's account of how it
   ended each string field of the answer (findit-studio/application#235): it
   calls `task.parse_ended(raw, &ends)` where it called `task.parse(raw)`. For
@@ -29,20 +29,18 @@ and this crate adheres to [Semantic Versioning](https://semver.org/).
   so a member serde_json cannot materialize as a value (a number past `f64`,
   deep nesting) costs no other member its account; a key written twice binds
   by its last occurrence, as serde_json reads it. The account is decided by
-  the length first: a string that closed holding exactly its member's cap was
-  bound by it, whichever token carried the quote, and is
-  `FieldEnd::cap(field)`. A member's cap is resolved from the schema as
-  llguidance normalizes it: the smallest `maxLength` among its `properties`
-  entry, every `patternProperties` entry its key matches (or
-  `additionalProperties` when neither names it), local `$ref`s followed
-  through chains, and every `allOf` branch, the top-level object's own `$ref`
-  and `allOf` included. Below the cap the model's close is
-  `FieldEnd::model(field)`, and a close every allowed token made (an `enum`,
-  a `const`, a `pattern`) or one the mask cannot attribute has no account.
-  No account names a cut token
-  (`with_cut`): llguidance never admits a closing quote after a partial UTF-8
-  sequence, and `generate` detokenizes the whole answer at once. With
-  `ImageAnalysisTask` a live description now reads `DescriptionEnd::Ragged`
+  the length first, against the cap the task declares for the field
+  (`Task::field_caps`): lfm reads no cap out of the schema, the task that
+  wrote it being the one authority on its caps. A string that closed holding
+  exactly its declared cap was bound by it, whichever token carried the
+  quote, and is `FieldEnd::cap(field)`. Below the cap — or for a field with
+  no declared cap — the model's close is `FieldEnd::model(field)`, and a
+  close every allowed token made (an `enum`, a `const`, a `pattern`, a cap
+  the task did not declare) or one the mask cannot attribute has no account.
+  No account names a cut token (`with_cut`): llguidance never admits a
+  closing quote after a partial UTF-8 sequence, and `generate` detokenizes
+  the whole answer at once. With `ImageAnalysisTask`, which declares its
+  description's cap, a live description now reads `DescriptionEnd::Ragged`
   when it closed at the cap and `Whole` when the model closed it short of
   it; a task that reads no account parses as before.
 - CI only (no API change, no source change): the `test` job now compiles and
@@ -102,15 +100,9 @@ and this crate adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- Re-exports `DescriptionEnd`, `FieldEnd` and `FieldEnds` from llmtask, so a
-  consumer with no direct llmtask dependency can read how a description ended
-  and override `Task::parse_ended`.
-- `Error::UnsupportedFieldCap { field, reason }`: `Engine::run` refuses, before
-  generation and by the field's name, a JSON Schema task whose schema does not
-  fix a top-level string field's `maxLength` by itself — an `anyOf` or `oneOf`
-  whose branches disagree on it, or of which only some cap it; a `$ref` that
-  is not a local JSON Pointer; a `patternProperties` pattern the `regex` crate
-  cannot compile — rather than leave that field's account silently out.
+- Re-exports `DescriptionEnd`, `FieldCaps`, `FieldEnd` and `FieldEnds` from
+  llmtask, so a consumer with no direct llmtask dependency can read how a
+  description ended and override `Task::parse_ended` and `Task::field_caps`.
 
 ## [0.4.0] - 2026-10-01
 

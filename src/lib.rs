@@ -251,12 +251,13 @@ pub enum ImageInput<'a> {
 // feature), and any other name is refused as `UnknownExtension` (see
 // CHANGELOG). Since llmtask 0.5 an analysis says how its description ends
 // (`DescriptionEnd`), settled by the decoder's account of each string field
-// (`FieldEnd`, `FieldEnds`) that `Engine::run` hands `Task::parse_ended`.
+// (`FieldEnd`, `FieldEnds`) that `Engine::run` hands `Task::parse_ended`,
+// read against the caps the task declares (`FieldCaps`, llmtask 0.5.2).
 pub use llmtask::{
   DescriptionEnd, ImageAnalysis,
   image_analysis::{Extension, ImageAnalysisTask, UnknownExtension},
 };
-pub use task::{FieldEnd, FieldEnds, JsonParseError, Task};
+pub use task::{FieldCaps, FieldEnd, FieldEnds, JsonParseError, Task};
 
 #[cfg(test)]
 mod tests {

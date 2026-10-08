@@ -290,23 +290,6 @@ pub enum Error {
   #[error(transparent)]
   LlGuidance(Box<dyn std::error::Error + Send + Sync>),
 
-  /// A task's JSON Schema does not fix the `maxLength` of one of its
-  /// top-level string fields by itself — a cap that depends on which branch
-  /// of an `anyOf` or `oneOf` the value falls under, a `$ref` that is not a
-  /// local JSON Pointer, or a `patternProperties` pattern the `regex` crate
-  /// cannot compile — so the decoder's account of how that field ended could
-  /// not be read against its cap. `Engine::run` refuses such a task before
-  /// generation rather than leave the field's account silently out.
-  #[cfg(feature = "inference")]
-  #[error("field {field:?}: {reason}")]
-  UnsupportedFieldCap {
-    /// The field, or the schema keyword that covers a set of fields
-    /// (`additionalProperties`, a `patternProperties` pattern).
-    field: SmolStr,
-    /// What the schema leaves open.
-    reason: &'static str,
-  },
-
   /// llguidance produced an all-zero next-token mask.
   #[error("llguidance produced empty mask at step {step}: {state}")]
   LlGuidanceDeadEnd {

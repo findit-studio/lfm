@@ -3,4 +3,4 @@
 //!
 //! Users can `use lfm::Task` instead of `use llmtask::Task`.
 
-pub use llmtask::{FieldEnd, FieldEnds, JsonParseError, Task};
+pub use llmtask::{FieldCaps, FieldEnd, FieldEnds, JsonParseError, Task};

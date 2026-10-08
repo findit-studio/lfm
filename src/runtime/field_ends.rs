@@ -50,15 +50,17 @@
 //!
 //! # The account: length first, then the mask
 //!
-//! [`field_ends`] decides each account by the string's length first. A
-//! string that closed holding exactly its member's `maxLength` characters
-//! was bound by the cap, whichever token carried the quote — a lone `"`, a
-//! `.` before a forced close, or `."` one character short: the model could
-//! not have written past it, so it is `cap`, whatever the mask shows. Only
-//! below the cap does the mask's reading decide: the model's close is
-//! `model`; a close every allowed token made there (an `enum`, a `const`, a
-//! `pattern`) is not at a cap and has no account; an unproven one has none
-//! either.
+//! [`field_ends`] decides each account by the string's length first, against
+//! the cap the task declares for its member ([`llmtask::Task::field_caps`]).
+//! lfm derives no cap from the schema: the task that wrote it is the one
+//! authority on its caps. A string that closed holding exactly its declared
+//! cap was bound by it, whichever token carried the quote — a lone `"`, a `.`
+//! before a forced close, or `."` one character short: the model could not
+//! have written past it, so it is `cap`, whatever the mask shows. Only below
+//! the cap — or for a member that declares none — does the mask's reading
+//! decide: the model's close is `model`; a close every allowed token made
+//! there (an `enum`, a `const`, a `pattern`, or a cap the task left
+//! undeclared) has no account; an unproven one has none either.
 //!
 //! # One lexeme, bound on its own
 //!
@@ -88,7 +90,7 @@ use llguidance::toktrie::{SimpleVob, TokTrie};
 use llmtask::{FieldEnd, FieldEnds};
 use smol_str::SmolStr;
 
-use super::field_caps::FieldCaps;
+use llmtask::FieldCaps;
 
 /// One member of the answer's top-level object, as the decode wrote it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -416,15 +418,16 @@ fn decode_key(written: &[u8]) -> Option<SmolStr> {
 ///
 /// The account is decided by the string's length first, then by the mask:
 ///
-/// 1. a string holding exactly its member's cap — the `maxLength` `caps`
-///    resolves from the schema, in characters as the schema counts them — was
-///    bound by the cap, whichever token carried the quote: the model could not
-///    have written past it, so it is [`FieldEnd::cap`];
-/// 2. below the cap, a close the mask shows was the model's
-///    ([`ClosedBy::Model`]) is [`FieldEnd::model`];
-/// 3. below the cap, a close every allowed token made — an `enum`, a `const`
-///    or a `pattern` can leave the model no other choice, and that close is
-///    not at a cap — or one the mask cannot attribute has no account.
+/// 1. a string holding exactly its member's cap — the `maxLength` the task
+///    declares for it in `caps` ([`llmtask::Task::field_caps`]), in Unicode
+///    scalar values — was bound by the cap, whichever token carried the
+///    quote: the model could not have written past it, so it is
+///    [`FieldEnd::cap`];
+/// 2. below the cap, or for a member with no declared cap, a close the mask
+///    shows was the model's ([`ClosedBy::Model`]) is [`FieldEnd::model`];
+/// 3. otherwise — a close every allowed token made (an `enum`, a `const`, a
+///    `pattern`, or a cap the task did not declare), or one the mask cannot
+///    attribute — there is no account.
 ///
 /// A key written more than once is read as serde_json reads it, by its last
 /// occurrence: that occurrence's string binds, and when its value is not a
@@ -440,7 +443,7 @@ pub(crate) fn field_ends(raw: &str, members: &[Member], caps: &FieldCaps) -> Fie
     let end = member
       .string
       .as_ref()
-      .and_then(|string| account(raw, string, caps.cap(field)));
+      .and_then(|string| account(raw, string, caps.get(field)));
     last.insert(field, end);
   }
   let mut ends = FieldEnds::new();
@@ -453,7 +456,7 @@ pub(crate) fn field_ends(raw: &str, members: &[Member], caps: &FieldCaps) -> Fie
 }
 
 /// The account of one member string, bound to its lexeme as `raw` carries
-/// it; `cap` is the `maxLength` the schema declares for the member.
+/// it; `cap` is the `maxLength` the task declares for the member.
 fn account(raw: &str, string: &MemberString, cap: Option<usize>) -> Option<FieldEnd> {
   let lexeme = raw.get(string.at..string.at.checked_add(string.lexeme.len())?)?;
   if lexeme.as_bytes() != string.lexeme.as_slice() {
@@ -646,13 +649,13 @@ mod tests {
     runtime::sampler::{ConstrainedSampler, SampleResult, Sampler},
   };
 
-  /// [`field_ends`] under the caps `schema` resolves to.
-  fn field_ends_under(raw: &str, members: &[Member], schema: &Value) -> FieldEnds {
-    field_ends(
-      raw,
-      members,
-      &FieldCaps::of(schema).expect("the schema's caps resolve"),
-    )
+  /// The caps a task declares, as `(field, maxLength)` pairs.
+  fn declared(caps: &[(&str, usize)]) -> FieldCaps {
+    let mut declared = FieldCaps::new();
+    for &(field, cap) in caps {
+      declared.insert(field, cap);
+    }
+    declared
   }
 
   // ===== the tracker, byte by byte =====
@@ -867,10 +870,9 @@ mod tests {
   /// the grammar's at the declared cap as `cap`.
   #[test]
   fn an_account_holds_the_decoded_untrimmed_field() {
-    let schema = json!({"properties": {"description": {"type": "string", "maxLength": 9}}});
     let raw = r#"{"description":"  A \"cat\"","scene":" kitchen "}"#;
     let members = recorded(raw, &[ClosedBy::Grammar, ClosedBy::Model]);
-    let ends = field_ends_under(raw, &members, &schema);
+    let ends = field_ends(raw, &members, &declared(&[("description", 9)]));
     assert_eq!(ends.get("description"), Some(&FieldEnd::cap("  A \"cat\"")));
     assert_eq!(ends.get("scene"), Some(&FieldEnd::model(" kitchen ")));
     assert_eq!(ends.len(), 2);
@@ -883,7 +885,6 @@ mod tests {
   /// each string member's account is bound to its own lexeme all the same.
   #[test]
   fn a_member_a_document_parse_refuses_costs_no_account() {
-    let schema = json!({"properties": {"description": {"type": "string", "maxLength": 9}}});
     let deep = format!("{}{}", "[".repeat(200), "]".repeat(200));
     for raw in [
       r#"{"description":"A cat.   ","n":1e400}"#.to_owned(),
@@ -893,7 +894,11 @@ mod tests {
         serde_json::from_str::<Value>(&raw).is_err(),
         "{raw}: a document parse refuses it"
       );
-      let ends = field_ends_under(&raw, &recorded(&raw, &[ClosedBy::Grammar]), &schema);
+      let ends = field_ends(
+        &raw,
+        &recorded(&raw, &[ClosedBy::Grammar]),
+        &declared(&[("description", 9)]),
+      );
       assert_eq!(
         ends.get("description"),
         Some(&FieldEnd::cap("A cat.   ")),
@@ -907,7 +912,6 @@ mod tests {
   /// value that is not a string leaves the key with no account.
   #[test]
   fn a_key_written_twice_binds_by_its_last_occurrence() {
-    let schema = json!({});
     let ends_of = |raw: &str| {
       let mut members = follow(&[raw.as_bytes()]);
       for string in members
@@ -916,7 +920,7 @@ mod tests {
       {
         string.closed_by = ClosedBy::Model;
       }
-      field_ends_under(raw, &members, &schema)
+      field_ends(raw, &members, &FieldCaps::new())
     };
     assert_eq!(
       ends_of(r#"{"description":"first","description":"last"}"#).get("description"),
@@ -936,11 +940,10 @@ mod tests {
   /// escape (JSON's grammar admits it; no string holds it) all bind nothing.
   #[test]
   fn an_account_binds_only_the_committed_decodable_lexeme() {
-    let schema = json!({});
     let committed = r#"{"description":"A cat."}"#;
     let members = recorded(committed, &[ClosedBy::Model]);
     assert_eq!(
-      field_ends_under(committed, &members, &schema).get("description"),
+      field_ends(committed, &members, &FieldCaps::new()).get("description"),
       Some(&FieldEnd::model("A cat."))
     );
     for other in [
@@ -949,12 +952,12 @@ mod tests {
       r#"{"description":"A cat"#,
     ] {
       assert!(
-        field_ends_under(other, &members, &schema).is_empty(),
+        field_ends(other, &members, &FieldCaps::new()).is_empty(),
         "{other}"
       );
     }
     let lone = r#"{"description":"\ud800"}"#;
-    assert!(field_ends_under(lone, &recorded(lone, &[ClosedBy::Model]), &schema).is_empty());
+    assert!(field_ends(lone, &recorded(lone, &[ClosedBy::Model]), &FieldCaps::new()).is_empty());
   }
 
   /// LAW (R1): **the length at the close decides first, then the mask.** A
@@ -966,12 +969,8 @@ mod tests {
   /// is no object.
   #[test]
   fn the_length_at_the_close_decides_first_then_the_mask() {
-    let schema = json!({"properties": {
-      "description": {"type": "string", "maxLength": 5},
-      "scene": {"type": "string", "enum": ["kitchen"]},
-    }});
     let end_of = |raw: &str, by: ClosedBy| {
-      field_ends_under(raw, &recorded(raw, &[by]), &schema)
+      field_ends(raw, &recorded(raw, &[by]), &declared(&[("description", 5)]))
         .get("description")
         .cloned()
     };
@@ -996,7 +995,12 @@ mod tests {
       r#""abcde""#,
     ] {
       assert!(
-        field_ends_under(raw, &follow(&[raw.as_bytes()]), &schema).is_empty(),
+        field_ends(
+          raw,
+          &follow(&[raw.as_bytes()]),
+          &declared(&[("description", 5)])
+        )
+        .is_empty(),
         "{raw}"
       );
     }
@@ -1072,7 +1076,7 @@ mod tests {
     );
     assert_eq!(closes(&members), [("description", ClosedBy::Grammar)]);
     assert_eq!(description(&raw), written);
-    let ends = field_ends_under(&raw, &members, task.schema());
+    let ends = field_ends(&raw, &members, &task.field_caps());
     let end = ends
       .get("description")
       .expect("the description has an account");
@@ -1111,7 +1115,7 @@ mod tests {
     );
     assert!(serde_json::from_str::<Value>(&raw).is_err(), "{raw}");
     assert_eq!(closes(&members), [("description", ClosedBy::Grammar)]);
-    let ends = field_ends_under(&raw, &members, &schema);
+    let ends = field_ends(&raw, &members, &declared(&[("description", 120)]));
     assert_eq!(ends.get("description"), Some(&FieldEnd::cap(&written)));
   }
 
@@ -1130,7 +1134,7 @@ mod tests {
       ],
     );
     assert_eq!(closes(&members), [("description", ClosedBy::Model)]);
-    let ends = field_ends_under(&raw, &members, task.schema());
+    let ends = field_ends(&raw, &members, &task.field_caps());
     assert_eq!(ends.get("description"), Some(&FieldEnd::model(written)));
     let analysis = task.parse_ended(&raw, &ends).expect("the answer parses");
     assert_eq!(analysis.description_end(), DescriptionEnd::Whole);
@@ -1162,7 +1166,7 @@ mod tests {
     );
     assert_eq!(closes(&members), [("description", ClosedBy::Unproven)]);
     assert_eq!(description(&raw), written);
-    let ends = field_ends_under(&raw, &members, task.schema());
+    let ends = field_ends(&raw, &members, &task.field_caps());
     assert_eq!(ends.get("description"), Some(&FieldEnd::cap(&written)));
     let analysis = task.parse_ended(&raw, &ends).expect("the answer parses");
     assert_eq!(analysis.description_end(), DescriptionEnd::Ragged);
@@ -1190,44 +1194,42 @@ mod tests {
     let schema = capped(0);
     let (raw, members) = decode(&schema, vec![text(r#"{"description":"","tags":["cat"]}"#)]);
     assert_eq!(closes(&members), [("description", ClosedBy::Grammar)]);
-    let ends = field_ends_under(&raw, &members, &schema);
+    let ends = field_ends(&raw, &members, &declared(&[("description", 0)]));
     assert_eq!(ends.get("description"), Some(&FieldEnd::cap("")));
   }
 
-  /// The account `schema` leads to for `field` of the answer `answer`,
-  /// decoded through the real matcher.
-  fn decoded_end(schema: &Value, answer: &str, field: &str) -> Option<FieldEnd> {
-    let (raw, members) = decode(schema, vec![text(answer)]);
-    assert_eq!(raw, answer);
-    field_ends_under(&raw, &members, schema).get(field).cloned()
+  /// The account a task declaring `caps` gets for `field` of `answer` under
+  /// `schema`, decoded through the real matcher: `answer` is `open`, the
+  /// field's `content`, then `close` — the closing quote its own step, so the
+  /// field's last content token never carries it.
+  fn decoded_end(
+    schema: &Value,
+    (open, content, close): (&str, &str, &str),
+    field: &str,
+    caps: &FieldCaps,
+  ) -> Option<FieldEnd> {
+    let (raw, members) = decode(schema, vec![text(open), text(content), text(close)]);
+    assert_eq!(raw, format!("{open}{content}{close}"));
+    field_ends(&raw, &members, caps).get(field).cloned()
   }
 
-  /// LAW (Codex R2, [medium]): **a cap reached through a `$ref` is the
-  /// cap's.** The description's schema is a reference to `#/$defs/…` capped
-  /// at 5; llguidance closes `"abcde"` at its fifth character, and the account
-  /// is `cap("abcde")` — not the no account a literal `properties` lookup
-  /// would leave.
+  /// LAW (Codex R3): **a field the schema caps is the cap's only when the task
+  /// declares its cap** — lfm reads no cap out of the schema. For each schema
+  /// the field reaches its cap through — a `$ref` to `#/$defs/…`, an `allOf`
+  /// of 8 and 5, `additionalProperties` for a field `properties` does not name
+  /// — the matcher closes the field at the cap; under the task's declared cap
+  /// the account is `cap`, and with none declared there is no account. A field
+  /// the model closed short of the cap is `model` either way.
   #[test]
-  fn a_cap_reached_through_a_ref_is_the_caps() {
-    let schema = json!({
+  fn a_schema_capped_field_is_the_caps_only_when_the_task_declares_it() {
+    let by_ref = json!({
       "type": "object",
       "properties": {"description": {"$ref": "#/$defs/description"}},
       "required": ["description"],
       "additionalProperties": false,
       "$defs": {"description": {"type": "string", "maxLength": 5}},
     });
-    assert_eq!(
-      decoded_end(&schema, r#"{"description":"abcde"}"#, "description"),
-      Some(FieldEnd::cap("abcde"))
-    );
-  }
-
-  /// LAW (Codex R2, [medium]): **an `allOf` of caps 5 and 8 caps at 5**: the
-  /// matcher closes `"abcde"` at its fifth character, and the account is
-  /// `cap("abcde")`.
-  #[test]
-  fn an_all_of_caps_at_its_smallest_through_the_matcher() {
-    let schema = json!({
+    let all_of = json!({
       "type": "object",
       "properties": {"description": {"allOf": [
         {"type": "string", "maxLength": 8},
@@ -1236,25 +1238,68 @@ mod tests {
       "required": ["description"],
       "additionalProperties": false,
     });
-    assert_eq!(
-      decoded_end(&schema, r#"{"description":"abcde"}"#, "description"),
-      Some(FieldEnd::cap("abcde"))
-    );
-  }
-
-  /// LAW (Codex R2, [medium]): **a member no `properties` entry names is
-  /// capped by `additionalProperties`**: `note`, a string of at most 3, closes
-  /// at `"abc"` and its account is `cap("abc")`.
-  #[test]
-  fn an_unlisted_member_is_capped_by_additional_properties() {
-    let schema = json!({
+    let additional = json!({
       "type": "object",
       "additionalProperties": {"type": "string", "maxLength": 3},
     });
-    assert_eq!(
-      decoded_end(&schema, r#"{"note":"abc"}"#, "note"),
-      Some(FieldEnd::cap("abc"))
+    for (schema, field, at_cap, short) in [
+      (&by_ref, "description", "abcde", "ab"),
+      (&all_of, "description", "abcde", "ab"),
+      (&additional, "note", "abc", "a"),
+    ] {
+      let open = format!(r#"{{"{field}":""#);
+      let cap = at_cap.chars().count();
+      let declared = declared(&[(field, cap)]);
+      assert_eq!(
+        decoded_end(schema, (&open, at_cap, r#""}"#), field, &declared),
+        Some(FieldEnd::cap(at_cap)),
+        "{schema}: declared"
+      );
+      assert_eq!(
+        decoded_end(schema, (&open, at_cap, r#""}"#), field, &FieldCaps::new()),
+        None,
+        "{schema}: undeclared"
+      );
+      for caps in [&declared, &FieldCaps::new()] {
+        assert_eq!(
+          decoded_end(schema, (&open, short, r#""}"#), field, caps),
+          Some(FieldEnd::model(short)),
+          "{schema}: the model's close"
+        );
+      }
+    }
+  }
+
+  /// LAW (Codex R3, [high]): **llguidance resolves a `$ref` inside an `$id`
+  /// subresource against that subresource, and the account follows the
+  /// task's declared cap.** The description refers to `#/$defs/inner`, which
+  /// sets its own `$id`; inside it `#/$defs/cap` is the subresource's cap of
+  /// 3, not the root's 9. The matcher closes `"abc"` itself — every token it
+  /// allows at the third character closes the string — and under the task's
+  /// declared 3 the account is `cap("abc")`.
+  #[test]
+  fn an_id_subresource_cap_is_the_matchers_and_the_declared_one() {
+    let schema = json!({
+      "type": "object",
+      "properties": {"description": {"$ref": "#/$defs/inner"}},
+      "required": ["description"],
+      "additionalProperties": false,
+      "$defs": {
+        "cap": {"type": "string", "maxLength": 9},
+        "inner": {
+          "$id": "https://example.com/fieldend/inner",
+          "$ref": "#/$defs/cap",
+          "$defs": {"cap": {"type": "string", "maxLength": 3}},
+        },
+      },
+    });
+    let (raw, members) = decode(
+      &schema,
+      vec![text(r#"{"description":""#), text("abc"), text(r#""}"#)],
     );
+    assert_eq!(closes(&members), [("description", ClosedBy::Grammar)]);
+    let ends = field_ends(&raw, &members, &declared(&[("description", 3)]));
+    assert_eq!(ends.get("description"), Some(&FieldEnd::cap("abc")));
   }
 
   /// LAW (Codex R1, [medium]): **a string the model opens and closes in one
@@ -1277,7 +1322,7 @@ mod tests {
       ],
     );
     assert_eq!(closes(&members), [("description", ClosedBy::Model)]);
-    let ends = field_ends_under(&raw, &members, &schema);
+    let ends = field_ends(&raw, &members, &declared(&[("description", 120)]));
     assert_eq!(ends.get("description"), Some(&FieldEnd::model("")));
   }
 
@@ -1304,7 +1349,7 @@ mod tests {
     );
     assert_eq!(description(&raw), ",");
     assert_eq!(closes(&members), [("description", ClosedBy::Unproven)]);
-    assert!(field_ends_under(&raw, &members, &schema).is_empty());
+    assert!(field_ends(&raw, &members, &declared(&[("description", 120)])).is_empty());
   }
 
   /// The mask `matcher` computes for its next token.
@@ -1418,7 +1463,7 @@ mod tests {
     steps.push(text(r#"","tags":["cat"]}"#));
     let (raw, members) = decode(task.schema(), steps);
     assert_eq!(closes(&members), [("description", ClosedBy::Grammar)]);
-    let ends = field_ends_under(&raw, &members, task.schema());
+    let ends = field_ends(&raw, &members, &task.field_caps());
     let end = ends
       .get("description")
       .expect("the description has an account");
@@ -1460,7 +1505,7 @@ mod tests {
     }
     steps.push(text("}"));
     let (raw, members) = decode(task.schema(), steps);
-    let ends = field_ends_under(&raw, &members, task.schema());
+    let ends = field_ends(&raw, &members, &task.field_caps());
     let fields: Vec<(&str, bool)> = ends
       .iter()
       .map(|(field, end)| (field, end.closed_at_cap()))
