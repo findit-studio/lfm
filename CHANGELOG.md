@@ -7,6 +7,31 @@ and this crate adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking: `llmtask` 0.4 → 0.5 (the dependency requires 0.5.1).** lfm
+  re-exports `ImageAnalysis`, `ImageAnalysisTask`, `Extension`,
+  `UnknownExtension`, `JsonParseError` and `Task` from llmtask, and
+  `Engine::run` takes any `llmtask::Task`, so llmtask 0.5's changes reach
+  lfm's API: `ImageAnalysis` gains `description_end` (serialized last),
+  `JsonParseError` gains `DescriptionCapMismatch`, and `Task` gains the
+  provided `parse_ended`.
+- `Engine::run` hands the task the constrained decoder's account of how it
+  ended each string field of the answer (findit-studio/application#235): it
+  calls `task.parse_ended(raw, &ends)` where it called `task.parse(raw)`. For
+  a JSON Schema grammar the constrained sampler follows the answer's JSON and
+  records, for each string member of its top-level object, whether the model
+  closed the string or the grammar did: the close is the grammar's when no
+  token the mask allowed at that step would have left the string open. Each
+  account holds the member's string as serde_json decodes it from the raw
+  answer, untrimmed — `FieldEnd::model(field)` for the model's close,
+  `FieldEnd::cap(field)` for the grammar's close at the `maxLength` the
+  schema's top-level `properties` entry declares, the string holding exactly
+  that many characters. A close the grammar forces short of a declared cap
+  (an `enum`, a `const` or a `pattern`) has no account. No account names a
+  cut token (`with_cut`): llguidance never admits a closing quote after a
+  partial UTF-8 sequence, and `generate` detokenizes the whole answer at
+  once. With `ImageAnalysisTask` a live description now reads
+  `DescriptionEnd::Whole` or `Ragged` instead of `Unknown`; a task that reads
+  no account parses as before.
 - CI only (no API change, no source change): the `test` job now compiles and
   runs `tests/options_document.rs` (`--features serde`, and again with
   `--no-default-features`) and the serde-gated unit tests in `src/options.rs`
@@ -61,6 +86,12 @@ and this crate adheres to [Semantic Versioning](https://semver.org/).
   there is no lfm API change and no source change: the test file's
   `toml::to_string`, `toml::from_str`, `toml::Table` and `toml::Value` uses compile
   and pass unchanged against toml 1.1.
+
+### Added
+
+- Re-exports `DescriptionEnd`, `FieldEnd` and `FieldEnds` from llmtask, so a
+  consumer with no direct llmtask dependency can read how a description ended
+  and override `Task::parse_ended`.
 
 ## [0.4.0] - 2026-10-01
 

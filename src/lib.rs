@@ -249,12 +249,14 @@ pub enum ImageInput<'a> {
 // schema. Since llmtask 0.4.1 an `Extension` is named by its field's JSON key
 // (`FromStr`, `TryFrom<&str>`, `Display`, and serde with the `serde`
 // feature), and any other name is refused as `UnknownExtension` (see
-// CHANGELOG).
+// CHANGELOG). Since llmtask 0.5 an analysis says how its description ends
+// (`DescriptionEnd`), settled by the decoder's account of each string field
+// (`FieldEnd`, `FieldEnds`) that `Engine::run` hands `Task::parse_ended`.
 pub use llmtask::{
-  ImageAnalysis,
+  DescriptionEnd, ImageAnalysis,
   image_analysis::{Extension, ImageAnalysisTask, UnknownExtension},
 };
-pub use task::{JsonParseError, Task};
+pub use task::{FieldEnd, FieldEnds, JsonParseError, Task};
 
 #[cfg(test)]
 mod tests {
