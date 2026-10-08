@@ -18,6 +18,9 @@ pub(crate) mod backend;
 // gate rather than inside the macOS-only `mlx_backend`.
 #[cfg(feature = "decoders")]
 pub(crate) mod checkpoint;
+// How each string field of a JSON answer was closed, followed token by token
+// by the constrained sampler.
+pub(crate) mod field_ends;
 // The ORT-backed component wrappers. `ort` is mandatory on the ALLOW-listed
 // targets (Linux x86_64/aarch64-gnu, Windows x86_64/aarch64-msvc) and optional on
 // aarch64-apple-darwin behind the `ort` feature; every other target compiles

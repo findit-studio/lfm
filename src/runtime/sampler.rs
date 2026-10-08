@@ -36,6 +36,8 @@ use std::collections::HashSet;
 use llguidance::Constraint;
 use smol_str::SmolStr;
 
+#[cfg(feature = "inference")]
+use crate::runtime::field_ends::{FieldTracker, Masked, Member};
 use crate::{
   error::{Error, Result},
   options::RequestOptions,
@@ -191,6 +193,10 @@ impl Sampler for FreeSampler {
 pub(crate) struct ConstrainedSampler {
   inner: FreeSampler,
   constraint: Constraint,
+  /// Follows the answer as a JSON text to record how each string field of
+  /// its top-level object closed; `None` unless
+  /// [`Self::with_field_tracking`] asked for it.
+  fields: Option<FieldTracker>,
 }
 
 #[cfg(feature = "inference")]
@@ -209,7 +215,28 @@ impl ConstrainedSampler {
       // double-masking is cheap and defensive.
       inner: FreeSampler::new(opts, seed, vocab_size),
       constraint,
+      fields: None,
     }
+  }
+
+  /// Builder: follow the answer as a JSON text and record each member of its
+  /// top-level object — for a string value, its lexeme and whether the model
+  /// closed it or the grammar left no other choice ([`Self::field_members`]).
+  /// For a constraint compiled from a JSON Schema, whose answer is a JSON
+  /// text.
+  // Its one caller, `Engine::run`, is compiled only with `decoders` on.
+  #[cfg_attr(not(feature = "decoders"), allow(dead_code))]
+  pub(crate) fn with_field_tracking(mut self) -> Self {
+    self.fields = Some(FieldTracker::new());
+    self
+  }
+
+  /// The members of the answer's top-level object, in the order the answer
+  /// wrote them; empty unless [`Self::with_field_tracking`] asked for the
+  /// record.
+  #[cfg_attr(not(feature = "decoders"), allow(dead_code))]
+  pub(crate) fn field_members(&self) -> &[Member] {
+    self.fields.as_ref().map_or(&[], FieldTracker::members)
   }
 }
 
@@ -221,9 +248,11 @@ impl Sampler for ConstrainedSampler {
     seen_tokens: &HashSet<u32>,
     step: usize,
   ) -> Result<SampleResult> {
-    // 1) Ask llguidance for the allowed-token mask.
-    //    Returns &StepResult = &Branch<SimpleVob>.
-    let step_result = self.constraint.compute_mask().map_err(Error::llguidance)?;
+    // 1) Ask llguidance for the allowed-token mask, then read the
+    //    `StepResult` (= `Branch<SimpleVob>`) it stored back through a
+    //    shared borrow, so step 6 can read the token trie beside the mask.
+    self.constraint.compute_mask().map_err(Error::llguidance)?;
+    let step_result = self.constraint.step_result();
 
     // 2) Check if the schema has accepted (stop state: no mask, no splices).
     if step_result.is_stop() {
@@ -270,7 +299,15 @@ impl Sampler for ConstrainedSampler {
       }
     };
 
-    // 6) Commit the chosen token to advance llguidance's state machine.
+    // 6) Follow the answer's JSON while the mask this token was drawn under
+    //    is still at hand: for each top-level string field the token closes,
+    //    the mask shows who closed it.
+    if let Some(fields) = &mut self.fields {
+      let trie = self.constraint.tok_trie();
+      fields.commit(trie.token(id), &Masked { mask, trie });
+    }
+
+    // 7) Commit the chosen token to advance llguidance's state machine.
     //
     // `CommitResult.stop` ONLY reports stop when the *previous*
     // compute_mask was already in stop state (see llguidance 1.7.3

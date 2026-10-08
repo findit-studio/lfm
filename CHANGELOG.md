@@ -7,6 +7,42 @@ and this crate adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking: `llmtask` 0.4 → 0.5 (the dependency requires 0.5.2).** lfm
+  re-exports `ImageAnalysis`, `ImageAnalysisTask`, `Extension`,
+  `UnknownExtension`, `JsonParseError` and `Task` from llmtask, and
+  `Engine::run` takes any `llmtask::Task`, so llmtask 0.5's changes reach
+  lfm's API: `ImageAnalysis` gains `description_end` (serialized last),
+  `JsonParseError` gains `DescriptionCapMismatch`, and `Task` gains the
+  provided `parse_ended` and `field_caps`.
+- `Engine::run` hands the task the constrained decoder's account of how it
+  ended each string field of the answer (findit-studio/application#235): it
+  calls `task.parse_ended(raw, &ends)` where it called `task.parse(raw)`. For
+  a JSON Schema grammar the constrained sampler follows the answer's JSON and
+  records, for each string member of its top-level object, its lexeme and
+  who closed it, reading each close — wherever it falls in the drawn token —
+  against the whole mask the token was drawn under: the model's when an
+  allowed token writes the drawn token's bytes up to the close and then
+  continues the string; the grammar's when every allowed token closes that
+  same string; unproven otherwise. Each account is bound to the member's
+  string lexeme alone, as the raw answer carries it where the matcher
+  committed it, decoded by serde_json on its own (JSON-decoded, untrimmed),
+  so a member serde_json cannot materialize as a value (a number past `f64`,
+  deep nesting) costs no other member its account; a key written twice binds
+  by its last occurrence, as serde_json reads it. The account is decided by
+  the length first, against the cap the task declares for the field
+  (`Task::field_caps`): lfm reads no cap out of the schema, the task that
+  wrote it being the one authority on its caps. A string that closed holding
+  exactly its declared cap was bound by it, whichever token carried the
+  quote, and is `FieldEnd::cap(field)`. Below the cap — or for a field with
+  no declared cap — the model's close is `FieldEnd::model(field)`, and a
+  close every allowed token made (an `enum`, a `const`, a `pattern`, a cap
+  the task did not declare) or one the mask cannot attribute has no account.
+  No account names a cut token (`with_cut`): llguidance never admits a
+  closing quote after a partial UTF-8 sequence, and `generate` detokenizes
+  the whole answer at once. With `ImageAnalysisTask`, which declares its
+  description's cap, a live description now reads `DescriptionEnd::Ragged`
+  when it closed at the cap and `Whole` when the model closed it short of
+  it; a task that reads no account parses as before.
 - CI only (no API change, no source change): the `test` job now compiles and
   runs `tests/options_document.rs` (`--features serde`, and again with
   `--no-default-features`) and the serde-gated unit tests in `src/options.rs`
@@ -61,6 +97,12 @@ and this crate adheres to [Semantic Versioning](https://semver.org/).
   there is no lfm API change and no source change: the test file's
   `toml::to_string`, `toml::from_str`, `toml::Table` and `toml::Value` uses compile
   and pass unchanged against toml 1.1.
+
+### Added
+
+- Re-exports `DescriptionEnd`, `FieldCaps`, `FieldEnd` and `FieldEnds` from
+  llmtask, so a consumer with no direct llmtask dependency can read how a
+  description ended and override `Task::parse_ended` and `Task::field_caps`.
 
 ## [0.4.0] - 2026-10-01
 

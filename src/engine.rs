@@ -50,6 +50,7 @@ use crate::{
   runtime::{
     backend::{Backend, BackendImpl},
     checkpoint::{self, CheckpointLayout},
+    field_ends::field_ends,
     sampler::{ConstrainedSampler, FreeSampler},
   },
 };
@@ -69,6 +70,7 @@ use crate::runtime::{
 };
 
 use llguidance::{Constraint, ParserFactory, api::TopLevelGrammar};
+use llmtask::FieldEnds;
 use toktrie::TokEnv;
 
 /// Public engine for LFM2.5-VL inference.
@@ -738,9 +740,26 @@ impl Engine {
   ///    guarantees `task.prompt()` is always present, so the schema-
   ///    valid output reflects the task's grounding rules and not just
   ///    its JSON shape.
-  /// 2. Compiles `task.schema()` into an llguidance `Constraint`.
-  /// 3. Runs the generation loop with a constraint-driven sampler.
-  /// 4. Passes the raw text to `task.parse(raw)` for typed deserialization.
+  /// 2. Compiles `task.grammar()` into an llguidance `Constraint`.
+  /// 3. Runs the generation loop with a constraint-driven sampler. For a
+  ///    JSON Schema grammar the sampler also records, for each string field
+  ///    of the answer's top-level object, whether the model closed the
+  ///    string or the grammar did at the field's `maxLength`.
+  /// 4. Passes the raw text and that account of each string field
+  ///    ([`llmtask::FieldEnds`]) to `task.parse_ended(raw, &ends)` for typed
+  ///    deserialization. A task that reads no account parses as
+  ///    `task.parse(raw)` would; `ImageAnalysisTask` marks its description
+  ///    `Whole` or `Ragged` by it (findit-studio/application#235).
+  ///
+  /// An account holds the field's string as the raw text carries it,
+  /// JSON-decoded and untrimmed. It never names a cut token: a string the
+  /// grammar closes at its `maxLength` always ends in a whole character.
+  ///
+  /// A field's cap is the one the task declares
+  /// ([`llmtask::Task::field_caps`]); lfm reads no cap out of the schema. A
+  /// field that closed holding exactly its declared cap is `cap`; a field
+  /// with no declared cap is never `cap` (the model's close is still
+  /// `model`).
   ///
   /// The `ParserFactory` is constructed once and cached across calls.
   pub fn run<T: llmtask::Task>(
@@ -774,36 +793,16 @@ impl Engine {
       req.max_new_tokens(),
     )?;
 
-    // Build a single user message: N image parts followed by the task
-    // prompt text. This locks in the contract that task.prompt() is
-    // always sent with the images — callers can't accidentally drop it.
-    let mut parts: Vec<ContentPart> = Vec::with_capacity(images.len() + 1);
-    for _ in 0..images.len() {
-      parts.push(ContentPart::Image);
-    }
-    parts.push(ContentPart::Text(task.prompt().to_owned()));
-    let messages = [ChatMessage::parts(
-      smol_str::SmolStr::new_static("user"),
-      parts,
-    )];
-
     let factory = self.parser_factory()?;
-    let constraint = build_constraint(&factory, &task.grammar())?;
-    let seed = self.draw_seed();
-    let mut sampler = ConstrainedSampler::new(
-      constraint,
-      *req,
-      seed,
-      self.tokenizer.get_vocab_size(true) as u32,
-    );
-    let text = generate(
-      &self.preproc,
-      &mut self.backend,
-      &self.tokenizer,
-      &mut sampler,
-      GenerateInputs::new(&messages, images, req, self.eos_token_id),
-    )?;
-    task.parse(&text).map_err(Error::from)
+    ConstrainedRun {
+      preproc: &self.preproc,
+      backend: &mut self.backend,
+      tokenizer: &self.tokenizer,
+      factory: &factory,
+      eos_token_id: self.eos_token_id,
+      next_seed: &mut self.next_seed,
+    }
+    .run(task, images, req)
   }
 
   // ===== internal =====
@@ -812,9 +811,7 @@ impl Engine {
   /// [`Engine::generate`] / [`Engine::run`] gets a distinct seed so
   /// non-greedy sampling doesn't replay an identical sequence.
   fn draw_seed(&mut self) -> u64 {
-    let seed = self.next_seed;
-    self.next_seed = self.next_seed.wrapping_add(1);
-    seed
+    take_seed(&mut self.next_seed)
   }
 
   /// Lazily construct and cache the `ParserFactory`.
@@ -831,6 +828,87 @@ impl Engine {
     self.parser_factory = Some(arc.clone());
     Ok(arc)
   }
+}
+
+// =========================================================================
+// Schema-constrained run
+// =========================================================================
+
+/// [`Engine::run`] past its admission checks — the prompt, the constraint,
+/// the decode, and the parse with the decoder's account — over any
+/// [`Backend`]. The engine lends it its parts; a test lends it a scripted
+/// backend.
+struct ConstrainedRun<'e, B: Backend> {
+  preproc: &'e Preprocessor,
+  backend: &'e mut B,
+  tokenizer: &'e Tokenizer,
+  factory: &'e ParserFactory,
+  eos_token_id: u32,
+  /// The engine's seed counter, drawn from once the constraint is built.
+  next_seed: &'e mut u64,
+}
+
+impl<B: Backend> ConstrainedRun<'_, B> {
+  fn run<T: llmtask::Task>(
+    self,
+    task: &T,
+    images: &[ImageInput<'_>],
+    req: &RequestOptions,
+  ) -> Result<T::Output>
+  where
+    Error: From<T::ParseError>,
+  {
+    // Build a single user message: N image parts followed by the task
+    // prompt text. This locks in the contract that task.prompt() is
+    // always sent with the images — callers can't accidentally drop it.
+    let mut parts: Vec<ContentPart> = Vec::with_capacity(images.len() + 1);
+    for _ in 0..images.len() {
+      parts.push(ContentPart::Image);
+    }
+    parts.push(ContentPart::Text(task.prompt().to_owned()));
+    let messages = [ChatMessage::parts(
+      smol_str::SmolStr::new_static("user"),
+      parts,
+    )];
+
+    let grammar = task.grammar();
+    let constraint = build_constraint(self.factory, &grammar)?;
+    let seed = take_seed(self.next_seed);
+    let mut sampler = ConstrainedSampler::new(
+      constraint,
+      *req,
+      seed,
+      self.tokenizer.get_vocab_size(true) as u32,
+    );
+    // The answer to a JSON Schema is a JSON text: follow it, so the task
+    // learns how the decoder ended each of its string fields.
+    let json = grammar.is_json_schema();
+    if json {
+      sampler = sampler.with_field_tracking();
+    }
+    let text = generate(
+      self.preproc,
+      self.backend,
+      self.tokenizer,
+      &mut sampler,
+      GenerateInputs::new(&messages, images, req, self.eos_token_id),
+    )?;
+    // Read against the caps the task declares: lfm derives none from the
+    // schema.
+    let ends = if json {
+      field_ends(&text, sampler.field_members(), &task.field_caps())
+    } else {
+      FieldEnds::new()
+    };
+    task.parse_ended(&text, &ends).map_err(Error::from)
+  }
+}
+
+/// Returns `counter`'s seed and advances it.
+fn take_seed(counter: &mut u64) -> u64 {
+  let seed = *counter;
+  *counter = counter.wrapping_add(1);
+  seed
 }
 
 // =========================================================================
@@ -1781,7 +1859,12 @@ fn build_constraint(factory: &ParserFactory, grammar: &llmtask::Grammar) -> Resu
 
 #[cfg(test)]
 mod tests {
+  use llmtask::Task;
+
   use super::*;
+  use crate::runtime::field_ends::testing::{
+    Script, Step, bundled_tokenizer_json, caption, factory, text, trie,
+  };
 
   #[test]
   fn engine_paths_accessors() {
@@ -2291,5 +2374,362 @@ mod tests {
       !names_preprocessing(&err),
       "the unchecked door must not run the preprocessing gate; failure was {err}"
     );
+  }
+
+  // ===== `Engine::run` past its admission checks, over a scripted backend =====
+
+  /// A backend that plays a [`Script`]: each decoder step's logits make the
+  /// script's next token the greedy pick wherever the matcher allows it, and
+  /// `embed_one` hears which token was drawn (all but the one that completes
+  /// the answer, after which `generate` embeds nothing). No model runs and no
+  /// image is read.
+  struct ScriptedBackend {
+    script: Script,
+  }
+
+  impl Backend for ScriptedBackend {
+    type Embeds = ();
+    type Cache = ();
+
+    fn kind(&self) -> BackendKind {
+      BackendKind::Onnx
+    }
+
+    fn make_cache(&self) -> Result<()> {
+      Ok(())
+    }
+
+    fn plan_image(&self, _: &Preprocessor, _: usize, _: u32, _: u32) -> Result<ImagePlan> {
+      Err(Error::InvalidRequest("the scripted backend reads no image"))
+    }
+
+    fn prepare_prompt_embeds(
+      &mut self,
+      _: &Preprocessor,
+      _: &[i64],
+      _: &[ImageInput<'_>],
+      _: &[ImagePlan],
+      _: &[usize],
+    ) -> Result<()> {
+      Ok(())
+    }
+
+    fn embed_one(&mut self, token_id: i64) -> Result<()> {
+      self.script.drew(token_id as u32);
+      Ok(())
+    }
+
+    fn decoder_step(&mut self, _: &mut (), _: &(), _: usize) -> Result<Vec<f32>> {
+      Ok(self.script.logits(trie().vocab_size()))
+    }
+  }
+
+  /// `ImageAnalysisTask`, keeping the accounts `parse_ended` is handed.
+  struct Recorded {
+    task: crate::ImageAnalysisTask,
+    ends: std::cell::RefCell<Option<llmtask::FieldEnds>>,
+  }
+
+  impl Task for Recorded {
+    type Output = crate::ImageAnalysis;
+    type Value = serde_json::Value;
+    type ParseError = llmtask::JsonParseError;
+
+    fn prompt(&self) -> &str {
+      self.task.prompt()
+    }
+
+    fn schema(&self) -> &serde_json::Value {
+      self.task.schema()
+    }
+
+    fn grammar(&self) -> llmtask::Grammar {
+      self.task.grammar()
+    }
+
+    fn parse(
+      &self,
+      raw: &str,
+    ) -> std::result::Result<crate::ImageAnalysis, llmtask::JsonParseError> {
+      self.task.parse(raw)
+    }
+
+    fn parse_ended(
+      &self,
+      raw: &str,
+      ends: &llmtask::FieldEnds,
+    ) -> std::result::Result<crate::ImageAnalysis, llmtask::JsonParseError> {
+      *self.ends.borrow_mut() = Some(ends.clone());
+      self.task.parse_ended(raw, ends)
+    }
+
+    fn field_caps(&self) -> llmtask::FieldCaps {
+      self.task.field_caps()
+    }
+  }
+
+  impl Recorded {
+    fn new(task: crate::ImageAnalysisTask) -> Self {
+      Self {
+        task,
+        ends: std::cell::RefCell::new(None),
+      }
+    }
+
+    /// The accounts the last `parse_ended` call was handed.
+    fn ends(&self) -> llmtask::FieldEnds {
+      self
+        .ends
+        .borrow()
+        .clone()
+        .expect("`parse_ended` was called")
+    }
+  }
+
+  /// Runs `task` through [`ConstrainedRun`] — `Engine::run` past its
+  /// admission checks — with no image, over a backend that plays `steps`,
+  /// and the engine's seed counter at 7. Returns the run's result and the
+  /// counter after it.
+  fn run_scripted<T: Task>(task: &T, steps: Vec<Step>) -> (Result<T::Output>, u64)
+  where
+    Error: From<T::ParseError>,
+  {
+    let tokenizer = Tokenizer::from_bytes(bundled_tokenizer_json()).expect("the tokenizer loads");
+    let preproc = Preprocessor::new(ImageBudget::default());
+    let mut backend = ScriptedBackend {
+      script: Script::new(steps),
+    };
+    let mut next_seed = 7;
+    let result = ConstrainedRun {
+      preproc: &preproc,
+      backend: &mut backend,
+      tokenizer: &tokenizer,
+      factory: factory(),
+      eos_token_id: crate::chat_template::EOS_TOKEN_ID,
+      next_seed: &mut next_seed,
+    }
+    .run(task, &[], &RequestOptions::deterministic());
+    (result, next_seed)
+  }
+
+  /// A JSON Schema task that declares `caps`, parses any answer to nothing,
+  /// and keeps the accounts `parse_ended` is handed.
+  struct SchemaTask {
+    schema: serde_json::Value,
+    caps: llmtask::FieldCaps,
+    ends: std::cell::RefCell<Option<llmtask::FieldEnds>>,
+  }
+
+  impl SchemaTask {
+    fn new(schema: serde_json::Value, caps: &[(&str, usize)]) -> Self {
+      let mut declared = llmtask::FieldCaps::new();
+      for &(field, cap) in caps {
+        declared.insert(field, cap);
+      }
+      Self {
+        schema,
+        caps: declared,
+        ends: std::cell::RefCell::new(None),
+      }
+    }
+
+    /// The accounts the last `parse_ended` call was handed.
+    fn ends(&self) -> llmtask::FieldEnds {
+      self
+        .ends
+        .borrow()
+        .clone()
+        .expect("`parse_ended` was called")
+    }
+  }
+
+  impl Task for SchemaTask {
+    type Output = ();
+    type Value = serde_json::Value;
+    type ParseError = llmtask::JsonParseError;
+
+    fn prompt(&self) -> &str {
+      "Answer in JSON."
+    }
+
+    fn schema(&self) -> &serde_json::Value {
+      &self.schema
+    }
+
+    fn grammar(&self) -> llmtask::Grammar {
+      llmtask::Grammar::JsonSchema(self.schema.clone())
+    }
+
+    fn parse(&self, _: &str) -> std::result::Result<(), llmtask::JsonParseError> {
+      Ok(())
+    }
+
+    fn parse_ended(
+      &self,
+      raw: &str,
+      ends: &llmtask::FieldEnds,
+    ) -> std::result::Result<(), llmtask::JsonParseError> {
+      *self.ends.borrow_mut() = Some(ends.clone());
+      self.parse(raw)
+    }
+
+    fn field_caps(&self) -> llmtask::FieldCaps {
+      self.caps.clone()
+    }
+  }
+
+  /// `D_n`: a description schema that `allOf`s two references to `D_{n-1}`,
+  /// down to `D_0`, a string of at most 5 — compact, acyclic, and `2^n`
+  /// references deep when each is expanded anew.
+  fn doubling_schema(depth: usize) -> serde_json::Value {
+    let mut defs = serde_json::Map::new();
+    defs.insert(
+      "d0".to_owned(),
+      serde_json::json!({"type": "string", "maxLength": 5}),
+    );
+    for level in 1..=depth {
+      let below = format!("#/$defs/d{}", level - 1);
+      defs.insert(
+        format!("d{level}"),
+        serde_json::json!({"allOf": [{"$ref": below}, {"$ref": below}]}),
+      );
+    }
+    serde_json::json!({
+      "type": "object",
+      "properties": {"description": {"$ref": format!("#/$defs/d{depth}")}},
+      "required": ["description"],
+      "additionalProperties": false,
+      "$defs": defs,
+    })
+  }
+
+  /// LAW (Codex R3, [high]): **lfm reads no cap out of the schema, so a
+  /// compact schema is no cost at admission.** `D_30` doubles its references
+  /// thirty times; llguidance compiles it once per reference, and lfm, which
+  /// takes the description's cap from the task, never walks it. The whole run
+  /// — admission, decode, the account — finishes within a budget a walk of
+  /// `2^30` references could not, and the description the matcher closed at 5
+  /// is `cap("abcde")` under the task's declared cap.
+  #[test]
+  fn a_compact_schema_admits_without_walking_it() {
+    factory();
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+      let task = SchemaTask::new(doubling_schema(30), &[("description", 5)]);
+      let (result, _) = run_scripted(&task, vec![text(r#"{"description":"abcde"}"#)]);
+      let _ = done.send(result.map(|()| task.ends()));
+    });
+    let ends = finished
+      .recv_timeout(std::time::Duration::from_secs(20))
+      .expect("the run finishes within its budget")
+      .expect("the run parses");
+    assert_eq!(
+      ends.get("description"),
+      Some(&llmtask::FieldEnd::cap("abcde"))
+    );
+  }
+
+  /// LAW (Codex R3, [high]): **a cap behind an `$id` subresource is the cap
+  /// the task declares.** The description refers to `#/$defs/inner`, which
+  /// sets its own `$id`: inside it `#/$defs/cap` names the subresource's cap
+  /// of 3, not the document root's cap of 9. llguidance resolves it in the
+  /// subresource and closes the description at `"abc"`; the task declares 3,
+  /// and the account is `cap("abc")`.
+  #[test]
+  fn a_cap_behind_an_id_subresource_is_the_one_the_task_declares() {
+    let schema = serde_json::json!({
+      "type": "object",
+      "properties": {"description": {"$ref": "#/$defs/inner"}},
+      "required": ["description"],
+      "additionalProperties": false,
+      "$defs": {
+        "cap": {"type": "string", "maxLength": 9},
+        "inner": {
+          "$id": "https://example.com/fieldend/inner",
+          "$ref": "#/$defs/cap",
+          "$defs": {"cap": {"type": "string", "maxLength": 3}},
+        },
+      },
+    });
+    let task = SchemaTask::new(schema, &[("description", 3)]);
+    let (result, _) = run_scripted(
+      &task,
+      vec![text(r#"{"description":""#), text("abc"), text(r#""}"#)],
+    );
+    result.expect("the run parses");
+    assert_eq!(
+      task.ends().get("description"),
+      Some(&llmtask::FieldEnd::cap("abc"))
+    );
+  }
+
+  /// The answer to `task` whose description is `written`, `scene` (when the
+  /// task asks for it) `kitchen`, and `tags` one label, in the order the
+  /// schema lists them; the description's closing quote is a step of its
+  /// own, so its last content token never carries it.
+  fn answer(task: &crate::ImageAnalysisTask, written: &str) -> Vec<Step> {
+    let mut steps = vec![text("{")];
+    let properties = task.schema()["properties"]
+      .as_object()
+      .expect("the schema's properties are an object");
+    for (at, field) in properties.keys().enumerate() {
+      if at > 0 {
+        steps.push(text(","));
+      }
+      steps.push(text(&format!(r#""{field}":"#)));
+      match field.as_str() {
+        "description" => steps.extend([text(r#"""#), text(written), text(r#"""#)]),
+        "scene" => steps.push(text(r#""kitchen""#)),
+        "tags" => steps.push(text(r#"["cat"]"#)),
+        other => panic!("unexpected field {other}"),
+      }
+    }
+    steps.push(text("}"));
+    steps
+  }
+
+  /// LAW: **`Engine::run` hands the task the decoder's account of every
+  /// string field** — built from the sampler's record of each close and the
+  /// answer serde_json decodes — through `Task::parse_ended`: the
+  /// description the grammar closed at its `maxLength` as `cap`, untrimmed,
+  /// and the scene the model closed as `model`. The task marks the
+  /// description `Ragged`. One seed is drawn.
+  #[test]
+  fn run_hands_the_task_the_decoders_account_of_each_string_field() {
+    let task =
+      Recorded::new(crate::ImageAnalysisTask::new().with_extensions([crate::Extension::Scene]));
+    let written = caption(task.task.description_max_chars().get());
+    let (analysis, next_seed) = run_scripted(&task, answer(&task.task, &written));
+    let analysis = analysis.expect("the run parses");
+    assert_eq!(next_seed, 8, "one seed is drawn");
+    let ends = task.ends();
+    assert_eq!(
+      ends.get("description"),
+      Some(&llmtask::FieldEnd::cap(&written))
+    );
+    assert_eq!(
+      ends.get("scene"),
+      Some(&llmtask::FieldEnd::model("kitchen"))
+    );
+    assert_eq!(ends.len(), 2);
+    assert_eq!(analysis.description_end(), crate::DescriptionEnd::Ragged);
+    assert_eq!(analysis.description(), written.trim());
+    assert_eq!(analysis.scene(), "kitchen");
+  }
+
+  /// LAW: **a description the model closed reads `Whole` through
+  /// `Engine::run`**, its account the model's, untrimmed.
+  #[test]
+  fn run_marks_a_description_the_model_closed_whole() {
+    let task = Recorded::new(crate::ImageAnalysisTask::new());
+    let written = " A grey cat sleeps on the rug. ";
+    let (analysis, _) = run_scripted(&task, answer(&task.task, written));
+    let analysis = analysis.expect("the run parses");
+    assert_eq!(
+      task.ends().get("description"),
+      Some(&llmtask::FieldEnd::model(written))
+    );
+    assert_eq!(analysis.description_end(), crate::DescriptionEnd::Whole);
+    assert_eq!(analysis.description(), written.trim());
   }
 }
