@@ -4,14 +4,15 @@
 //!
 //! [`ConstrainedSampler`](super::sampler::ConstrainedSampler) hands every
 //! token it commits to a [`FieldTracker`], which follows the JSON structure of
-//! the committed bytes far enough to know which member of the answer's
-//! top-level object a string value belongs to, and which token closes it. For
-//! that token the sampler still holds the mask the token was drawn under, so
-//! it asks the tracker whether the grammar left the model any other choice:
-//! the close is the grammar's when no token the mask allowed would have left
-//! the string open ([`FieldTracker::grammar_closes`]). [`field_ends`] then
-//! binds each record to the member's string as the finished answer carries
-//! it, as llmtask's [`FieldEnd`].
+//! the committed bytes far enough to record each member of the answer's
+//! top-level object: its key, and — when its value is a string — the string's
+//! lexeme exactly as committed, where it sits in the committed bytes, and
+//! which token closed it. For that token the sampler still holds the mask the
+//! token was drawn under, so it asks the tracker whether the grammar left the
+//! model any other choice: the close is the grammar's when no token the mask
+//! allowed would have left the string open
+//! ([`FieldTracker::grammar_closes`]). [`field_ends`] then binds each record
+//! to the string the answer carries, as llmtask's [`FieldEnd`].
 //!
 //! # Why the tracker is exact
 //!
@@ -33,6 +34,16 @@
 //! token the mask allows then closes the string, so the close still reads as
 //! the grammar's.
 //!
+//! # One lexeme, bound on its own
+//!
+//! An account is bound to its member's string lexeme alone: the bytes the
+//! answer carries where the matcher committed the string, decoded by
+//! serde_json as one JSON string. Nothing else in the answer has to decode:
+//! a schema-valid member that serde_json cannot materialize as a `Value` — a
+//! number outside the `f64` range (`1e400`), a value nested past its
+//! recursion limit — costs no other member its account. A key written twice
+//! is read as serde_json reads it, by its last occurrence.
+//!
 //! # No cut token
 //!
 //! An account never names a cut token ([`FieldEnd::with_cut`]): a string's
@@ -45,60 +56,51 @@
 //! bytes before it decodes them. A field's text therefore never ends in a
 //! U+FFFD left by a token cut at the cap.
 
+use std::collections::BTreeMap;
+
 use llguidance::toktrie::{SimpleVob, TokTrie};
 use llmtask::{FieldEnd, FieldEnds};
 use serde_json::Value;
 use smol_str::SmolStr;
 
-/// How the decode closed one string member of the answer's top-level object.
+/// One member of the answer's top-level object, as the decode wrote it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct FieldClose {
+pub(crate) struct Member {
   /// The member's key, JSON-decoded.
   pub(crate) field: SmolStr,
-  /// The grammar closed the string: no token the mask allowed at the closing
-  /// step would have left it open.
+  /// Its value when that is a string; `None` for any other value.
+  pub(crate) string: Option<MemberString>,
+}
+
+/// The string value of a top-level member: where the decode wrote it, its
+/// lexeme, and who closed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MemberString {
+  /// The offset of its opening quote in the committed bytes.
+  pub(crate) at: usize,
+  /// Its lexeme as committed, opening quote to closing quote.
+  pub(crate) lexeme: Vec<u8>,
+  /// The grammar closed it: no token the mask allowed at the closing step
+  /// would have left it open.
   pub(crate) forced: bool,
 }
 
-/// Follows the JSON structure of the committed bytes far enough to record how
-/// each string member of the top-level object closed.
+/// Follows the JSON structure of the committed bytes far enough to record
+/// each member of the top-level object.
 #[derive(Debug, Default)]
 pub(crate) struct FieldTracker {
-  /// The containers open around the next byte, outermost first.
-  open: Vec<Container>,
-  /// The string the next byte is inside, if any.
-  string: Option<OpenString>,
-  /// The decoded key of the top-level member whose value is being read.
+  cursor: Cursor,
+  /// How many bytes have been committed.
+  offset: usize,
+  /// The top-level key being read, as written (escapes included).
+  key: Vec<u8>,
+  /// The decoded key of the member whose value is being read, until the
+  /// member is recorded.
   member: Option<SmolStr>,
-  /// The top-level value has closed: no later byte belongs to it.
-  done: bool,
-  closes: Vec<FieldClose>,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum Container {
-  /// An object; `key_next` while the next string in it is a key.
-  Object {
-    key_next: bool,
-  },
-  Array,
-}
-
-#[derive(Debug)]
-struct OpenString {
-  role: Role,
-  /// The previous byte was an unescaped backslash, so this one is escaped.
-  escaped: bool,
-}
-
-#[derive(Debug)]
-enum Role {
-  /// A key of the top-level object, its bytes as written (escapes included).
-  Key(Vec<u8>),
-  /// The string value of the top-level member being read.
-  Member,
-  /// Any other string: a nested key or value, an array's element.
-  Other,
+  /// Where the member string being read opened, and its lexeme so far.
+  string_at: usize,
+  lexeme: Vec<u8>,
+  members: Vec<Member>,
 }
 
 impl FieldTracker {
@@ -109,10 +111,11 @@ impl FieldTracker {
     Self::default()
   }
 
-  /// How each top-level string member closed, in the order they closed.
+  /// The members of the top-level object recorded so far, in the order the
+  /// answer wrote them; a member is recorded once its value ends.
   #[cfg_attr(not(feature = "decoders"), allow(dead_code))]
-  pub(crate) fn closes(&self) -> &[FieldClose] {
-    &self.closes
+  pub(crate) fn members(&self) -> &[Member] {
+    &self.members
   }
 
   /// Whether the grammar closes the open top-level member's string at this
@@ -122,7 +125,7 @@ impl FieldTracker {
     let Some(OpenString {
       role: Role::Member,
       escaped,
-    }) = self.string
+    }) = self.cursor.string
     else {
       return false;
     };
@@ -140,82 +143,162 @@ impl FieldTracker {
   pub(crate) fn commit(&mut self, bytes: &[u8], forced: bool) {
     let mut forced = forced;
     for &byte in bytes {
-      self.byte(byte, &mut forced);
+      match self.cursor.step(byte) {
+        Event::Opens(Role::Key) => self.key.clear(),
+        Event::Content(Role::Key) => self.key.push(byte),
+        Event::Closes(Role::Key) => self.member = decode_key(&self.key),
+        Event::Opens(Role::Member) => {
+          self.string_at = self.offset;
+          self.lexeme.clear();
+          self.lexeme.push(byte);
+        }
+        Event::Content(Role::Member) => self.lexeme.push(byte),
+        Event::Closes(Role::Member) => {
+          self.lexeme.push(byte);
+          let lexeme = std::mem::take(&mut self.lexeme);
+          if let Some(field) = self.member.take() {
+            self.members.push(Member {
+              field,
+              string: Some(MemberString {
+                at: self.string_at,
+                lexeme,
+                forced,
+              }),
+            });
+          }
+          forced = false;
+        }
+        Event::MemberEnds => {
+          if let Some(field) = self.member.take() {
+            self.members.push(Member {
+              field,
+              string: None,
+            });
+          }
+        }
+        Event::Opens(Role::Other)
+        | Event::Content(Role::Other)
+        | Event::Closes(Role::Other)
+        | Event::Outside => {}
+      }
+      self.offset += 1;
     }
   }
+}
 
-  fn byte(&mut self, byte: u8, forced: &mut bool) {
+/// Where the committed bytes stand in the JSON text.
+#[derive(Debug, Clone, Default)]
+struct Cursor {
+  /// The containers open around the next byte, outermost first.
+  open: Vec<Container>,
+  /// The string the next byte is inside, if any.
+  string: Option<OpenString>,
+  /// The top-level value has closed: no later byte belongs to it.
+  done: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Container {
+  /// An object; `key_next` while the next string in it is a key.
+  Object {
+    key_next: bool,
+  },
+  Array,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OpenString {
+  role: Role,
+  /// The previous byte was an unescaped backslash, so this one is escaped.
+  escaped: bool,
+}
+
+/// What a string is to the top-level object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Role {
+  /// One of its keys.
+  Key,
+  /// The value of the member being read.
+  Member,
+  /// Any other string: a nested key or value, an array's element.
+  Other,
+}
+
+/// What one byte does to the JSON text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Event {
+  /// Nothing the tracker records: structure, whitespace, a number's or a
+  /// literal's bytes, or a byte past the top-level value.
+  Outside,
+  /// It opens a string: its opening quote.
+  Opens(Role),
+  /// It is a string's content, escapes included.
+  Content(Role),
+  /// It closes a string: its closing quote.
+  Closes(Role),
+  /// It ends a member of the top-level object: the `,` after it, or the `}`
+  /// that closes the object.
+  MemberEnds,
+}
+
+impl Cursor {
+  fn step(&mut self, byte: u8) -> Event {
     if self.done {
-      return;
+      return Event::Outside;
     }
     if let Some(string) = &mut self.string {
+      let role = string.role;
       if !string.escaped && byte == b'"' {
-        self.close_string(forced);
-        return;
+        self.string = None;
+        return Event::Closes(role);
       }
       string.escaped = !string.escaped && byte == b'\\';
-      if let Role::Key(written) = &mut string.role {
-        written.push(byte);
-      }
-      return;
+      return Event::Content(role);
     }
+    let in_top_level_object =
+      self.open.len() == 1 && matches!(self.open.last(), Some(Container::Object { .. }));
     match byte {
       b'{' => self.open.push(Container::Object { key_next: true }),
       b'[' => self.open.push(Container::Array),
       b'}' | b']' => {
         self.open.pop();
         self.done = self.open.is_empty();
+        if in_top_level_object {
+          return Event::MemberEnds;
+        }
       }
       b',' => {
         if let Some(Container::Object { key_next }) = self.open.last_mut() {
           *key_next = true;
         }
-        if self.open.len() == 1 {
-          self.member = None;
+        if in_top_level_object {
+          return Event::MemberEnds;
         }
       }
-      b'"' => self.open_string(),
+      b'"' => {
+        let role = self.open_role();
+        self.string = Some(OpenString {
+          role,
+          escaped: false,
+        });
+        return Event::Opens(role);
+      }
       // `:`, whitespace, and the bytes of a number, `true`, `false` or `null`.
       _ => {}
     }
+    Event::Outside
   }
 
-  fn open_string(&mut self) {
+  /// The role of a string opening at the next byte.
+  fn open_role(&mut self) -> Role {
     let top_level = self.open.len() == 1;
-    let role = match self.open.last_mut() {
+    match self.open.last_mut() {
       Some(Container::Object { key_next }) if *key_next => {
         *key_next = false;
-        if top_level {
-          Role::Key(Vec::new())
-        } else {
-          Role::Other
-        }
+        if top_level { Role::Key } else { Role::Other }
       }
       Some(Container::Object { .. }) if top_level => Role::Member,
       _ => Role::Other,
-    };
-    self.string = Some(OpenString {
-      role,
-      escaped: false,
-    });
-  }
-
-  fn close_string(&mut self, forced: &mut bool) {
-    let Some(string) = self.string.take() else {
-      return;
-    };
-    match string.role {
-      Role::Key(written) => self.member = decode_key(&written),
-      Role::Member => {
-        if let Some(field) = self.member.take() {
-          self.closes.push(FieldClose {
-            field,
-            forced: *forced,
-          });
-        }
-        *forced = false;
-      }
-      Role::Other => {}
     }
   }
 }
@@ -256,51 +339,60 @@ fn decode_key(written: &[u8]) -> Option<SmolStr> {
 }
 
 /// The decoder's account of each top-level string member of `raw` that
-/// `closes` records, for the task's `parse_ended`.
+/// `members` records, for the task's `parse_ended`.
 ///
-/// A member the model closed is [`FieldEnd::model`]; one the grammar closed
-/// at the `maxLength` its entry in `schema`'s top-level `properties` declares
-/// — the string holding exactly that many characters — is [`FieldEnd::cap`].
-/// Each account holds the member's string as `raw` carries it, JSON-decoded
-/// by serde_json and untrimmed: the string the task's own parse reads from
-/// the same text.
+/// Each account is bound to its member's string lexeme alone, as `raw`
+/// carries it at the offset the matcher committed it — byte for byte the
+/// lexeme the tracker recorded — and decoded by serde_json as one JSON
+/// string: JSON-decoded and untrimmed, the string the task's own parse reads
+/// from the same text. Nothing else in `raw` has to decode. A member the
+/// model closed is [`FieldEnd::model`]; one the grammar closed at the
+/// `maxLength` its entry in `schema`'s top-level `properties` declares — the
+/// string holding exactly that many characters — is [`FieldEnd::cap`].
 ///
-/// A member gets no account when the grammar closed it short of a declared
-/// cap (an `enum`, a `const` or a `pattern` can leave the model no other
-/// choice too, and that close is not at a cap), when it closed more than once
-/// (an account describes one string), or when its value in `raw` is not a
-/// string; and `raw` gets none at all when serde_json does not read it as an
-/// object.
+/// A key written more than once is read as serde_json reads it, by its last
+/// occurrence: that occurrence's string binds, and when its value is not a
+/// string the key has no account. A member also gets no account when the
+/// grammar closed it short of a declared cap (an `enum`, a `const` or a
+/// `pattern` can leave the model no other choice too, and that close is not
+/// at a cap), or when `raw` does not carry its lexeme where the matcher
+/// committed it, or when the lexeme does not decode.
 // Its one caller, `Engine::run`, is compiled only with `decoders` on.
 #[cfg_attr(not(feature = "decoders"), allow(dead_code))]
-pub(crate) fn field_ends(raw: &str, closes: &[FieldClose], schema: &Value) -> FieldEnds {
+pub(crate) fn field_ends(raw: &str, members: &[Member], schema: &Value) -> FieldEnds {
+  let mut last: BTreeMap<&str, Option<FieldEnd>> = BTreeMap::new();
+  for member in members {
+    let field = member.field.as_str();
+    let end = member
+      .string
+      .as_ref()
+      .and_then(|string| account(raw, string, max_length(schema, field)));
+    last.insert(field, end);
+  }
   let mut ends = FieldEnds::new();
-  let Ok(Value::Object(members)) = serde_json::from_str::<Value>(raw) else {
-    return ends;
-  };
-  for close in closes {
-    if closes
-      .iter()
-      .filter(|other| other.field == close.field)
-      .count()
-      > 1
-    {
-      continue;
+  for (field, end) in last {
+    if let Some(end) = end {
+      ends.insert(field, end);
     }
-    let field = close.field.as_str();
-    let Some(Value::String(text)) = members.get(field) else {
-      continue;
-    };
-    let end = if !close.forced {
-      FieldEnd::model(text)
-    } else if max_length(schema, field) == Some(text.chars().count()) {
-      FieldEnd::cap(text)
-    } else {
-      continue;
-    };
-    ends.insert(close.field.clone(), end);
   }
   ends
+}
+
+/// The account of one member string, bound to its lexeme as `raw` carries
+/// it; `cap` is the `maxLength` the schema declares for the member.
+fn account(raw: &str, string: &MemberString, cap: Option<usize>) -> Option<FieldEnd> {
+  let lexeme = raw.get(string.at..string.at.checked_add(string.lexeme.len())?)?;
+  if lexeme.as_bytes() != string.lexeme.as_slice() {
+    return None;
+  }
+  let text: String = serde_json::from_str(lexeme).ok()?;
+  if !string.forced {
+    Some(FieldEnd::model(&text))
+  } else if cap == Some(text.chars().count()) {
+    Some(FieldEnd::cap(&text))
+  } else {
+    None
+  }
 }
 
 /// The `maxLength` `schema` declares for its top-level property `field`.
@@ -490,31 +582,65 @@ mod tests {
 
   // ===== the tracker, byte by byte =====
 
-  /// The closes a tracker records over `tokens`, each a committed token's
-  /// bytes, every first member close in a token accounted `forced`.
-  fn follow(tokens: &[&[u8]], forced: bool) -> Vec<FieldClose> {
+  /// The members a tracker records over `tokens`, each a committed token's
+  /// bytes, the first member string each token closes accounted `forced`.
+  fn follow(tokens: &[&[u8]], forced: bool) -> Vec<Member> {
     let mut tracker = FieldTracker::new();
     for token in tokens {
       tracker.commit(token, forced);
     }
-    tracker.closes().to_vec()
+    tracker.members().to_vec()
   }
 
-  fn close(field: &str, forced: bool) -> FieldClose {
-    FieldClose {
+  /// The member `field` of `answer` whose string value is `lexeme`, found
+  /// where `answer` writes it.
+  fn string(answer: &[u8], field: &str, lexeme: &str, forced: bool) -> Member {
+    let at = answer
+      .windows(lexeme.len())
+      .position(|window| window == lexeme.as_bytes())
+      .expect("the answer writes the lexeme");
+    Member {
       field: field.into(),
-      forced,
+      string: Some(MemberString {
+        at,
+        lexeme: lexeme.as_bytes().to_vec(),
+        forced,
+      }),
     }
   }
 
-  /// LAW: **every string member of the top-level object closes once, in
-  /// order, and nothing else does** — not an array's elements, not a nested
-  /// object's keys or values, not a key — however the bytes fall into tokens
-  /// and whatever whitespace sits between them.
+  /// The member `field` whose value is not a string.
+  fn non_string(field: &str) -> Member {
+    Member {
+      field: field.into(),
+      string: None,
+    }
+  }
+
+  /// Each string member's key and whether the grammar closed it.
+  fn closes(members: &[Member]) -> Vec<(&str, bool)> {
+    members
+      .iter()
+      .filter_map(|member| Some((member.field.as_str(), member.string.as_ref()?.forced)))
+      .collect()
+  }
+
+  /// LAW: **every member of the top-level object is recorded once, in
+  /// order** — a string value with its lexeme exactly as written and where it
+  /// sits, any other value as no string — and nothing else is: not an
+  /// array's elements, not a nested object's keys or values, however the
+  /// bytes fall into tokens and whatever whitespace sits between them.
   #[test]
-  fn each_top_level_string_member_closes_once_in_order() {
-    let answer: &[u8] = br#"{ "scene" : "kitchen", "tags":["cat","rug"], "meta":{"note":"x","list":["y"]}, "description":"A cat.", "n": 1.5e3, "ok": true }"#;
-    let expected = [close("scene", false), close("description", false)];
+  fn each_top_level_member_is_recorded_once_in_order() {
+    let answer: &[u8] = br#"{ "scene" : "kitchen", "tags":["cat","rug"], "meta":{"note":"x","list":["y"]}, "description":"A \"cat\".", "n": 1.5e3, "ok": true }"#;
+    let expected = [
+      string(answer, "scene", r#""kitchen""#, false),
+      non_string("tags"),
+      non_string("meta"),
+      string(answer, "description", r#""A \"cat\".""#, false),
+      non_string("n"),
+      non_string("ok"),
+    ];
     assert_eq!(follow(&[answer], false), expected, "one token");
     for size in 1..9 {
       let tokens: Vec<&[u8]> = answer.chunks(size).collect();
@@ -528,18 +654,21 @@ mod tests {
   fn a_tokens_account_is_its_first_member_closes() {
     let tokens: [&[u8]; 3] = [br#"{"description":"A cat"#, br#"","scene":"x""#, b"}"];
     assert_eq!(
-      follow(&tokens, true),
-      [close("description", true), close("scene", false)]
+      closes(&follow(&tokens, true)),
+      [("description", true), ("scene", false)]
     );
   }
 
   /// LAW: **an escaped quote or backslash never closes a string**, wherever
-  /// the token boundary falls inside the escape; and a key is named as JSON
-  /// decodes it.
+  /// the token boundary falls inside the escape; a key is named as JSON
+  /// decodes it, and a lexeme is kept as written.
   #[test]
   fn escapes_never_close_a_string_and_keys_are_decoded() {
     let answer: &[u8] = br#"{"d\u0065scription":"say \"hi\" \\","sc\"ene":"\\\""}"#;
-    let expected = [close("description", false), close("sc\"ene", false)];
+    let expected = [
+      string(answer, "description", r#""say \"hi\" \\""#, false),
+      string(answer, "sc\"ene", r#""\\\"""#, false),
+    ];
     for size in 1..12 {
       let tokens: Vec<&[u8]> = answer.chunks(size).collect();
       assert_eq!(follow(&tokens, false), expected, "tokens of {size} bytes");
@@ -569,68 +698,116 @@ mod tests {
     assert!(follow(&[br#"["a","b"]"#], true).is_empty());
     assert!(follow(&[br#""abc""#], true).is_empty());
     let tokens: [&[u8]; 3] = [br#"{"a":"x"}"#, b" ", br#""b":"y""#];
-    assert_eq!(follow(&tokens, false), [close("a", false)]);
+    assert_eq!(closes(&follow(&tokens, false)), [("a", false)]);
   }
 
-  // ===== binding the closes to the answer =====
+  // ===== binding the members to the answer =====
 
-  /// LAW: **an account holds the field exactly as serde_json decodes it from
-  /// the answer** — escapes decoded, untrimmed — the model's close as
-  /// `model`, the grammar's at the declared cap as `cap`.
+  /// LAW: **an account holds the field exactly as serde_json decodes its
+  /// lexeme** — escapes decoded, untrimmed — the model's close as `model`,
+  /// the grammar's at the declared cap as `cap`.
   #[test]
   fn an_account_holds_the_decoded_untrimmed_field() {
     let schema = json!({"properties": {"description": {"type": "string", "maxLength": 9}}});
     let raw = r#"{"description":"  A \"cat\"","scene":" kitchen "}"#;
-    let decoded: Value = serde_json::from_str(raw).expect("the answer is JSON");
-    assert_eq!(decoded["description"], "  A \"cat\"");
-    let ends = field_ends(
-      raw,
-      &[close("description", true), close("scene", false)],
-      &schema,
-    );
+    let ends = field_ends(raw, &follow(&[raw.as_bytes()], true), &schema);
     assert_eq!(ends.get("description"), Some(&FieldEnd::cap("  A \"cat\"")));
     assert_eq!(ends.get("scene"), Some(&FieldEnd::model(" kitchen ")));
     assert_eq!(ends.len(), 2);
   }
 
+  /// LAW (Codex R1, [medium]): **a member serde_json cannot materialize costs
+  /// no other member its account.** A number outside the `f64` range
+  /// (`1e400`) and a value nested past serde_json's recursion limit are
+  /// JSON the matcher can write, but a whole-answer `Value` refuses them;
+  /// each string member's account is bound to its own lexeme all the same.
+  #[test]
+  fn a_member_a_document_parse_refuses_costs_no_account() {
+    let schema = json!({"properties": {"description": {"type": "string", "maxLength": 9}}});
+    let deep = format!("{}{}", "[".repeat(200), "]".repeat(200));
+    for raw in [
+      r#"{"description":"A cat.   ","n":1e400}"#.to_owned(),
+      format!(r#"{{"n":{deep},"description":"A cat.   "}}"#),
+    ] {
+      assert!(
+        serde_json::from_str::<Value>(&raw).is_err(),
+        "{raw}: a document parse refuses it"
+      );
+      let ends = field_ends(&raw, &follow(&[raw.as_bytes()], true), &schema);
+      assert_eq!(
+        ends.get("description"),
+        Some(&FieldEnd::cap("A cat.   ")),
+        "{raw}"
+      );
+    }
+  }
+
+  /// LAW (Codex R1, [medium]): **a key written twice binds by its last
+  /// occurrence**, as serde_json reads it: the last string binds, and a last
+  /// value that is not a string leaves the key with no account.
+  #[test]
+  fn a_key_written_twice_binds_by_its_last_occurrence() {
+    let schema = json!({});
+    let ends_of = |raw: &str| field_ends(raw, &follow(&[raw.as_bytes()], false), &schema);
+    assert_eq!(
+      ends_of(r#"{"description":"first","description":"last"}"#).get("description"),
+      Some(&FieldEnd::model("last"))
+    );
+    assert_eq!(
+      ends_of(r#"{"description":5,"description":"last"}"#).get("description"),
+      Some(&FieldEnd::model("last"))
+    );
+    assert!(ends_of(r#"{"description":"first","description":5}"#).is_empty());
+    assert!(ends_of(r#"{"description":"first","description":{"a":"b"}}"#).is_empty());
+  }
+
+  /// LAW: **an account binds only a lexeme the answer carries where the
+  /// matcher committed it, and only one that decodes**: another text at that
+  /// place, the same text shifted, a text cut short, and a lone surrogate
+  /// escape (JSON's grammar admits it; no string holds it) all bind nothing.
+  #[test]
+  fn an_account_binds_only_the_committed_decodable_lexeme() {
+    let schema = json!({});
+    let committed = r#"{"description":"A cat."}"#;
+    let members = follow(&[committed.as_bytes()], false);
+    assert_eq!(
+      field_ends(committed, &members, &schema).get("description"),
+      Some(&FieldEnd::model("A cat."))
+    );
+    for other in [
+      r#"{"description":"A dog."}"#,
+      r#" {"description":"A cat."}"#,
+      r#"{"description":"A cat"#,
+    ] {
+      assert!(field_ends(other, &members, &schema).is_empty(), "{other}");
+    }
+    let lone = r#"{"description":"\ud800"}"#;
+    assert!(field_ends(lone, &follow(&[lone.as_bytes()], false), &schema).is_empty());
+  }
+
   /// LAW: **the grammar's close is a cap's account only at the declared
   /// cap.** Short of the `maxLength`, or for a field with none (an `enum` or
-  /// a `pattern` can force a close too), it is no account; a field closed
-  /// twice is no account, nor one whose value is not a string; and an answer
-  /// serde_json does not read as an object has none.
+  /// a `pattern` can force a close too), it is no account; nor is a value
+  /// that is not a string; and an answer that is no object has none.
   #[test]
   fn a_forced_close_is_a_caps_account_only_at_the_declared_cap() {
     let schema = json!({"properties": {
       "description": {"type": "string", "maxLength": 5},
       "scene": {"type": "string", "enum": ["kitchen"]},
     }});
-    let at_cap = field_ends(
-      r#"{"description":"abcde"}"#,
-      &[close("description", true)],
-      &schema,
+    let ends_of = |raw: &str| field_ends(raw, &follow(&[raw.as_bytes()], true), &schema);
+    assert_eq!(
+      ends_of(r#"{"description":"abcde"}"#).get("description"),
+      Some(&FieldEnd::cap("abcde"))
     );
-    assert_eq!(at_cap.get("description"), Some(&FieldEnd::cap("abcde")));
-    for (raw, closes) in [
-      (
-        r#"{"description":"abcd"}"#,
-        vec![close("description", true)],
-      ),
-      (r#"{"scene":"kitchen"}"#, vec![close("scene", true)]),
-      (
-        r#"{"description":"abcde","description":"abcde"}"#,
-        vec![close("description", true), close("description", true)],
-      ),
-      (
-        r#"{"description":["abcde"]}"#,
-        vec![close("description", false)],
-      ),
-      ("not json", vec![close("description", false)]),
-      (r#"["abcde"]"#, vec![close("description", false)]),
+    for raw in [
+      r#"{"description":"abcd"}"#,
+      r#"{"scene":"kitchen"}"#,
+      r#"{"description":["abcde"]}"#,
+      r#"["abcde"]"#,
+      r#""abcde""#,
     ] {
-      assert!(
-        field_ends(raw, &closes, &schema).is_empty(),
-        "{raw} under {closes:?}"
-      );
+      assert!(ends_of(raw).is_empty(), "{raw}");
     }
   }
 
@@ -642,13 +819,13 @@ mod tests {
       .expect("the tokenizer loads")
   }
 
-  /// Plays `steps` through a tracking `ConstrainedSampler` over `task`'s
-  /// grammar until the matcher completes the answer; returns the raw answer
-  /// as `generate` detokenizes it, and the sampler's closes.
-  fn decode(task: &ImageAnalysisTask, steps: Vec<Step>) -> (String, Vec<FieldClose>) {
+  /// Plays `steps` through a tracking `ConstrainedSampler` over `schema`
+  /// until the matcher completes the answer; returns the raw answer as
+  /// `generate` detokenizes it, and the members the sampler recorded.
+  fn decode(schema: &Value, steps: Vec<Step>) -> (String, Vec<Member>) {
     let vocab = trie().vocab_size();
     let mut sampler = ConstrainedSampler::new(
-      constraint(task.schema()),
+      constraint(schema),
       RequestOptions::deterministic(),
       0,
       vocab as u32,
@@ -674,7 +851,7 @@ mod tests {
     let raw = detokenizer()
       .decode(&drawn, true)
       .expect("the answer detokenizes");
-    (raw, sampler.field_closes().to_vec())
+    (raw, sampler.field_members().to_vec())
   }
 
   /// The decoded answer's `description`, as serde_json reads it.
@@ -694,17 +871,17 @@ mod tests {
   fn a_description_the_grammar_closes_at_its_max_length_is_capped() {
     let task = ImageAnalysisTask::new();
     let written = caption(task.description_max_chars().get());
-    let (raw, closes) = decode(
-      &task,
+    let (raw, members) = decode(
+      task.schema(),
       vec![
         text(r#"{"description":""#),
         text(&written),
         text(r#"","tags":["cat"]}"#),
       ],
     );
-    assert_eq!(closes, [close("description", true)]);
+    assert_eq!(closes(&members), [("description", true)]);
     assert_eq!(description(&raw), written);
-    let ends = field_ends(&raw, &closes, task.schema());
+    let ends = field_ends(&raw, &members, task.schema());
     let end = ends
       .get("description")
       .expect("the description has an account");
@@ -716,22 +893,53 @@ mod tests {
     assert_eq!(analysis.description(), written.trim());
   }
 
+  /// LAW (Codex R1, [medium]): **through the matcher, a number serde_json
+  /// cannot hold costs the description nothing.** The schema admits any JSON
+  /// number, so the matcher writes `1e400`; a whole-answer `Value` refuses
+  /// it, and the description the grammar closed at its cap still has its
+  /// `cap` account.
+  #[test]
+  fn a_number_past_f64_costs_the_description_nothing() {
+    let schema = json!({
+      "type": "object",
+      "properties": {
+        "description": {"type": "string", "maxLength": 120},
+        "n": {"type": "number"},
+      },
+      "required": ["description", "n"],
+      "additionalProperties": false,
+    });
+    let written = caption(120);
+    let (raw, members) = decode(
+      &schema,
+      vec![
+        text(r#"{"description":""#),
+        text(&written),
+        text(r#"","n":1e400}"#),
+      ],
+    );
+    assert!(serde_json::from_str::<Value>(&raw).is_err(), "{raw}");
+    assert_eq!(closes(&members), [("description", true)]);
+    let ends = field_ends(&raw, &members, &schema);
+    assert_eq!(ends.get("description"), Some(&FieldEnd::cap(&written)));
+  }
+
   /// LAW: **a description the model closes short of the cap has the model's
   /// account**, bound untrimmed, and the task marks it `Whole`.
   #[test]
   fn a_description_the_model_closes_is_the_models() {
     let task = ImageAnalysisTask::new();
     let written = " A grey cat sleeps on the rug. ";
-    let (raw, closes) = decode(
-      &task,
+    let (raw, members) = decode(
+      task.schema(),
       vec![
         text(r#"{"description":""#),
         text(written),
         text(r#"","tags":["cat"]}"#),
       ],
     );
-    assert_eq!(closes, [close("description", false)]);
-    let ends = field_ends(&raw, &closes, task.schema());
+    assert_eq!(closes(&members), [("description", false)]);
+    let ends = field_ends(&raw, &members, task.schema());
     assert_eq!(ends.get("description"), Some(&FieldEnd::model(written)));
     let analysis = task.parse_ended(&raw, &ends).expect("the answer parses");
     assert_eq!(analysis.description_end(), DescriptionEnd::Whole);
@@ -749,8 +957,8 @@ mod tests {
     let period_quote = trie()
       .token_id(br#".""#)
       .expect("the vocabulary holds `.\"`");
-    let (raw, closes) = decode(
-      &task,
+    let (raw, members) = decode(
+      task.schema(),
       vec![
         text(r#"{"description":""#),
         text(&caption(cap - 1)),
@@ -758,8 +966,8 @@ mod tests {
         text(r#","tags":["cat"]}"#),
       ],
     );
-    assert_eq!(closes, [close("description", false)]);
-    let ends = field_ends(&raw, &closes, task.schema());
+    assert_eq!(closes(&members), [("description", false)]);
+    let ends = field_ends(&raw, &members, task.schema());
     let end = ends
       .get("description")
       .expect("the description has an account");
@@ -856,9 +1064,9 @@ mod tests {
     let mut steps = vec![text(r#"{"description":""#), text(&written)];
     steps.extend(byte_tokens.iter().map(|&token| Step::Token(token)));
     steps.push(text(r#"","tags":["cat"]}"#));
-    let (raw, closes) = decode(&task, steps);
-    assert_eq!(closes, [close("description", true)]);
-    let ends = field_ends(&raw, &closes, task.schema());
+    let (raw, members) = decode(task.schema(), steps);
+    assert_eq!(closes(&members), [("description", true)]);
+    let ends = field_ends(&raw, &members, task.schema());
     let end = ends
       .get("description")
       .expect("the description has an account");
@@ -899,8 +1107,8 @@ mod tests {
       }
     }
     steps.push(text("}"));
-    let (raw, closes) = decode(&task, steps);
-    let ends = field_ends(&raw, &closes, task.schema());
+    let (raw, members) = decode(task.schema(), steps);
+    let ends = field_ends(&raw, &members, task.schema());
     let fields: Vec<(&str, bool)> = ends
       .iter()
       .map(|(field, end)| (field, end.closed_at_cap()))

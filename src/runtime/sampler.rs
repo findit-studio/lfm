@@ -37,7 +37,7 @@ use llguidance::Constraint;
 use smol_str::SmolStr;
 
 #[cfg(feature = "inference")]
-use crate::runtime::field_ends::{FieldClose, FieldTracker};
+use crate::runtime::field_ends::{FieldTracker, Member};
 use crate::{
   error::{Error, Result},
   options::RequestOptions,
@@ -219,10 +219,11 @@ impl ConstrainedSampler {
     }
   }
 
-  /// Builder: follow the answer as a JSON text and record, for each string
-  /// field of its top-level object, whether the model closed it or the
-  /// grammar left no other choice ([`Self::field_closes`]). For a
-  /// constraint compiled from a JSON Schema, whose answer is a JSON text.
+  /// Builder: follow the answer as a JSON text and record each member of its
+  /// top-level object — for a string value, its lexeme and whether the model
+  /// closed it or the grammar left no other choice ([`Self::field_members`]).
+  /// For a constraint compiled from a JSON Schema, whose answer is a JSON
+  /// text.
   // Its one caller, `Engine::run`, is compiled only with `decoders` on.
   #[cfg_attr(not(feature = "decoders"), allow(dead_code))]
   pub(crate) fn with_field_tracking(mut self) -> Self {
@@ -230,12 +231,12 @@ impl ConstrainedSampler {
     self
   }
 
-  /// How each string field of the answer's top-level object closed, in the
-  /// order the fields closed; empty unless [`Self::with_field_tracking`]
-  /// asked for the record.
+  /// The members of the answer's top-level object, in the order the answer
+  /// wrote them; empty unless [`Self::with_field_tracking`] asked for the
+  /// record.
   #[cfg_attr(not(feature = "decoders"), allow(dead_code))]
-  pub(crate) fn field_closes(&self) -> &[FieldClose] {
-    self.fields.as_ref().map_or(&[], FieldTracker::closes)
+  pub(crate) fn field_members(&self) -> &[Member] {
+    self.fields.as_ref().map_or(&[], FieldTracker::members)
   }
 }
 

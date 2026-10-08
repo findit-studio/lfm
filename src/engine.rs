@@ -888,7 +888,7 @@ impl<B: Backend> ConstrainedRun<'_, B> {
       GenerateInputs::new(&messages, images, req, self.eos_token_id),
     )?;
     let ends = schema.map_or_else(FieldEnds::new, |schema| {
-      field_ends(&text, sampler.field_closes(), schema)
+      field_ends(&text, sampler.field_members(), schema)
     });
     task.parse_ended(&text, &ends).map_err(Error::from)
   }
