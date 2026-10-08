@@ -50,6 +50,7 @@ use crate::{
   runtime::{
     backend::{Backend, BackendImpl},
     checkpoint::{self, CheckpointLayout},
+    field_caps::FieldCaps,
     field_ends::field_ends,
     sampler::{ConstrainedSampler, FreeSampler},
   },
@@ -755,6 +756,12 @@ impl Engine {
   /// JSON-decoded and untrimmed. It never names a cut token: a string the
   /// grammar closes at its `maxLength` always ends in a whole character.
   ///
+  /// A JSON Schema task whose schema does not fix a top-level string field's
+  /// `maxLength` by itself — a union whose branches disagree on it, a `$ref`
+  /// that is not a local JSON Pointer — is refused before generation with
+  /// [`Error::UnsupportedFieldCap`](crate::Error::UnsupportedFieldCap), naming
+  /// the field.
+  ///
   /// The `ParserFactory` is constructed once and cached across calls.
   pub fn run<T: llmtask::Task>(
     &mut self,
@@ -867,6 +874,11 @@ impl<B: Backend> ConstrainedRun<'_, B> {
 
     let grammar = task.grammar();
     let constraint = build_constraint(self.factory, &grammar)?;
+    // The answer to a JSON Schema is a JSON text: follow it, so the task
+    // learns how the decoder ended each of its string fields, read against
+    // the caps the schema puts on them. A cap the schema alone does not fix
+    // is refused here, before a token is drawn.
+    let caps = grammar.as_json_schema().map(FieldCaps::of).transpose()?;
     let seed = take_seed(self.next_seed);
     let mut sampler = ConstrainedSampler::new(
       constraint,
@@ -874,10 +886,7 @@ impl<B: Backend> ConstrainedRun<'_, B> {
       seed,
       self.tokenizer.get_vocab_size(true) as u32,
     );
-    // The answer to a JSON Schema is a JSON text: follow it, so the task
-    // learns how the decoder ended each of its string fields.
-    let schema = grammar.as_json_schema();
-    if schema.is_some() {
+    if caps.is_some() {
       sampler = sampler.with_field_tracking();
     }
     let text = generate(
@@ -887,8 +896,8 @@ impl<B: Backend> ConstrainedRun<'_, B> {
       &mut sampler,
       GenerateInputs::new(&messages, images, req, self.eos_token_id),
     )?;
-    let ends = schema.map_or_else(FieldEnds::new, |schema| {
-      field_ends(&text, sampler.field_members(), schema)
+    let ends = caps.map_or_else(FieldEnds::new, |caps| {
+      field_ends(&text, sampler.field_members(), &caps)
     });
     task.parse_ended(&text, &ends).map_err(Error::from)
   }
@@ -2375,6 +2384,8 @@ mod tests {
   /// image is read.
   struct ScriptedBackend {
     script: Script,
+    /// How many decoder steps ran.
+    steps: usize,
   }
 
   impl Backend for ScriptedBackend {
@@ -2410,6 +2421,7 @@ mod tests {
     }
 
     fn decoder_step(&mut self, _: &mut (), _: &(), _: usize) -> Result<Vec<f32>> {
+      self.steps += 1;
       Ok(self.script.logits(trie().vocab_size()))
     }
   }
@@ -2476,14 +2488,27 @@ mod tests {
   /// admission checks — with no image, over a backend that plays `steps`,
   /// and the engine's seed counter at 7. Returns the run's result and the
   /// counter after it.
-  fn run_scripted(task: &Recorded, steps: Vec<Step>) -> (Result<crate::ImageAnalysis>, u64) {
+  fn run_scripted<T: Task>(task: &T, steps: Vec<Step>) -> (Result<T::Output>, u64)
+  where
+    Error: From<T::ParseError>,
+  {
+    let (result, next_seed, _) = run_counted(task, steps);
+    (result, next_seed)
+  }
+
+  /// [`run_scripted`], with how many decoder steps the backend ran.
+  fn run_counted<T: Task>(task: &T, steps: Vec<Step>) -> (Result<T::Output>, u64, usize)
+  where
+    Error: From<T::ParseError>,
+  {
     let tokenizer = Tokenizer::from_bytes(bundled_tokenizer_json()).expect("the tokenizer loads");
     let preproc = Preprocessor::new(ImageBudget::default());
     let mut backend = ScriptedBackend {
       script: Script::new(steps),
+      steps: 0,
     };
     let mut next_seed = 7;
-    let analysis = ConstrainedRun {
+    let result = ConstrainedRun {
       preproc: &preproc,
       backend: &mut backend,
       tokenizer: &tokenizer,
@@ -2492,7 +2517,66 @@ mod tests {
       next_seed: &mut next_seed,
     }
     .run(task, &[], &RequestOptions::deterministic());
-    (analysis, next_seed)
+    (result, next_seed, backend.steps)
+  }
+
+  /// A JSON Schema task that parses any answer to nothing.
+  struct SchemaTask {
+    schema: serde_json::Value,
+  }
+
+  impl Task for SchemaTask {
+    type Output = ();
+    type Value = serde_json::Value;
+    type ParseError = llmtask::JsonParseError;
+
+    fn prompt(&self) -> &str {
+      "Answer in JSON."
+    }
+
+    fn schema(&self) -> &serde_json::Value {
+      &self.schema
+    }
+
+    fn grammar(&self) -> llmtask::Grammar {
+      llmtask::Grammar::JsonSchema(self.schema.clone())
+    }
+
+    fn parse(&self, _: &str) -> std::result::Result<(), llmtask::JsonParseError> {
+      Ok(())
+    }
+  }
+
+  /// LAW (Codex R2, [medium]): **a task whose schema leaves a field's cap to
+  /// the branch of a union is refused by the field's name at admission** —
+  /// an `anyOf` of `maxLength` 5 and 8 — before a seed is drawn or the
+  /// decoder runs, rather than run with that field's account silently out.
+  #[test]
+  fn a_branch_dependent_cap_is_refused_by_name_at_admission() {
+    let task = SchemaTask {
+      schema: serde_json::json!({
+        "type": "object",
+        "properties": {"description": {"anyOf": [
+          {"type": "string", "maxLength": 5},
+          {"type": "string", "maxLength": 8},
+        ]}},
+        "required": ["description"],
+        "additionalProperties": false,
+      }),
+    };
+    let (result, next_seed, steps) = run_counted(&task, vec![text(r#"{"description":"abcde"}"#)]);
+    match result {
+      Err(Error::UnsupportedFieldCap { field, reason }) => {
+        assert_eq!(field, "description");
+        assert_eq!(
+          reason,
+          "branch-dependent maxLength is not supported for field-end accounts"
+        );
+      }
+      other => panic!("must be refused by name, got {other:?}"),
+    }
+    assert_eq!(next_seed, 7, "no seed is drawn");
+    assert_eq!(steps, 0, "the decoder never runs");
   }
 
   /// The answer to `task` whose description is `written`, `scene` (when the

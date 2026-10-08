@@ -29,12 +29,17 @@ and this crate adheres to [Semantic Versioning](https://semver.org/).
   so a member serde_json cannot materialize as a value (a number past `f64`,
   deep nesting) costs no other member its account; a key written twice binds
   by its last occurrence, as serde_json reads it. The account is decided by
-  the length first: a string that closed holding exactly the `maxLength` the
-  schema's top-level `properties` entry declares was bound by the cap,
-  whichever token carried the quote, and is `FieldEnd::cap(field)`. Below the
-  cap the model's close is `FieldEnd::model(field)`, and a close every
-  allowed token made (an `enum`, a `const`, a `pattern`) or one the mask
-  cannot attribute has no account. No account names a cut token
+  the length first: a string that closed holding exactly its member's cap was
+  bound by it, whichever token carried the quote, and is
+  `FieldEnd::cap(field)`. A member's cap is resolved from the schema as
+  llguidance normalizes it: the smallest `maxLength` among its `properties`
+  entry, every `patternProperties` entry its key matches (or
+  `additionalProperties` when neither names it), local `$ref`s followed
+  through chains, and every `allOf` branch, the top-level object's own `$ref`
+  and `allOf` included. Below the cap the model's close is
+  `FieldEnd::model(field)`, and a close every allowed token made (an `enum`,
+  a `const`, a `pattern`) or one the mask cannot attribute has no account.
+  No account names a cut token
   (`with_cut`): llguidance never admits a closing quote after a partial UTF-8
   sequence, and `generate` detokenizes the whole answer at once. With
   `ImageAnalysisTask` a live description now reads `DescriptionEnd::Ragged`
@@ -100,6 +105,12 @@ and this crate adheres to [Semantic Versioning](https://semver.org/).
 - Re-exports `DescriptionEnd`, `FieldEnd` and `FieldEnds` from llmtask, so a
   consumer with no direct llmtask dependency can read how a description ended
   and override `Task::parse_ended`.
+- `Error::UnsupportedFieldCap { field, reason }`: `Engine::run` refuses, before
+  generation and by the field's name, a JSON Schema task whose schema does not
+  fix a top-level string field's `maxLength` by itself — an `anyOf` or `oneOf`
+  whose branches disagree on it, or of which only some cap it; a `$ref` that
+  is not a local JSON Pointer; a `patternProperties` pattern the `regex` crate
+  cannot compile — rather than leave that field's account silently out.
 
 ## [0.4.0] - 2026-10-01
 

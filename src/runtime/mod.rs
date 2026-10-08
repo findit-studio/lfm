@@ -18,6 +18,9 @@ pub(crate) mod backend;
 // gate rather than inside the macOS-only `mlx_backend`.
 #[cfg(feature = "decoders")]
 pub(crate) mod checkpoint;
+// The `maxLength` a task's JSON Schema puts on each top-level string field,
+// resolved for the decoder's account.
+pub(crate) mod field_caps;
 // How each string field of a JSON answer was closed, followed token by token
 // by the constrained sampler.
 pub(crate) mod field_ends;
