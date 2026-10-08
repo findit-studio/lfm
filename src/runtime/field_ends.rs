@@ -39,14 +39,26 @@
 //! - **unproven** otherwise — say the drawn token writes content and closes,
 //!   and the mask holds a shorter token that stops inside the string but none
 //!   that writes past the drawn token's content: whether the grammar would
-//!   have taken more after that content is not in the mask. Such a string has
-//!   no account, rather than one the mask cannot back.
+//!   have taken more after that content is not in the mask. Below the cap
+//!   such a string has no account, rather than one the mask cannot back.
 //!
 //! When llguidance forces bytes it can narrow the mask to the single token
 //! that starts their canonical tokenization (`TokenParser::compute_mask`);
 //! that token may open a string, write its content and close it in one —
 //! `""` for a `maxLength` of 0 — and as the only allowed token it closes the
 //! string on every road the mask leaves, so the close is the grammar's.
+//!
+//! # The account: length first, then the mask
+//!
+//! [`field_ends`] decides each account by the string's length first. A
+//! string that closed holding exactly its member's `maxLength` characters
+//! was bound by the cap, whichever token carried the quote — a lone `"`, a
+//! `.` before a forced close, or `."` one character short: the model could
+//! not have written past it, so it is `cap`, whatever the mask shows. Only
+//! below the cap does the mask's reading decide: the model's close is
+//! `model`; a close every allowed token made there (an `enum`, a `const`, a
+//! `pattern`) is not at a cap and has no account; an unproven one has none
+//! either.
 //!
 //! # One lexeme, bound on its own
 //!
@@ -399,20 +411,25 @@ fn decode_key(written: &[u8]) -> Option<SmolStr> {
 /// carries it at the offset the matcher committed it — byte for byte the
 /// lexeme the tracker recorded — and decoded by serde_json as one JSON
 /// string: JSON-decoded and untrimmed, the string the task's own parse reads
-/// from the same text. Nothing else in `raw` has to decode. A member the
-/// model closed is [`FieldEnd::model`]; one the grammar closed at the
-/// `maxLength` its entry in `schema`'s top-level `properties` declares — the
-/// string holding exactly that many characters — is [`FieldEnd::cap`].
+/// from the same text. Nothing else in `raw` has to decode.
+///
+/// The account is decided by the string's length first, then by the mask:
+///
+/// 1. a string holding exactly the `maxLength` its entry in `schema`'s
+///    top-level `properties` declares (in characters, as the schema counts
+///    them) was bound by the cap, whichever token carried the quote — the
+///    model could not have written past it: [`FieldEnd::cap`];
+/// 2. below the cap, a close the mask shows was the model's
+///    ([`ClosedBy::Model`]) is [`FieldEnd::model`];
+/// 3. below the cap, a close every allowed token made — an `enum`, a `const`
+///    or a `pattern` can leave the model no other choice, and that close is
+///    not at a cap — or one the mask cannot attribute has no account.
 ///
 /// A key written more than once is read as serde_json reads it, by its last
 /// occurrence: that occurrence's string binds, and when its value is not a
-/// string the key has no account. A member also gets no account when the
-/// mask its closing token was drawn under proves neither who closed it
-/// ([`ClosedBy::Unproven`]), when the grammar closed it short of a declared
-/// cap (an `enum`, a `const` or a `pattern` can leave the model no other
-/// choice too, and that close is not at a cap), when `raw` does not carry its
-/// lexeme where the matcher committed it, or when the lexeme does not
-/// decode.
+/// string the key has no account. A member also gets no account when `raw`
+/// does not carry its lexeme where the matcher committed it, or when the
+/// lexeme does not decode.
 // Its one caller, `Engine::run`, is compiled only with `decoders` on.
 #[cfg_attr(not(feature = "decoders"), allow(dead_code))]
 pub(crate) fn field_ends(raw: &str, members: &[Member], schema: &Value) -> FieldEnds {
@@ -442,9 +459,13 @@ fn account(raw: &str, string: &MemberString, cap: Option<usize>) -> Option<Field
     return None;
   }
   let text: String = serde_json::from_str(lexeme).ok()?;
+  // The length decides first: a string that closed holding exactly its cap
+  // was bound by it, whichever token carried the quote.
+  if cap == Some(text.chars().count()) {
+    return Some(FieldEnd::cap(&text));
+  }
   match string.closed_by {
     ClosedBy::Model => Some(FieldEnd::model(&text)),
-    ClosedBy::Grammar if cap == Some(text.chars().count()) => Some(FieldEnd::cap(&text)),
     ClosedBy::Grammar | ClosedBy::Unproven => None,
   }
 }
@@ -933,39 +954,48 @@ mod tests {
     assert!(field_ends(lone, &recorded(lone, &[ClosedBy::Model]), &schema).is_empty());
   }
 
-  /// LAW: **the grammar's close is a cap's account only at the declared
-  /// cap**, and an unproven close is no account at all. Short of the
-  /// `maxLength`, or for a field with none (an `enum` or a `pattern` can
-  /// force a close too), the grammar's close is no account; nor is a value
-  /// that is not a string; and an answer that is no object has none.
+  /// LAW (R1): **the length at the close decides first, then the mask.** A
+  /// string holding exactly its declared `maxLength` is `cap` whoever the
+  /// mask shows closed it; below the cap the model's close is `model`, and a
+  /// close every allowed token made — an `enum` or a `pattern` can force one
+  /// — or an unproven one has no account; nor has a field with no declared
+  /// cap the grammar closed, a value that is not a string, or an answer that
+  /// is no object.
   #[test]
-  fn a_forced_close_is_a_caps_account_only_at_the_declared_cap() {
+  fn the_length_at_the_close_decides_first_then_the_mask() {
     let schema = json!({"properties": {
       "description": {"type": "string", "maxLength": 5},
       "scene": {"type": "string", "enum": ["kitchen"]},
     }});
-    let ends_of = |raw: &str| field_ends(raw, &follow(&[raw.as_bytes()]), &schema);
-    assert!(
-      field_ends(
-        r#"{"description":"abcde"}"#,
-        &recorded(r#"{"description":"abcde"}"#, &[ClosedBy::Unproven]),
-        &schema
-      )
-      .is_empty(),
-      "an unproven close"
-    );
+    let end_of = |raw: &str, by: ClosedBy| {
+      field_ends(raw, &recorded(raw, &[by]), &schema)
+        .get("description")
+        .cloned()
+    };
+    for by in [ClosedBy::Grammar, ClosedBy::Unproven, ClosedBy::Model] {
+      assert_eq!(
+        end_of(r#"{"description":"abcde"}"#, by),
+        Some(FieldEnd::cap("abcde")),
+        "at the cap under {by:?}"
+      );
+    }
+    let below = r#"{"description":"abcd"}"#;
     assert_eq!(
-      ends_of(r#"{"description":"abcde"}"#).get("description"),
-      Some(&FieldEnd::cap("abcde"))
+      end_of(below, ClosedBy::Model),
+      Some(FieldEnd::model("abcd"))
     );
+    assert_eq!(end_of(below, ClosedBy::Grammar), None);
+    assert_eq!(end_of(below, ClosedBy::Unproven), None);
     for raw in [
-      r#"{"description":"abcd"}"#,
       r#"{"scene":"kitchen"}"#,
       r#"{"description":["abcde"]}"#,
       r#"["abcde"]"#,
       r#""abcde""#,
     ] {
-      assert!(ends_of(raw).is_empty(), "{raw}");
+      assert!(
+        field_ends(raw, &follow(&[raw.as_bytes()]), &schema).is_empty(),
+        "{raw}"
+      );
     }
   }
 
@@ -1103,20 +1133,21 @@ mod tests {
     assert_eq!(analysis.description_end(), DescriptionEnd::Whole);
   }
 
-  /// LAW (Codex R1, [medium]): **a close drawn with content at the cap is
-  /// unproven, and has no account.** One character short of the cap, the
-  /// model draws `."` — the last character and the close in one token. The
-  /// mask it was drawn under also allows `.` alone, which stops inside the
-  /// string, and no token that writes past the `.`: whether the grammar
-  /// would have taken more after it is not in the mask, so the description
-  /// gets no account and reads `Unknown`, rather than `Whole` by default.
+  /// LAW (R1, the length decides first): **a close drawn with content at the
+  /// cap is the cap's.** One character short of it, the model draws `."` —
+  /// the last character and the close in one token. The mask cannot say who
+  /// closed it: it also allows `.` alone, which stops inside the string, and
+  /// no token that writes past the `.`. But the description closed holding
+  /// exactly its 120 characters: the model could not have written past them
+  /// whichever token carried the quote, so it is `cap`, and `Ragged`.
   #[test]
-  fn a_close_drawn_with_content_at_the_cap_has_no_account() {
+  fn a_close_drawn_with_content_at_the_cap_is_the_caps() {
     let task = ImageAnalysisTask::new();
     let cap = task.description_max_chars().get();
     let period_quote = trie()
       .token_id(br#".""#)
       .expect("the vocabulary holds `.\"`");
+    let written = format!("{}.", caption(cap - 1));
     let (raw, members) = decode(
       task.schema(),
       vec![
@@ -1127,11 +1158,11 @@ mod tests {
       ],
     );
     assert_eq!(closes(&members), [("description", ClosedBy::Unproven)]);
-    assert_eq!(description(&raw).chars().count(), cap);
+    assert_eq!(description(&raw), written);
     let ends = field_ends(&raw, &members, task.schema());
-    assert!(ends.is_empty(), "{ends:?}");
+    assert_eq!(ends.get("description"), Some(&FieldEnd::cap(&written)));
     let analysis = task.parse_ended(&raw, &ends).expect("the answer parses");
-    assert_eq!(analysis.description_end(), DescriptionEnd::Unknown);
+    assert_eq!(analysis.description_end(), DescriptionEnd::Ragged);
   }
 
   /// A schema with a `description` of at most `cap` characters and `tags`.

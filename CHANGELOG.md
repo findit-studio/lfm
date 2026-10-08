@@ -18,27 +18,28 @@ and this crate adheres to [Semantic Versioning](https://semver.org/).
   ended each string field of the answer (findit-studio/application#235): it
   calls `task.parse_ended(raw, &ends)` where it called `task.parse(raw)`. For
   a JSON Schema grammar the constrained sampler follows the answer's JSON and
-  records, for each string member of its top-level object, who closed the
-  string, reading each close — wherever it falls in the drawn token — against
-  the whole mask the token was drawn under: the model's when an allowed token
-  writes the drawn token's bytes up to the close and then continues the
-  string; the grammar's when every allowed token closes that same string;
-  unproven otherwise, and an unproven close has no account. Each account is
-  bound to the member's string lexeme alone, as the raw answer carries it
-  where the matcher committed it, decoded by serde_json on its own (JSON-
-  decoded, untrimmed), so a member serde_json cannot materialize as a value
-  (a number past `f64`, deep nesting) costs no other member its account; a
-  key written twice binds by its last occurrence, as serde_json reads it.
-  The model's close is `FieldEnd::model(field)`; the grammar's is
-  `FieldEnd::cap(field)` at the `maxLength` the schema's top-level
-  `properties` entry declares, the string holding exactly that many
-  characters, and no account short of it (an `enum`, a `const` or a
-  `pattern` can force a close too). No account names a cut token
+  records, for each string member of its top-level object, its lexeme and
+  who closed it, reading each close — wherever it falls in the drawn token —
+  against the whole mask the token was drawn under: the model's when an
+  allowed token writes the drawn token's bytes up to the close and then
+  continues the string; the grammar's when every allowed token closes that
+  same string; unproven otherwise. Each account is bound to the member's
+  string lexeme alone, as the raw answer carries it where the matcher
+  committed it, decoded by serde_json on its own (JSON-decoded, untrimmed),
+  so a member serde_json cannot materialize as a value (a number past `f64`,
+  deep nesting) costs no other member its account; a key written twice binds
+  by its last occurrence, as serde_json reads it. The account is decided by
+  the length first: a string that closed holding exactly the `maxLength` the
+  schema's top-level `properties` entry declares was bound by the cap,
+  whichever token carried the quote, and is `FieldEnd::cap(field)`. Below the
+  cap the model's close is `FieldEnd::model(field)`, and a close every
+  allowed token made (an `enum`, a `const`, a `pattern`) or one the mask
+  cannot attribute has no account. No account names a cut token
   (`with_cut`): llguidance never admits a closing quote after a partial UTF-8
   sequence, and `generate` detokenizes the whole answer at once. With
-  `ImageAnalysisTask` a live description now reads `DescriptionEnd::Whole` or
-  `Ragged`, or `Unknown` where the mask cannot attribute its close; a task
-  that reads no account parses as before.
+  `ImageAnalysisTask` a live description now reads `DescriptionEnd::Ragged`
+  when it closed at the cap and `Whole` when the model closed it short of
+  it; a task that reads no account parses as before.
 - CI only (no API change, no source change): the `test` job now compiles and
   runs `tests/options_document.rs` (`--features serde`, and again with
   `--no-default-features`) and the serde-gated unit tests in `src/options.rs`
