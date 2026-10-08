@@ -37,7 +37,7 @@ use llguidance::Constraint;
 use smol_str::SmolStr;
 
 #[cfg(feature = "inference")]
-use crate::runtime::field_ends::{FieldTracker, Member};
+use crate::runtime::field_ends::{FieldTracker, Masked, Member};
 use crate::{
   error::{Error, Result},
   options::RequestOptions,
@@ -300,13 +300,11 @@ impl Sampler for ConstrainedSampler {
     };
 
     // 6) Follow the answer's JSON while the mask this token was drawn under
-    //    is still at hand: when the token closes a top-level string field,
-    //    the mask says whether the grammar allowed anything else.
+    //    is still at hand: for each top-level string field the token closes,
+    //    the mask shows who closed it.
     if let Some(fields) = &mut self.fields {
       let trie = self.constraint.tok_trie();
-      let token = trie.token(id);
-      let forced = fields.grammar_closes(token, mask, trie);
-      fields.commit(token, forced);
+      fields.commit(trie.token(id), &Masked { mask, trie });
     }
 
     // 7) Commit the chosen token to advance llguidance's state machine.

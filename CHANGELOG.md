@@ -18,20 +18,27 @@ and this crate adheres to [Semantic Versioning](https://semver.org/).
   ended each string field of the answer (findit-studio/application#235): it
   calls `task.parse_ended(raw, &ends)` where it called `task.parse(raw)`. For
   a JSON Schema grammar the constrained sampler follows the answer's JSON and
-  records, for each string member of its top-level object, whether the model
-  closed the string or the grammar did: the close is the grammar's when no
-  token the mask allowed at that step would have left the string open. Each
-  account holds the member's string as serde_json decodes it from the raw
-  answer, untrimmed — `FieldEnd::model(field)` for the model's close,
-  `FieldEnd::cap(field)` for the grammar's close at the `maxLength` the
-  schema's top-level `properties` entry declares, the string holding exactly
-  that many characters. A close the grammar forces short of a declared cap
-  (an `enum`, a `const` or a `pattern`) has no account. No account names a
-  cut token (`with_cut`): llguidance never admits a closing quote after a
-  partial UTF-8 sequence, and `generate` detokenizes the whole answer at
-  once. With `ImageAnalysisTask` a live description now reads
-  `DescriptionEnd::Whole` or `Ragged` instead of `Unknown`; a task that reads
-  no account parses as before.
+  records, for each string member of its top-level object, who closed the
+  string, reading each close — wherever it falls in the drawn token — against
+  the whole mask the token was drawn under: the model's when an allowed token
+  writes the drawn token's bytes up to the close and then continues the
+  string; the grammar's when every allowed token closes that same string;
+  unproven otherwise, and an unproven close has no account. Each account is
+  bound to the member's string lexeme alone, as the raw answer carries it
+  where the matcher committed it, decoded by serde_json on its own (JSON-
+  decoded, untrimmed), so a member serde_json cannot materialize as a value
+  (a number past `f64`, deep nesting) costs no other member its account; a
+  key written twice binds by its last occurrence, as serde_json reads it.
+  The model's close is `FieldEnd::model(field)`; the grammar's is
+  `FieldEnd::cap(field)` at the `maxLength` the schema's top-level
+  `properties` entry declares, the string holding exactly that many
+  characters, and no account short of it (an `enum`, a `const` or a
+  `pattern` can force a close too). No account names a cut token
+  (`with_cut`): llguidance never admits a closing quote after a partial UTF-8
+  sequence, and `generate` detokenizes the whole answer at once. With
+  `ImageAnalysisTask` a live description now reads `DescriptionEnd::Whole` or
+  `Ragged`, or `Unknown` where the mask cannot attribute its close; a task
+  that reads no account parses as before.
 - CI only (no API change, no source change): the `test` job now compiles and
   runs `tests/options_document.rs` (`--features serde`, and again with
   `--no-default-features`) and the serde-gated unit tests in `src/options.rs`

@@ -3,15 +3,12 @@
 //! the grammar closed it at the field's `maxLength`.
 //!
 //! [`ConstrainedSampler`](super::sampler::ConstrainedSampler) hands every
-//! token it commits to a [`FieldTracker`], which follows the JSON structure of
-//! the committed bytes far enough to record each member of the answer's
-//! top-level object: its key, and — when its value is a string — the string's
-//! lexeme exactly as committed, where it sits in the committed bytes, and
-//! which token closed it. For that token the sampler still holds the mask the
-//! token was drawn under, so it asks the tracker whether the grammar left the
-//! model any other choice: the close is the grammar's when no token the mask
-//! allowed would have left the string open
-//! ([`FieldTracker::grammar_closes`]). [`field_ends`] then binds each record
+//! token it commits to a [`FieldTracker`], together with the mask the token
+//! was drawn under. The tracker follows the JSON structure of the committed
+//! bytes far enough to record each member of the answer's top-level object:
+//! its key, and — when its value is a string — the string's lexeme exactly as
+//! committed, where it sits in the committed bytes, and who closed it
+//! ([`ClosedBy`]), read off that mask. [`field_ends`] then binds each record
 //! to the string the answer carries, as llmtask's [`FieldEnd`].
 //!
 //! # Why the tracker is exact
@@ -26,13 +23,30 @@
 //! that continue a JSON text the schema accepts, so the tracker never meets a
 //! byte it has to guess about.
 //!
-//! The mask is read the same way: whether an allowed token would have left
-//! the string open is decided by that token's bytes from the string's current
-//! state. When llguidance forces bytes it can narrow the mask to the single
-//! token that starts their canonical tokenization (`TokenParser::
-//! compute_mask`), and that token may carry content before the quote; every
-//! token the mask allows then closes the string, so the close still reads as
-//! the grammar's.
+//! # Who closed a string
+//!
+//! A string closes at a byte of the drawn token — its first, or one past
+//! content the token carries, or one past the string's opening quote when the
+//! token opens it too. Every such close is read against the whole mask the
+//! token was drawn under, by the bytes each allowed token would have
+//! committed from the state the step began in:
+//!
+//! - **the model's** when an allowed token commits the drawn token's bytes up
+//!   to the close and then continues the string instead: the model could have
+//!   written on, and chose the close;
+//! - **the grammar's** when every allowed token closes that same string: none
+//!   would have left it open, so no choice the model had kept it going;
+//! - **unproven** otherwise — say the drawn token writes content and closes,
+//!   and the mask holds a shorter token that stops inside the string but none
+//!   that writes past the drawn token's content: whether the grammar would
+//!   have taken more after that content is not in the mask. Such a string has
+//!   no account, rather than one the mask cannot back.
+//!
+//! When llguidance forces bytes it can narrow the mask to the single token
+//! that starts their canonical tokenization (`TokenParser::compute_mask`);
+//! that token may open a string, write its content and close it in one —
+//! `""` for a `maxLength` of 0 — and as the only allowed token it closes the
+//! string on every road the mask leaves, so the close is the grammar's.
 //!
 //! # One lexeme, bound on its own
 //!
@@ -80,9 +94,43 @@ pub(crate) struct MemberString {
   pub(crate) at: usize,
   /// Its lexeme as committed, opening quote to closing quote.
   pub(crate) lexeme: Vec<u8>,
-  /// The grammar closed it: no token the mask allowed at the closing step
-  /// would have left it open.
-  pub(crate) forced: bool,
+  /// Who closed it, as the mask its closing token was drawn under shows.
+  pub(crate) closed_by: ClosedBy,
+}
+
+/// Who closed a string, read against the mask the token that closes it was
+/// drawn under (see the module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClosedBy {
+  /// An allowed token would have written on where the drawn token closes it.
+  Model,
+  /// Every allowed token closes it.
+  Grammar,
+  /// The mask shows neither.
+  Unproven,
+}
+
+/// The tokens one step's mask allowed, by their bytes.
+pub(crate) trait Allowed {
+  /// Whether `test` holds for some allowed token.
+  fn any(&self, test: impl FnMut(&[u8]) -> bool) -> bool;
+
+  /// Whether `test` holds for every allowed token.
+  fn all(&self, mut test: impl FnMut(&[u8]) -> bool) -> bool {
+    !self.any(|token| !test(token))
+  }
+}
+
+/// The tokens a step's mask allowed, read off the matcher's token trie.
+pub(crate) struct Masked<'a> {
+  pub(crate) mask: &'a SimpleVob,
+  pub(crate) trie: &'a TokTrie,
+}
+
+impl Allowed for Masked<'_> {
+  fn any(&self, mut test: impl FnMut(&[u8]) -> bool) -> bool {
+    self.mask.iter().any(|token| test(self.trie.token(token)))
+  }
 }
 
 /// Follows the JSON structure of the committed bytes far enough to record
@@ -118,31 +166,13 @@ impl FieldTracker {
     &self.members
   }
 
-  /// Whether the grammar closes the open top-level member's string at this
-  /// step: `token`, the token drawn under `mask`, closes it, and no token
-  /// `mask` allowed would have left it open.
-  pub(crate) fn grammar_closes(&self, token: &[u8], mask: &SimpleVob, trie: &TokTrie) -> bool {
-    let Some(OpenString {
-      role: Role::Member,
-      escaped,
-    }) = self.cursor.string
-    else {
-      return false;
-    };
-    closing_quote(escaped, token).is_some()
-      && !mask
-        .iter()
-        .any(|allowed| leaves_open(escaped, trie.token(allowed)))
-  }
-
-  /// Follows one committed token's `bytes`. `forced` is the account of the
-  /// first top-level member string they close: whether the grammar closed it
-  /// ([`Self::grammar_closes`], asked before the commit). A later member
-  /// string opened and closed within the same token is the model's: the mask
-  /// the token was drawn under says nothing about it.
-  pub(crate) fn commit(&mut self, bytes: &[u8], forced: bool) {
-    let mut forced = forced;
-    for &byte in bytes {
+  /// Follows one committed token, `token`, drawn under a mask that allowed
+  /// `allowed`: every top-level member string it closes is recorded with who
+  /// closed it ([`ClosedBy`]), read against that whole mask from the state
+  /// the step began in.
+  pub(crate) fn commit(&mut self, token: &[u8], allowed: &(impl Allowed + ?Sized)) {
+    let before = self.cursor.clone();
+    for (at, &byte) in token.iter().enumerate() {
       match self.cursor.step(byte) {
         Event::Opens(Role::Key) => self.key.clear(),
         Event::Content(Role::Key) => self.key.push(byte),
@@ -162,11 +192,10 @@ impl FieldTracker {
               string: Some(MemberString {
                 at: self.string_at,
                 lexeme,
-                forced,
+                closed_by: closed_by(&before, token, at, allowed),
               }),
             });
           }
-          forced = false;
         }
         Event::MemberEnds => {
           if let Some(field) = self.member.take() {
@@ -193,6 +222,9 @@ struct Cursor {
   open: Vec<Container>,
   /// The string the next byte is inside, if any.
   string: Option<OpenString>,
+  /// How many keys of the top-level object have opened: the member a
+  /// top-level string value belongs to is the one this many keys in.
+  keys: usize,
   /// The top-level value has closed: no later byte belongs to it.
   done: bool,
 }
@@ -295,7 +327,12 @@ impl Cursor {
     match self.open.last_mut() {
       Some(Container::Object { key_next }) if *key_next => {
         *key_next = false;
-        if top_level { Role::Key } else { Role::Other }
+        if top_level {
+          self.keys += 1;
+          Role::Key
+        } else {
+          Role::Other
+        }
       }
       Some(Container::Object { .. }) if top_level => Role::Member,
       _ => Role::Other,
@@ -303,28 +340,45 @@ impl Cursor {
   }
 }
 
-/// Where in `bytes` an open string closes, reading on from a state whose
-/// previous byte was an unescaped backslash when `escaped`: the offset of the
-/// first unescaped quote, if any.
-fn closing_quote(escaped: bool, bytes: &[u8]) -> Option<usize> {
-  let mut escaped = escaped;
-  for (at, &byte) in bytes.iter().enumerate() {
-    if !escaped && byte == b'"' {
-      return Some(at);
-    }
-    escaped = !escaped && byte == b'\\';
+impl Cursor {
+  /// Whether `bytes`, read on from this state, close the string value of the
+  /// top-level member `key` keys in.
+  fn closes_member(mut self, bytes: &[u8], key: usize) -> bool {
+    bytes
+      .iter()
+      .any(|&byte| self.step(byte) == Event::Closes(Role::Member) && self.keys == key)
   }
-  None
 }
 
-/// Whether a token of these `bytes` would leave an open string open: string
-/// content with no closing quote. A special token (its bytes start with
-/// [`TokTrie::SPECIAL_TOKEN_MARKER`]) or one with no bytes continues nothing.
-fn leaves_open(escaped: bool, bytes: &[u8]) -> bool {
-  bytes
-    .first()
-    .is_some_and(|&first| first != TokTrie::SPECIAL_TOKEN_MARKER)
-    && closing_quote(escaped, bytes).is_none()
+/// Who closed the member string that `token`, drawn from the state `before`
+/// under a mask that allowed `allowed`, closes at its byte `close`.
+fn closed_by(
+  before: &Cursor,
+  token: &[u8],
+  close: usize,
+  allowed: &(impl Allowed + ?Sized),
+) -> ClosedBy {
+  // After `written` the string is open and unescaped: `token[close]` closes it.
+  let written = &token[..close];
+  let writes_on = |other: &[u8]| {
+    other.starts_with(written)
+      && other
+        .get(close)
+        .is_some_and(|&next| next != b'"' && next != TokTrie::SPECIAL_TOKEN_MARKER)
+  };
+  if allowed.any(writes_on) {
+    return ClosedBy::Model;
+  }
+  let mut at_close = before.clone();
+  for &byte in written {
+    at_close.step(byte);
+  }
+  let key = at_close.keys;
+  if allowed.all(|other| before.clone().closes_member(other, key)) {
+    ClosedBy::Grammar
+  } else {
+    ClosedBy::Unproven
+  }
 }
 
 /// A key's bytes as written between its quotes, JSON-decoded.
@@ -353,10 +407,12 @@ fn decode_key(written: &[u8]) -> Option<SmolStr> {
 /// A key written more than once is read as serde_json reads it, by its last
 /// occurrence: that occurrence's string binds, and when its value is not a
 /// string the key has no account. A member also gets no account when the
-/// grammar closed it short of a declared cap (an `enum`, a `const` or a
-/// `pattern` can leave the model no other choice too, and that close is not
-/// at a cap), or when `raw` does not carry its lexeme where the matcher
-/// committed it, or when the lexeme does not decode.
+/// mask its closing token was drawn under proves neither who closed it
+/// ([`ClosedBy::Unproven`]), when the grammar closed it short of a declared
+/// cap (an `enum`, a `const` or a `pattern` can leave the model no other
+/// choice too, and that close is not at a cap), when `raw` does not carry its
+/// lexeme where the matcher committed it, or when the lexeme does not
+/// decode.
 // Its one caller, `Engine::run`, is compiled only with `decoders` on.
 #[cfg_attr(not(feature = "decoders"), allow(dead_code))]
 pub(crate) fn field_ends(raw: &str, members: &[Member], schema: &Value) -> FieldEnds {
@@ -386,12 +442,10 @@ fn account(raw: &str, string: &MemberString, cap: Option<usize>) -> Option<Field
     return None;
   }
   let text: String = serde_json::from_str(lexeme).ok()?;
-  if !string.forced {
-    Some(FieldEnd::model(&text))
-  } else if cap == Some(text.chars().count()) {
-    Some(FieldEnd::cap(&text))
-  } else {
-    None
+  match string.closed_by {
+    ClosedBy::Model => Some(FieldEnd::model(&text)),
+    ClosedBy::Grammar if cap == Some(text.chars().count()) => Some(FieldEnd::cap(&text)),
+    ClosedBy::Grammar | ClosedBy::Unproven => None,
   }
 }
 
@@ -582,19 +636,40 @@ mod tests {
 
   // ===== the tracker, byte by byte =====
 
+  impl Allowed for [&[u8]] {
+    fn any(&self, test: impl FnMut(&[u8]) -> bool) -> bool {
+      self.iter().copied().any(test)
+    }
+  }
+
   /// The members a tracker records over `tokens`, each a committed token's
-  /// bytes, the first member string each token closes accounted `forced`.
-  fn follow(tokens: &[&[u8]], forced: bool) -> Vec<Member> {
+  /// bytes drawn as the only token its mask allowed: every close is the
+  /// grammar's.
+  fn follow(tokens: &[&[u8]]) -> Vec<Member> {
     let mut tracker = FieldTracker::new();
     for token in tokens {
-      tracker.commit(token, forced);
+      tracker.commit(token, &[*token][..]);
     }
     tracker.members().to_vec()
   }
 
+  /// The members a tracker records over `raw` committed as one token, each
+  /// string member then accounted closed by `by`, in order.
+  fn recorded(raw: &str, by: &[ClosedBy]) -> Vec<Member> {
+    let mut members = follow(&[raw.as_bytes()]);
+    let mut by = by.iter();
+    for member in &mut members {
+      if let Some(string) = &mut member.string {
+        string.closed_by = *by.next().expect("an account per string member");
+      }
+    }
+    assert!(by.next().is_none(), "a string member per account");
+    members
+  }
+
   /// The member `field` of `answer` whose string value is `lexeme`, found
   /// where `answer` writes it.
-  fn string(answer: &[u8], field: &str, lexeme: &str, forced: bool) -> Member {
+  fn string(answer: &[u8], field: &str, lexeme: &str, closed_by: ClosedBy) -> Member {
     let at = answer
       .windows(lexeme.len())
       .position(|window| window == lexeme.as_bytes())
@@ -604,7 +679,7 @@ mod tests {
       string: Some(MemberString {
         at,
         lexeme: lexeme.as_bytes().to_vec(),
-        forced,
+        closed_by,
       }),
     }
   }
@@ -617,11 +692,11 @@ mod tests {
     }
   }
 
-  /// Each string member's key and whether the grammar closed it.
-  fn closes(members: &[Member]) -> Vec<(&str, bool)> {
+  /// Each string member's key and who closed it.
+  fn closes(members: &[Member]) -> Vec<(&str, ClosedBy)> {
     members
       .iter()
-      .filter_map(|member| Some((member.field.as_str(), member.string.as_ref()?.forced)))
+      .filter_map(|member| Some((member.field.as_str(), member.string.as_ref()?.closed_by)))
       .collect()
   }
 
@@ -634,29 +709,102 @@ mod tests {
   fn each_top_level_member_is_recorded_once_in_order() {
     let answer: &[u8] = br#"{ "scene" : "kitchen", "tags":["cat","rug"], "meta":{"note":"x","list":["y"]}, "description":"A \"cat\".", "n": 1.5e3, "ok": true }"#;
     let expected = [
-      string(answer, "scene", r#""kitchen""#, false),
+      string(answer, "scene", r#""kitchen""#, ClosedBy::Grammar),
       non_string("tags"),
       non_string("meta"),
-      string(answer, "description", r#""A \"cat\".""#, false),
+      string(answer, "description", r#""A \"cat\".""#, ClosedBy::Grammar),
       non_string("n"),
       non_string("ok"),
     ];
-    assert_eq!(follow(&[answer], false), expected, "one token");
+    assert_eq!(follow(&[answer]), expected, "one token");
     for size in 1..9 {
       let tokens: Vec<&[u8]> = answer.chunks(size).collect();
-      assert_eq!(follow(&tokens, false), expected, "tokens of {size} bytes");
+      assert_eq!(follow(&tokens), expected, "tokens of {size} bytes");
     }
   }
 
-  /// LAW: **a token's account is its first member close's**: a later member
-  /// string opened and closed within the same token is the model's.
+  /// Who closed the member string `token` closes, drawn after `prefix`
+  /// under a mask that allowed `allowed`.
+  fn by(prefix: &[u8], token: &[u8], allowed: &[&[u8]]) -> ClosedBy {
+    let mut tracker = FieldTracker::new();
+    tracker.commit(prefix, &[prefix][..]);
+    let before = tracker.members().len();
+    tracker.commit(token, allowed);
+    let closed = &tracker.members()[before..];
+    assert_eq!(closed.len(), 1, "{token:?} closes one member string");
+    closed[0]
+      .string
+      .as_ref()
+      .expect("a string member")
+      .closed_by
+  }
+
+  /// LAW (Codex R1, [medium]): **every close in a drawn token is read against
+  /// the whole mask it was drawn under**, wherever in the token it falls.
+  /// The model closed the string when an allowed token writes the drawn
+  /// token's bytes up to the close and then writes on; the grammar did when
+  /// every allowed token closes that same string; and when the mask shows
+  /// neither, the close is unproven.
   #[test]
-  fn a_tokens_account_is_its_first_member_closes() {
-    let tokens: [&[u8]; 3] = [br#"{"description":"A cat"#, br#"","scene":"x""#, b"}"];
+  fn every_close_in_a_token_is_read_against_its_mask() {
+    // A close at the token's first byte, the string already open.
+    let open: &[u8] = br#"{"description":"A cat"#;
+    let (close, comma, s) = (&br#"""#[..], &br#"","#[..], &b"s"[..]);
+    assert_eq!(by(open, comma, &[comma, close]), ClosedBy::Grammar);
+    assert_eq!(by(open, comma, &[comma, s]), ClosedBy::Model);
+    // A close past content the token writes.
+    let s_close: &[u8] = br#"s""#;
+    assert_eq!(by(open, s_close, &[s_close]), ClosedBy::Grammar);
+    assert_eq!(by(open, s_close, &[s_close, b"s."]), ClosedBy::Model);
     assert_eq!(
-      closes(&follow(&tokens, true)),
-      [("description", true), ("scene", false)]
+      by(open, s_close, &[s_close, s]),
+      ClosedBy::Unproven,
+      "`s` stops inside the string; nothing writes past it"
     );
+    // A string the token opens and closes.
+    let key: &[u8] = br#"{"description":"#;
+    let empty: &[u8] = br#""""#;
+    assert_eq!(
+      by(key, empty, &[empty]),
+      ClosedBy::Grammar,
+      "a forced `\"\"`"
+    );
+    assert_eq!(by(key, empty, &[empty, br#""A"#]), ClosedBy::Model);
+    assert_eq!(
+      by(key, empty, &[empty, br#"""#]),
+      ClosedBy::Unproven,
+      "`\"` opens it and stops"
+    );
+    assert_eq!(
+      by(key, empty, &[empty, b" "]),
+      ClosedBy::Unproven,
+      "a space does not reach the string"
+    );
+  }
+
+  /// LAW (Codex R1, [medium]): **a later close in the same token is read
+  /// against the same mask**: the token that closes the description and then
+  /// opens and closes `scene` was the only one allowed, so both closes are the
+  /// grammar's; with a lone quote allowed too — it closes the description and
+  /// stops short of `scene` — the description's close is still the grammar's
+  /// and `scene`'s is unproven.
+  #[test]
+  fn a_later_close_in_a_token_is_read_against_the_same_mask() {
+    let open: &[u8] = br#"{"description":"A cat"#;
+    let token: &[u8] = br#"","scene":"x""#;
+    let close: &[u8] = br#"""#;
+    for (allowed, scene) in [
+      (vec![token], ClosedBy::Grammar),
+      (vec![token, close], ClosedBy::Unproven),
+    ] {
+      let mut tracker = FieldTracker::new();
+      tracker.commit(open, &[open][..]);
+      tracker.commit(token, &allowed[..]);
+      assert_eq!(
+        closes(tracker.members()),
+        [("description", ClosedBy::Grammar), ("scene", scene)]
+      );
+    }
   }
 
   /// LAW: **an escaped quote or backslash never closes a string**, wherever
@@ -666,28 +814,18 @@ mod tests {
   fn escapes_never_close_a_string_and_keys_are_decoded() {
     let answer: &[u8] = br#"{"d\u0065scription":"say \"hi\" \\","sc\"ene":"\\\""}"#;
     let expected = [
-      string(answer, "description", r#""say \"hi\" \\""#, false),
-      string(answer, "sc\"ene", r#""\\\"""#, false),
+      string(
+        answer,
+        "description",
+        r#""say \"hi\" \\""#,
+        ClosedBy::Grammar,
+      ),
+      string(answer, "sc\"ene", r#""\\\"""#, ClosedBy::Grammar),
     ];
     for size in 1..12 {
       let tokens: Vec<&[u8]> = answer.chunks(size).collect();
-      assert_eq!(follow(&tokens, false), expected, "tokens of {size} bytes");
+      assert_eq!(follow(&tokens), expected, "tokens of {size} bytes");
     }
-    assert_eq!(closing_quote(false, br#"ab"c"#), Some(2));
-    assert_eq!(closing_quote(true, br#""c"#), None, "an escaped quote");
-    assert_eq!(
-      closing_quote(false, br#"\\""#),
-      Some(2),
-      "after an escaped backslash"
-    );
-    assert!(leaves_open(false, b"abc"));
-    assert!(leaves_open(true, br#""abc"#), "the quote is escaped");
-    assert!(!leaves_open(false, br#"c""#));
-    assert!(!leaves_open(false, b""), "no bytes continue nothing");
-    assert!(
-      !leaves_open(false, &[TokTrie::SPECIAL_TOKEN_MARKER, b'a']),
-      "a special token continues nothing"
-    );
   }
 
   /// LAW: **only a member of a top-level object is a field**: the strings of
@@ -695,10 +833,10 @@ mod tests {
   /// after the top-level value counts.
   #[test]
   fn only_a_member_of_a_top_level_object_is_a_field() {
-    assert!(follow(&[br#"["a","b"]"#], true).is_empty());
-    assert!(follow(&[br#""abc""#], true).is_empty());
+    assert!(follow(&[br#"["a","b"]"#]).is_empty());
+    assert!(follow(&[br#""abc""#]).is_empty());
     let tokens: [&[u8]; 3] = [br#"{"a":"x"}"#, b" ", br#""b":"y""#];
-    assert_eq!(closes(&follow(&tokens, false)), [("a", false)]);
+    assert_eq!(closes(&follow(&tokens)), [("a", ClosedBy::Grammar)]);
   }
 
   // ===== binding the members to the answer =====
@@ -710,7 +848,8 @@ mod tests {
   fn an_account_holds_the_decoded_untrimmed_field() {
     let schema = json!({"properties": {"description": {"type": "string", "maxLength": 9}}});
     let raw = r#"{"description":"  A \"cat\"","scene":" kitchen "}"#;
-    let ends = field_ends(raw, &follow(&[raw.as_bytes()], true), &schema);
+    let members = recorded(raw, &[ClosedBy::Grammar, ClosedBy::Model]);
+    let ends = field_ends(raw, &members, &schema);
     assert_eq!(ends.get("description"), Some(&FieldEnd::cap("  A \"cat\"")));
     assert_eq!(ends.get("scene"), Some(&FieldEnd::model(" kitchen ")));
     assert_eq!(ends.len(), 2);
@@ -733,7 +872,7 @@ mod tests {
         serde_json::from_str::<Value>(&raw).is_err(),
         "{raw}: a document parse refuses it"
       );
-      let ends = field_ends(&raw, &follow(&[raw.as_bytes()], true), &schema);
+      let ends = field_ends(&raw, &recorded(&raw, &[ClosedBy::Grammar]), &schema);
       assert_eq!(
         ends.get("description"),
         Some(&FieldEnd::cap("A cat.   ")),
@@ -748,7 +887,16 @@ mod tests {
   #[test]
   fn a_key_written_twice_binds_by_its_last_occurrence() {
     let schema = json!({});
-    let ends_of = |raw: &str| field_ends(raw, &follow(&[raw.as_bytes()], false), &schema);
+    let ends_of = |raw: &str| {
+      let mut members = follow(&[raw.as_bytes()]);
+      for string in members
+        .iter_mut()
+        .filter_map(|member| member.string.as_mut())
+      {
+        string.closed_by = ClosedBy::Model;
+      }
+      field_ends(raw, &members, &schema)
+    };
     assert_eq!(
       ends_of(r#"{"description":"first","description":"last"}"#).get("description"),
       Some(&FieldEnd::model("last"))
@@ -769,7 +917,7 @@ mod tests {
   fn an_account_binds_only_the_committed_decodable_lexeme() {
     let schema = json!({});
     let committed = r#"{"description":"A cat."}"#;
-    let members = follow(&[committed.as_bytes()], false);
+    let members = recorded(committed, &[ClosedBy::Model]);
     assert_eq!(
       field_ends(committed, &members, &schema).get("description"),
       Some(&FieldEnd::model("A cat."))
@@ -782,12 +930,13 @@ mod tests {
       assert!(field_ends(other, &members, &schema).is_empty(), "{other}");
     }
     let lone = r#"{"description":"\ud800"}"#;
-    assert!(field_ends(lone, &follow(&[lone.as_bytes()], false), &schema).is_empty());
+    assert!(field_ends(lone, &recorded(lone, &[ClosedBy::Model]), &schema).is_empty());
   }
 
   /// LAW: **the grammar's close is a cap's account only at the declared
-  /// cap.** Short of the `maxLength`, or for a field with none (an `enum` or
-  /// a `pattern` can force a close too), it is no account; nor is a value
+  /// cap**, and an unproven close is no account at all. Short of the
+  /// `maxLength`, or for a field with none (an `enum` or a `pattern` can
+  /// force a close too), the grammar's close is no account; nor is a value
   /// that is not a string; and an answer that is no object has none.
   #[test]
   fn a_forced_close_is_a_caps_account_only_at_the_declared_cap() {
@@ -795,7 +944,16 @@ mod tests {
       "description": {"type": "string", "maxLength": 5},
       "scene": {"type": "string", "enum": ["kitchen"]},
     }});
-    let ends_of = |raw: &str| field_ends(raw, &follow(&[raw.as_bytes()], true), &schema);
+    let ends_of = |raw: &str| field_ends(raw, &follow(&[raw.as_bytes()]), &schema);
+    assert!(
+      field_ends(
+        r#"{"description":"abcde"}"#,
+        &recorded(r#"{"description":"abcde"}"#, &[ClosedBy::Unproven]),
+        &schema
+      )
+      .is_empty(),
+      "an unproven close"
+    );
     assert_eq!(
       ends_of(r#"{"description":"abcde"}"#).get("description"),
       Some(&FieldEnd::cap("abcde"))
@@ -879,7 +1037,7 @@ mod tests {
         text(r#"","tags":["cat"]}"#),
       ],
     );
-    assert_eq!(closes(&members), [("description", true)]);
+    assert_eq!(closes(&members), [("description", ClosedBy::Grammar)]);
     assert_eq!(description(&raw), written);
     let ends = field_ends(&raw, &members, task.schema());
     let end = ends
@@ -919,7 +1077,7 @@ mod tests {
       ],
     );
     assert!(serde_json::from_str::<Value>(&raw).is_err(), "{raw}");
-    assert_eq!(closes(&members), [("description", true)]);
+    assert_eq!(closes(&members), [("description", ClosedBy::Grammar)]);
     let ends = field_ends(&raw, &members, &schema);
     assert_eq!(ends.get("description"), Some(&FieldEnd::cap(&written)));
   }
@@ -938,20 +1096,22 @@ mod tests {
         text(r#"","tags":["cat"]}"#),
       ],
     );
-    assert_eq!(closes(&members), [("description", false)]);
+    assert_eq!(closes(&members), [("description", ClosedBy::Model)]);
     let ends = field_ends(&raw, &members, task.schema());
     assert_eq!(ends.get("description"), Some(&FieldEnd::model(written)));
     let analysis = task.parse_ended(&raw, &ends).expect("the answer parses");
     assert_eq!(analysis.description_end(), DescriptionEnd::Whole);
   }
 
-  /// LAW: **the model's close is the model's even at the cap.** One
-  /// character short of it, the model draws `."` — content, then the close,
-  /// in one token — where the matcher also allowed tokens that keep the
-  /// string open: the account is `model` although the description holds
-  /// exactly the cap's characters.
+  /// LAW (Codex R1, [medium]): **a close drawn with content at the cap is
+  /// unproven, and has no account.** One character short of the cap, the
+  /// model draws `."` — the last character and the close in one token. The
+  /// mask it was drawn under also allows `.` alone, which stops inside the
+  /// string, and no token that writes past the `.`: whether the grammar
+  /// would have taken more after it is not in the mask, so the description
+  /// gets no account and reads `Unknown`, rather than `Whole` by default.
   #[test]
-  fn a_close_drawn_with_content_is_the_models_even_at_the_cap() {
+  fn a_close_drawn_with_content_at_the_cap_has_no_account() {
     let task = ImageAnalysisTask::new();
     let cap = task.description_max_chars().get();
     let period_quote = trie()
@@ -966,15 +1126,88 @@ mod tests {
         text(r#","tags":["cat"]}"#),
       ],
     );
-    assert_eq!(closes(&members), [("description", false)]);
+    assert_eq!(closes(&members), [("description", ClosedBy::Unproven)]);
+    assert_eq!(description(&raw).chars().count(), cap);
     let ends = field_ends(&raw, &members, task.schema());
-    let end = ends
-      .get("description")
-      .expect("the description has an account");
-    assert!(!end.closed_at_cap());
-    assert_eq!(end.source().chars().count(), cap);
+    assert!(ends.is_empty(), "{ends:?}");
     let analysis = task.parse_ended(&raw, &ends).expect("the answer parses");
-    assert_eq!(analysis.description_end(), DescriptionEnd::Whole);
+    assert_eq!(analysis.description_end(), DescriptionEnd::Unknown);
+  }
+
+  /// A schema with a `description` of at most `cap` characters and `tags`.
+  fn capped(cap: usize) -> Value {
+    json!({
+      "type": "object",
+      "properties": {
+        "description": {"type": "string", "maxLength": cap},
+        "tags": {"type": "array", "items": {"type": "string"}},
+      },
+      "required": ["description", "tags"],
+      "additionalProperties": false,
+    })
+  }
+
+  /// LAW (Codex R1, [medium]): **a `maxLength` of 0 is the grammar's close:
+  /// `cap("")`.** The matcher forces the empty string, narrowing each mask to
+  /// the token that starts the forced bytes' canonical tokenization; the
+  /// token that opens and closes the description was the only one allowed.
+  #[test]
+  fn a_max_length_of_zero_is_closed_by_the_grammar() {
+    let schema = capped(0);
+    let (raw, members) = decode(&schema, vec![text(r#"{"description":"","tags":["cat"]}"#)]);
+    assert_eq!(closes(&members), [("description", ClosedBy::Grammar)]);
+    let ends = field_ends(&raw, &members, &schema);
+    assert_eq!(ends.get("description"), Some(&FieldEnd::cap("")));
+  }
+
+  /// LAW (Codex R1, [medium]): **a string the model opens and closes in one
+  /// token under a larger cap is the model's.** The bundled vocabulary's
+  /// one-token string is `""`: drawn as the description under a cap of 120,
+  /// it shares its mask with tokens that open the string and write on (`"A`
+  /// and its like), so the account is `model("")`.
+  #[test]
+  fn a_one_token_string_the_model_chose_is_the_models() {
+    let schema = capped(120);
+    let empty = trie()
+      .token_id(br#""""#)
+      .expect("the vocabulary holds `\"\"`");
+    let (raw, members) = decode(
+      &schema,
+      vec![
+        text(r#"{"description":"#),
+        Step::Token(empty),
+        text(r#","tags":["cat"]}"#),
+      ],
+    );
+    assert_eq!(closes(&members), [("description", ClosedBy::Model)]);
+    let ends = field_ends(&raw, &members, &schema);
+    assert_eq!(ends.get("description"), Some(&FieldEnd::model("")));
+  }
+
+  /// LAW (Codex R1, [medium]): **a one-token string the mask cannot
+  /// attribute has no account, not the model's by default.** The token
+  /// `","` opens the description, writes `,` and closes it. Its mask allows
+  /// the lone quote, which opens the string and stops, so not every allowed
+  /// token closes it; and no allowed token writes past the `,` (the
+  /// vocabulary's only one, `",\n`, puts a raw newline in a string). The
+  /// description gets no account.
+  #[test]
+  fn a_one_token_string_the_mask_cannot_attribute_has_no_account() {
+    let schema = capped(120);
+    let comma = trie()
+      .token_id(br#"",""#)
+      .expect("the vocabulary holds `\",\"`");
+    let (raw, members) = decode(
+      &schema,
+      vec![
+        text(r#"{"description":"#),
+        Step::Token(comma),
+        text(r#","tags":["cat"]}"#),
+      ],
+    );
+    assert_eq!(description(&raw), ",");
+    assert_eq!(closes(&members), [("description", ClosedBy::Unproven)]);
+    assert!(field_ends(&raw, &members, &schema).is_empty());
   }
 
   /// The mask `matcher` computes for its next token.
@@ -1030,7 +1263,13 @@ mod tests {
         .max_by(|a, b| logits[*a as usize].total_cmp(&logits[*b as usize]))
         .expect("an allowed token");
       prefix.drew(token);
-      tracker.commit(trie().token(token), false);
+      tracker.commit(
+        trie().token(token),
+        &Masked {
+          mask: &mask,
+          trie: trie(),
+        },
+      );
       matcher
         .commit_token(Some(token))
         .expect("the token commits");
@@ -1048,7 +1287,13 @@ mod tests {
           "after {at} of the character's bytes only continuation bytes follow: {first:x?}"
         );
       }
-      tracker.commit(trie().token(token), false);
+      tracker.commit(
+        trie().token(token),
+        &Masked {
+          mask: &mask,
+          trie: trie(),
+        },
+      );
       matcher.commit_token(Some(token)).expect("the byte commits");
     }
     let mask = next_mask(&mut matcher);
@@ -1059,13 +1304,23 @@ mod tests {
       "at the cap every allowed token opens with the close"
     );
     let quote = trie().token_id(br#"""#).expect("the vocabulary holds `\"`");
-    assert!(tracker.grammar_closes(trie().token(quote), &mask, trie()));
+    tracker.commit(
+      trie().token(quote),
+      &Masked {
+        mask: &mask,
+        trie: trie(),
+      },
+    );
+    assert_eq!(
+      closes(tracker.members()),
+      [("description", ClosedBy::Grammar)]
+    );
 
     let mut steps = vec![text(r#"{"description":""#), text(&written)];
     steps.extend(byte_tokens.iter().map(|&token| Step::Token(token)));
     steps.push(text(r#"","tags":["cat"]}"#));
     let (raw, members) = decode(task.schema(), steps);
-    assert_eq!(closes(&members), [("description", true)]);
+    assert_eq!(closes(&members), [("description", ClosedBy::Grammar)]);
     let ends = field_ends(&raw, &members, task.schema());
     let end = ends
       .get("description")
