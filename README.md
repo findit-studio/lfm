@@ -133,7 +133,7 @@ fn main() -> lfm::Result<()> {
 
 ```toml
 [dependencies]
-lfm = "0.5"
+lfm = "0.6"
 ```
 
 Download the ONNX artifacts from [`LiquidAI/LFM2.5-VL-450M-ONNX`][lfm-card] and set `LFM_MODEL_PATH` to the directory containing them:

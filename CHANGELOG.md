@@ -5,6 +5,27 @@ and this crate adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-10
+
+### Changed
+
+- **Breaking: `llmtask` 0.5 → 0.6.** lfm re-exports `ImageAnalysis`,
+  `ImageAnalysisTask`, `DescriptionEnd`, `Extension`, `UnknownExtension`,
+  `FieldEnd`, `FieldEnds`, `FieldCaps`, `JsonParseError` and `Task` from
+  llmtask, and `Engine::run` takes any `llmtask::Task`, so llmtask 0.6's
+  changes reach lfm's API (findit-studio/llmtask#18). Every list
+  `ImageAnalysisTask` asks for states `maxItems` in its schema: `subjects`,
+  `objects` and `actions` at 8, `emotion`, `lighting` and `categories` at 3,
+  and `tags` at its 8 as before. The constrained sampler therefore closes a
+  list at its cap instead of letting a small model append labels until
+  `max_new_tokens` runs out. `parse` reads every list, `tags` included, to
+  its cap rather than refusing it, and records how the list ended as
+  `llmtask::ListEnd` (`Whole` or `Capped`). `ImageAnalysis` gains seven list
+  ends, from `subjects_end` to `categories_end` with `tags_end` among them,
+  serialized after `description_end`. `Engine::run` still refuses an answer
+  that runs out of `max_new_tokens` as `Error::MaxTokensExceeded` before it
+  is parsed; the caps are what end the loop.
+
 ## [0.5.0] - 2026-10-08
 
 ### Changed
