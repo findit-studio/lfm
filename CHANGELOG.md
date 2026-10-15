@@ -17,6 +17,12 @@ and this crate adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `ort` is pinned to exactly `=2.0.0-rc.13` on every target that takes it, as
+  asry pins it: the pre-release series changes its API between candidates
+  (rc.14's `Session::builder()` takes an `Environment`), the requirement
+  `"2.0.0-rc.13"` let a fresh resolve take rc.14 and fail to compile, and
+  `ort-sys` links one native library per dependency graph, so lfm and asry
+  move to the next candidate together.
 - The `integration` feature enables `decoders` as well as `inference`:
   `Engine` is gated on both, so `--no-default-features --features
   integration` failed to compile `tests/integration.rs`. CI now lints that

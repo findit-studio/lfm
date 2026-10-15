@@ -94,16 +94,16 @@ fast_image_resize = "6"
 # (`tests/options_document.rs`) parses this file's `target` tables and pins
 # that the two spell the same four-target set; update both together.
 [target.x86_64-unknown-linux-gnu.dependencies]
-ort = { version = "2.0.0-rc.13" }
+ort = { version = "=2.0.0-rc.13" }
 
 [target.aarch64-unknown-linux-gnu.dependencies]
-ort = { version = "2.0.0-rc.13" }
+ort = { version = "=2.0.0-rc.13" }
 
 [target.x86_64-pc-windows-msvc.dependencies]
-ort = { version = "2.0.0-rc.13" }
+ort = { version = "=2.0.0-rc.13" }
 
 [target.aarch64-pc-windows-msvc.dependencies]
-ort = { version = "2.0.0-rc.13" }
+ort = { version = "=2.0.0-rc.13" }
 
 # The MLX road: `aarch64-apple-darwin` EXACTLY, not a `cfg(target_arch =
 # "aarch64", target_os = "macos")` predicate — that pair also matches
@@ -118,7 +118,7 @@ ort = { version = "2.0.0-rc.13" }
 # `ort_allow_list_matches_the_manifest_target_table` pins that this table
 # name, `mlx_backend`'s check, and each other agree.
 [target.aarch64-apple-darwin.dependencies]
-ort = { version = "2.0.0-rc.13", optional = true }
+ort = { version = "=2.0.0-rc.13", optional = true }
 mlxrs = { version = "0.2", default-features = false, features = ["lfm2-vl"] }
 
 [dev-dependencies]
