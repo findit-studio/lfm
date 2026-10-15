@@ -5,6 +5,23 @@ and this crate adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-10-16
+
+### Added
+
+- Re-export `llmtask::ListEnd` — the type the seven `*_end` accessors of
+  `ImageAnalysis` answer — and llmtask 0.6.1's `InvalidTemplate`, the refusal
+  `ImageAnalysisTask::with_prompt_template` returns, so a crate naming llmtask
+  only through lfm can write `lfm::ListEnd::Capped` and name a template
+  refusal.
+
+### Fixed
+
+- The `integration` feature enables `decoders` as well as `inference`:
+  `Engine` is gated on both, so `--no-default-features --features
+  integration` failed to compile `tests/integration.rs`. CI now lints that
+  lane.
+
 ## [0.6.0] - 2026-10-10
 
 ### Changed
