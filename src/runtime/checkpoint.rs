@@ -17,6 +17,7 @@
 //! winning constructor does the real load and surfaces a typed error if the
 //! checkpoint is malformed.
 
+#[cfg(feature = "bundled")]
 use std::path::Path;
 
 /// The ONNX graphs [`Engine::from_dir`](crate::Engine) loads, relative to the
@@ -24,6 +25,7 @@ use std::path::Path;
 /// ONNX checkpoint and an MLX one, because `config.json` + `model.safetensors`
 /// are ALSO the standard HuggingFace source-asset names: an export that ships
 /// those next to its graphs is an ONNX checkpoint.
+#[cfg(feature = "bundled")]
 pub(crate) const REQUIRED_ONNX_GRAPHS: [&str; 3] = [
   "onnx/vision_encoder.onnx",
   "onnx/embed_tokens.onnx",
@@ -32,23 +34,30 @@ pub(crate) const REQUIRED_ONNX_GRAPHS: [&str; 3] = [
 
 /// The MLX-format config file name inside a checkpoint directory (the `mlxrs`
 /// checkpoint marker, paired with a weight file).
+#[cfg(any(feature = "bundled", mlx_backend))]
 pub(crate) const MLX_CONFIG: &str = "config.json";
 
 /// The MLX-format safetensors weights file name — the always-available baseline
-/// weight format.
+/// weight format. Read by [`detect`] (under `bundled`) and by the MLX
+/// backend's own tests.
+#[cfg(any(feature = "bundled", all(test, mlx_backend)))]
 pub(crate) const MLX_SAFETENSORS: &str = "model.safetensors";
 
 /// The legacy single-file safetensors weights name. Some older MLX checkpoints
 /// ship their weights as `weights.safetensors` rather than `model.safetensors`;
 /// `mlxrs::io::load_weights_from_dir` accepts it as a fallback tier.
+#[cfg(feature = "bundled")]
 pub(crate) const MLX_SAFETENSORS_LEGACY: &str = "weights.safetensors";
 
 /// The sharded-checkpoint index file name. A multi-shard safetensors export
 /// ships a `model.safetensors.index.json` weight map instead of a single
 /// `model.safetensors`.
+#[cfg(feature = "bundled")]
 pub(crate) const MLX_SAFETENSORS_INDEX: &str = "model.safetensors.index.json";
 
-/// What a checkpoint directory describes.
+/// What a checkpoint directory describes. The classifier and everything it reads are
+/// under `bundled`, the gate of their one user, [`Engine::from_dir`](crate::Engine).
+#[cfg(feature = "bundled")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CheckpointLayout {
   /// A complete ONNX graph set (or nothing recognizable at all, so that the
@@ -74,6 +83,7 @@ pub(crate) enum CheckpointLayout {
 
 /// Which MLX weight formats a directory offers, relative to what this build
 /// enabled.
+#[cfg(feature = "bundled")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MlxWeights {
   /// No MLX weight file of any format.
@@ -86,6 +96,7 @@ enum MlxWeights {
 }
 
 /// Whether `dir` contains at least one file with the given `extension`.
+#[cfg(feature = "bundled")]
 fn has_extension(dir: &Path, extension: &str) -> bool {
   let Ok(entries) = std::fs::read_dir(dir) else {
     return false;
@@ -106,6 +117,7 @@ fn has_extension(dir: &Path, extension: &str) -> bool {
 /// The enabled formats are tested BEFORE the disabled ones so a directory
 /// carrying both an unusable `*.npz` and a usable `*.gguf` reports `Enabled`
 /// rather than the first-seen disabled format.
+#[cfg(feature = "bundled")]
 fn mlx_weights(dir: &Path) -> MlxWeights {
   if dir.join(MLX_SAFETENSORS_INDEX).is_file()
     || dir.join(MLX_SAFETENSORS).is_file()
@@ -127,6 +139,7 @@ fn mlx_weights(dir: &Path) -> MlxWeights {
 }
 
 /// Classify a model directory.
+#[cfg(feature = "bundled")]
 pub(crate) fn detect(dir: &Path) -> CheckpointLayout {
   let onnx_found = REQUIRED_ONNX_GRAPHS
     .iter()
@@ -183,7 +196,7 @@ pub(crate) fn detect(dir: &Path) -> CheckpointLayout {
   }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "bundled"))]
 mod tests {
   use super::*;
 

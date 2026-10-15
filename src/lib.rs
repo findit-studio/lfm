@@ -253,15 +253,34 @@ pub enum ImageInput<'a> {
 // (`DescriptionEnd`), settled by the decoder's account of each string field
 // (`FieldEnd`, `FieldEnds`) that `Engine::run` hands `Task::parse_ended`,
 // read against the caps the task declares (`FieldCaps`, llmtask 0.5.2).
+// Since llmtask 0.6 each list says how it ended (`ListEnd`, the type the seven
+// `*_end` accessors answer), and since llmtask 0.6.1 a prompt template the
+// task cannot render is refused as `InvalidTemplate` — both re-exported so a
+// consumer naming llmtask only through lfm can name what those answer.
 pub use llmtask::{
-  DescriptionEnd, ImageAnalysis,
-  image_analysis::{Extension, ImageAnalysisTask, UnknownExtension},
+  DescriptionEnd, ImageAnalysis, ListEnd,
+  image_analysis::{Extension, ImageAnalysisTask, InvalidTemplate, UnknownExtension},
 };
 pub use task::{FieldCaps, FieldEnd, FieldEnds, JsonParseError, Task};
 
 #[cfg(test)]
 mod tests {
-  use crate::{Extension, ImageAnalysisTask, JsonParseError, Task, UnknownExtension};
+  use crate::{
+    Extension, ImageAnalysisTask, InvalidTemplate, JsonParseError, ListEnd, Task, UnknownExtension,
+  };
+
+  /// LAW: the two llmtask 0.6 names a consumer reads through lfm alone — how a list ended
+  /// (`lfm::ListEnd`, what the seven `*_end` accessors answer) and why a prompt template was
+  /// refused (`lfm::InvalidTemplate`) — are nameable at lfm's own paths.
+  #[test]
+  fn the_list_end_and_the_template_refusal_are_named_through_lfm() {
+    assert_ne!(ListEnd::Capped, ListEnd::Whole);
+    let refused: InvalidTemplate = ImageAnalysisTask::new()
+      .with_prompt_template("")
+      .err()
+      .expect("an empty template is refused");
+    assert_eq!(refused, InvalidTemplate::Empty);
+  }
 
   /// The `required` list of `task`'s JSON Schema, in order.
   fn required(task: &ImageAnalysisTask) -> Vec<&str> {
