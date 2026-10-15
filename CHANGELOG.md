@@ -23,10 +23,13 @@ and this crate adheres to [Semantic Versioning](https://semver.org/).
   `"2.0.0-rc.13"` let a fresh resolve take rc.14 and fail to compile, and
   `ort-sys` links one native library per dependency graph, so lfm and asry
   move to the next candidate together.
-- The `integration` feature enables `decoders` as well as `inference`:
-  `Engine` is gated on both, so `--no-default-features --features
-  integration` failed to compile `tests/integration.rs`. CI now lints that
-  lane.
+- The `integration` feature enables `bundled` (and so `inference` and
+  `decoders`): `tests/integration.rs` opens its models with
+  `Engine::from_dir`, which is `bundled`'s, so `--no-default-features
+  --features integration` failed to compile it. CI now lints that lane.
+- The checkpoint classifier and `Engine::from_dir`'s backend selection are
+  gated on `bundled`, the gate of their one user, so a build with `inference`
+  and `decoders` but without `bundled` carries no dead code.
 
 ## [0.6.0] - 2026-10-10
 

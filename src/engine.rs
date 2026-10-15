@@ -49,11 +49,14 @@ use crate::{
   preproc::{ImagePlan, Preprocessor},
   runtime::{
     backend::{Backend, BackendImpl},
-    checkpoint::{self, CheckpointLayout},
     field_ends::field_ends,
     sampler::{ConstrainedSampler, FreeSampler},
   },
 };
+// `select_backend` is the only user of the checkpoint classifier, and
+// `Engine::from_dir` — under `bundled` — is `select_backend`'s only user.
+#[cfg(feature = "bundled")]
+use crate::runtime::checkpoint::{self, CheckpointLayout};
 // `assemble`'s tokenizer cross-check is the only user of these two; import
 // them under the same `backend_available` gate it carries (see `assemble`).
 #[cfg(backend_available)]
@@ -923,6 +926,9 @@ fn take_seed(counter: &mut u64) -> u64 {
 /// disabled format, a half-present graph set beside MLX weights, and an MLX
 /// checkpoint on a host with no MLX backend — are now reported for what they
 /// are.
+///
+/// Under `bundled`, which is the gate of its one caller, [`Engine::from_dir`].
+#[cfg(feature = "bundled")]
 fn select_backend(dir: &Path, pinned: Option<BackendKind>) -> Result<BackendKind> {
   // (default choice, MLX servable from this dir, ONNX servable from this dir)
   let (default_choice, mlx_available, onnx_available) = match checkpoint::detect(dir) {
@@ -980,6 +986,9 @@ fn select_backend(dir: &Path, pinned: Option<BackendKind>) -> Result<BackendKind
 /// neither is named too, rather than failing deep inside a constructor that
 /// does not exist. The two `ort`-less cases get DIFFERENT messages: only
 /// aarch64-apple-darwin actually has an `ort` opt-in route to point at.
+///
+/// Under `bundled`, the gate of [`select_backend`], its one caller.
+#[cfg(feature = "bundled")]
 fn require_backend_compiled(kind: BackendKind) -> Result<BackendKind> {
   #[cfg(not(mlx_backend))]
   if matches!(kind, BackendKind::Mlx) {

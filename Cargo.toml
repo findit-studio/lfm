@@ -154,7 +154,7 @@ tensorrt    = ["inference", "ort", "ort/tensorrt"]
 directml    = ["inference", "ort", "ort/directml"]
 rocm        = ["inference", "ort", "ort/rocm"]
 coreml      = ["inference", "ort", "ort/coreml"]
-integration = ["inference", "decoders"]
+integration = ["bundled"]
 lax-feature-matching = ["inference", "ort", "ort/lax-feature-matching"]
 
 [[test]]
