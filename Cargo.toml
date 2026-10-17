@@ -31,7 +31,7 @@ tokenizers  = { version = "0.23", optional = true, default-features = false, fea
 llguidance  = { version = "1.7", optional = true }
 toktrie     = { version = "1.7", optional = true }
 toktrie_hf_tokenizers = { version = "1.7", optional = true }
-minijinja   = { version = "2", optional = true, default-features = false, features = ["builtins", "json", "macros", "serde"] }
+minijinja   = { version = "3", optional = true, default-features = false, features = ["builtins", "json", "macros", "serde"] }
 image       = { version = "0.25", default-features = false }
 smol_str    = "0.3"
 thiserror   = "2"
